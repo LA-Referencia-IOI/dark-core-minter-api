@@ -1,4 +1,4 @@
-# dARK Core API
+# dARK Core Minter API
 
 **REST API service for the dARK Core Orchestrator**
 
@@ -7,7 +7,7 @@
 
 ## Overview
 
-The Core API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It serves as the gateway between Minter/Resolver nodes and the blockchain.
+The Core Minter API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It serves as the gateway between Minter nodes and the blockchain.
 
 ## Quick Start
 
@@ -34,10 +34,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1/lookup/url` | POST | Check if ARK exists for URL |
 | `/api/v1/mint/batch` | POST | Persist ARKs on-chain |
-| `/api/v1/resolve/{naan}/{name}` | GET | Resolve ARK to URL |
-| `/api/v1/ark/{naan}/{name}` | GET | Get full ARK info |
 | `/api/v1/authority/{uuid}` | GET | Get authority info |
 | `/health` | GET | Health check |
 

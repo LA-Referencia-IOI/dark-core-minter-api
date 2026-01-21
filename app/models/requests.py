@@ -8,14 +8,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, HttpUrl
 
 
-class URLLookupRequest(BaseModel):
-    """Request to look up an ARK by URL."""
-    
-    url: str = Field(
-        ...,
-        description="URL to look up",
-        examples=["https://repository.example.edu/handle/1234/5678"]
-    )
+
 
 
 class MintItem(BaseModel):

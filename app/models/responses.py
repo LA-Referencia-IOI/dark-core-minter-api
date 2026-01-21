@@ -9,30 +9,7 @@ from typing import Optional, Literal
 from pydantic import BaseModel, Field
 
 
-# =============================================================================
-# Lookup Responses
-# =============================================================================
 
-class URLLookupResponse(BaseModel):
-    """Response from URL lookup."""
-    
-    exists: bool = Field(
-        ...,
-        description="Whether an ARK exists for this URL"
-    )
-    dark_id: Optional[str] = Field(
-        None,
-        description="Full ARK identifier if exists",
-        examples=["ark:/12345/xk9a2b7"]
-    )
-    naan: Optional[str] = Field(
-        None,
-        description="NAAN component if exists"
-    )
-    name: Optional[str] = Field(
-        None,
-        description="Name component if exists"
-    )
 
 
 # =============================================================================
@@ -77,48 +54,7 @@ class BatchMintResponse(BaseModel):
     )
 
 
-# =============================================================================
-# ARK Responses
-# =============================================================================
 
-class ARKResolveResponse(BaseModel):
-    """Response from ARK resolution."""
-    
-    ark_id: str = Field(
-        ...,
-        description="Full ARK identifier"
-    )
-    url: str = Field(
-        ...,
-        description="URL the ARK resolves to"
-    )
-    cid: str = Field(
-        ...,
-        description="Content identifier"
-    )
-
-
-class ARKExistsResponse(BaseModel):
-    """Response for ARK existence check."""
-    
-    exists: bool
-    ark_id: str
-
-
-class ARKInfoResponse(BaseModel):
-    """Full ARK information response."""
-    
-    ark_id: str
-    naan: str
-    name: str
-    url: str
-    cid: str
-    owner: str = Field(
-        ...,
-        description="Owner wallet address"
-    )
-    created_at: datetime
-    updated_at: datetime
 
 
 # =============================================================================

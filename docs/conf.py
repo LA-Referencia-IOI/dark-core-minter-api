@@ -1,5 +1,5 @@
 """
-Sphinx configuration for dARK Core API.
+Sphinx configuration for dARK Core Minter API.
 """
 
 import os
@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, os.path.abspath(".."))
 
-project = "dARK Core API"
+project = "dARK Core Minter API"
 copyright = "2026, dARK Team"
 author = "dARK Team"
 release = "0.1.0"

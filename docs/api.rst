@@ -22,13 +22,7 @@ API Router
 Enders Points
 -------------
 
-Lookup
-~~~~~~
 
-.. automodule:: app.api.lookup
-   :members:
-   :undoc-members:
-   :show-inheritance:
 
 Mint
 ~~~~
@@ -38,13 +32,7 @@ Mint
    :undoc-members:
    :show-inheritance:
 
-Resolve
-~~~~~~~
 
-.. automodule:: app.api.resolve
-   :members:
-   :undoc-members:
-   :show-inheritance:
 
 Authority
 ~~~~~~~~~

@@ -69,7 +69,7 @@ def create_app() -> FastAPI:
         title="dARK Core API",
         description=(
             "REST API service for the dARK Core Orchestrator. "
-            "Provides blockchain operations for Minter and Resolver nodes."
+            "Provides blockchain operations for Minter nodes."
         ),
         version="0.1.0",
         lifespan=lifespan,
