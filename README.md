@@ -18,6 +18,7 @@ source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
+pip install -e ../dark-core-orchestrator
 
 # Configure
 cp .env.example .env
@@ -28,6 +29,9 @@ uvicorn app.main:app --reload
 
 # Run (production with workers)
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+
+# Run via package entrypoint
+dark-core-api
 ```
 
 ## API Endpoints
@@ -36,6 +40,8 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
 |----------|--------|---------|
 | `/api/v1/mint/batch` | POST | Persist ARKs on-chain |
 | `/api/v1/authority/{uuid}` | GET | Get authority info |
+| `/api/v1/authority/{uuid}/naans` | GET | List authority NAANs |
+| `/api/v1/authority/{uuid}/authorized/{naan}` | GET | Check authority NAAN authorization |
 | `/health` | GET | Health check |
 
 ## Documentation

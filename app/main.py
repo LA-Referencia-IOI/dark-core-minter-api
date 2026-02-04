@@ -117,3 +117,15 @@ def create_app() -> FastAPI:
 
 # Application instance
 app = create_app()
+
+
+def run_server():
+    """Run the server (used by CLI)."""
+    import uvicorn
+    settings = get_settings()
+    uvicorn.run(
+        "app.main:app",
+        host=settings.core_api_host,
+        port=settings.core_api_port,
+        reload=False,
+    )
