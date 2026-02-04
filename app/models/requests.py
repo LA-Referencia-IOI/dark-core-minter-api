@@ -5,64 +5,94 @@ Pydantic models for validating incoming API requests.
 """
 
 from typing import Optional
+from typing import Optional, Any
 from pydantic import BaseModel, Field, HttpUrl
+from app.models.states import ARKState
 
 
 
 
 
-class MintItem(BaseModel):
-    """Single item in a batch mint request."""
+
+
+
+# =============================================================================
+# New ARK Lifecycle Requests
+# =============================================================================
+
+
+class AlternateIdentifier(BaseModel):
+    """Alternate identifier (e.g. DOI, OAI)."""
+    schema_: str = Field(..., alias="schema", description="Identifier schema (doi, oai, etc.)")
+    value: str = Field(..., description="Identifier value")
+
+
+class ReserveARKRequest(BaseModel):
+    """Request to reserve a new ARK."""
     
     authority_id: str = Field(
         ...,
-        description="Authority UUID (must be registered and authorized for NAAN)",
-        examples=["6b7f1d3a-9f9b-4d1f-bc4c-1a2b3c4d5e6f"]
+        description="Authority UUID requesting the reservation"
     )
     naan: str = Field(
         ...,
-        description="NAAN for the ARK",
-        examples=["12345"]
+        description="NAAN to use for the ARK"
     )
-    name: str = Field(
-        ...,
-        description="Name/identifier within NAAN",
-        examples=["xk9a2b7"]
-    )
-    url: str = Field(
-        ...,
-        description="URL the ARK resolves to",
-        examples=["https://repository.example.edu/doc/001"]
-    )
-    cid: str = Field(
-        ...,
-        description="Content identifier (e.g., IPFS CID of stable record)",
-        examples=["bafybeigdyrzt5sfp7udbbkc5dla2yv5ifyrkkwdxgper"]
+
+    alternate_identifiers: Optional[list[AlternateIdentifier]] = Field(
+        None,
+        description="External identifiers (stored in IPFS metadata)"
     )
 
 
-class BatchMintRequest(BaseModel):
-    """Request to mint multiple ARKs in a batch."""
-    
-    items: list[MintItem] = Field(
-        ...,
-        description="List of ARKs to mint",
-        min_length=1,
+class ReserveBatchItem(BaseModel):
+    """Item for batch reservation."""
+    target: Optional[str] = Field(
+        None,
+        description="Initial target URL (optional)"
+    )
+    alternate_identifiers: Optional[list[AlternateIdentifier]] = Field(
+        None,
+        description="External identifiers (stored in IPFS metadata)"
     )
 
 
-class UpdateARKRequest(BaseModel):
-    """Request to update an existing ARK."""
+
+class ReserveBatchRequest(BaseModel):
+    """Request to reserve multiple ARKs."""
     
     authority_id: str = Field(
         ...,
-        description="Authority UUID (must be the original owner)"
+        description="Authority UUID requesting the reservation"
     )
-    url: str = Field(
+    naan: str = Field(
         ...,
-        description="New URL the ARK resolves to"
+        description="NAAN to use for the ARKs"
     )
-    cid: str = Field(
+    items: list[ReserveBatchItem] = Field(
         ...,
-        description="New content identifier"
+        description="List of items to reserve (can be empty objects to just get IDs)",
+        min_length=1
     )
+
+
+class UpdateARKMetadataRequest(BaseModel):
+    """Request to update ARK metadata and promote to DRAFT."""
+    
+    authority_id: str = Field(
+        ...,
+        description="Authority UUID"
+    )
+    target: str = Field(
+        ...,
+        description="Target URL for resolution"
+    )
+    metadata: Any = Field(
+        ...,
+        description="Metadata payload (JSON/Dict). Will be stored opaquely."
+    )
+    alternate_identifiers: Optional[list[AlternateIdentifier]] = Field(
+        None,
+        description="External identifiers to update/add"
+    )
+

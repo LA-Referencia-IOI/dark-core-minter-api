@@ -20,10 +20,13 @@ class Settings(BaseSettings):
     
     # API Server
     core_api_host: str = "0.0.0.0"
-    core_api_port: int = 8000
+    core_api_port: int = 8001
     
     # Batch processing
     batch_size_limit: int = 100
+    
+    # Minter Configuration
+    minter_shoulder: str = ""
     
     # mTLS Configuration
     mtls_enabled: bool = False

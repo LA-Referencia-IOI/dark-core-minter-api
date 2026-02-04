@@ -24,10 +24,10 @@ Enders Points
 
 
 
-Mint
+ARKs
 ~~~~
 
-.. automodule:: app.api.mint
+.. automodule:: app.api.arks
    :members:
    :undoc-members:
    :show-inheritance:

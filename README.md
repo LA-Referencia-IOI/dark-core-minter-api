@@ -7,7 +7,11 @@
 
 ## Overview
 
-The Core Minter API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It serves as the gateway between Minter nodes and the blockchain.
+The Core Minter API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It handles the full lifecycle of ARK identifiers:
+- **Reserve**: Generate IDs locally (with optional external identifiers like DOI/OAI).
+- **Publish**: Persist metadata to IPFS and register on blockchain (`draft` -> `published`).
+- **Resolve**: Retrieve current state and metadata.
+- **Tombstone**: Deactivate identifiers.
 
 ## Quick Start
 
@@ -28,7 +32,7 @@ cp .env.example .env
 uvicorn app.main:app --reload
 
 # Run (production with workers)
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4
+uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 4
 
 # Run via package entrypoint
 dark-core-api
@@ -38,7 +42,11 @@ dark-core-api
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1/mint/batch` | POST | Persist ARKs on-chain |
+| `/api/v1/arks` | POST | Reserve new ARK ID (supports `alternate_identifiers`) |
+| `/api/v1/arks/batch` | POST | Batch reserve ARK IDs (supports `alternate_identifiers`) |
+| `/api/v1/arks/{ark}` | GET | Get ARK details |
+| `/api/v1/arks/{ark}` | PUT | Update metadata & Publish (supports `alternate_identifiers`) |
+| `/api/v1/arks/{ark}` | DELETE | Tombstone/Deactivate ARK |
 | `/api/v1/authority/{uuid}` | GET | Get authority info |
 | `/api/v1/authority/{uuid}/naans` | GET | List authority NAANs |
 | `/api/v1/authority/{uuid}/authorized/{naan}` | GET | Check authority NAAN authorization |
@@ -47,10 +55,20 @@ dark-core-api
 ## Documentation
 
 Once running, visit:
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
+- Swagger UI: `http://localhost:8001/docs`
+- ReDoc: `http://localhost:8001/redoc`
 
-## mTLS Configuration
+## Configuration
+ 
+ Key environment variables in `.env`:
+ 
+ | Variable | Description | Default |
+ |----------|-------------|---------|
+ | `MINTER_SHOULDER` | Unique prefix for this minter instance (e.g. `x`, `s1`). Used in ID generation. | `""` |
+ | `DARK_RPC_URL` | Blockchain RPC URL | `http://localhost:8545` |
+ | `DARK_AUTHORITY_ADDRESS` | Minter Authority Address | - |
+ 
+ ## mTLS Configuration
 
 For production, enable mTLS by setting in `.env`:
 

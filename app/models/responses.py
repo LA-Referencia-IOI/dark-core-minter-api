@@ -7,51 +7,39 @@ Pydantic models for API responses.
 from datetime import datetime
 from typing import Optional, Literal
 from pydantic import BaseModel, Field
+from app.models.states import ARKState
+
 
 
 
 
 
 # =============================================================================
-# Mint Responses
+# ARK Lifecycle Responses
 # =============================================================================
 
-class MintItemResult(BaseModel):
-    """Result for a single item in batch mint."""
+class ARKResponse(BaseModel):
+    """Full ARK record response."""
     
-    dark_id: Optional[str] = Field(
-        None,
-        description="Full ARK identifier"
-    )
-    name: Optional[str] = Field(
-        None,
-        description="Name (for correlation on errors)"
-    )
-    status: Literal["success", "authorization_error", "already_exists", "transient_error", "error"] = Field(
-        ...,
-        description="Result status"
-    )
-    transaction_ref: Optional[str] = Field(
-        None,
-        description="Blockchain transaction hash on success"
-    )
-    error: Optional[str] = Field(
-        None,
-        description="Error message if failed"
-    )
+    ark: str = Field(..., description="Full ARK identifier")
+    state: ARKState = Field(..., description="Current lifecycle state")
+    target: Optional[str] = Field(None, description="Target URL")
+    metadata_cid: Optional[str] = Field(None, description="IPFS CID of metadata (if published)")
+    alternate_identifiers: Optional[list] = Field(None, description="External identifiers")
+    
+    # Timestamps could be added here if we track them in DB/Orchestrator
+    
+    class Config:
+        use_enum_values = True
 
 
-class BatchMintResponse(BaseModel):
-    """Response from batch mint operation."""
+class ARKBatchResponse(BaseModel):
+    """Response for batch reservation."""
     
-    status: Literal["ok", "partial_success", "error"] = Field(
-        ...,
-        description="Overall batch status"
-    )
-    results: list[MintItemResult] = Field(
-        ...,
-        description="Per-item results"
-    )
+    results: list[ARKResponse] = Field(..., description="List of created/reserved ARKs")
+
+
+
 
 
 
