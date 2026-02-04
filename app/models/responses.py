@@ -26,6 +26,7 @@ class ARKResponse(BaseModel):
     target: Optional[str] = Field(None, description="Target URL")
     metadata_cid: Optional[str] = Field(None, description="IPFS CID of metadata (if published)")
     alternate_identifiers: Optional[list] = Field(None, description="External identifiers")
+    client_item_id: Optional[str] = Field(None, description="Client correlation ID")
     
     # Timestamps could be added here if we track them in DB/Orchestrator
     

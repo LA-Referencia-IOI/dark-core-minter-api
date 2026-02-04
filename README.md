@@ -43,7 +43,7 @@ dark-core-api
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/v1/arks` | POST | Reserve new ARK ID (supports `alternate_identifiers`) |
-| `/api/v1/arks/batch` | POST | Batch reserve ARK IDs (supports `alternate_identifiers`) |
+| `/api/v1/arks/batch` | POST | Batch reserve ARK IDs (requires `client_item_id` for correlation) |
 | `/api/v1/arks/{ark}` | GET | Get ARK details |
 | `/api/v1/arks/{ark}` | PUT | Update metadata & Publish (supports `alternate_identifiers`) |
 | `/api/v1/arks/{ark}` | DELETE | Tombstone/Deactivate ARK |

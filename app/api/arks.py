@@ -104,7 +104,8 @@ async def batch_reserve_ark(
             state=ARKState.RESERVED,
             target=item.target,
             metadata_cid=None,
-            alternate_identifiers=item.alternate_identifiers
+            alternate_identifiers=item.alternate_identifiers,
+            client_item_id=item.client_item_id
         ))
         
     logger.info(f"Batch reserved {len(results)} ARKs for {request.authority_id}")

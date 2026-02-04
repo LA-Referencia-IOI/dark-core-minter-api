@@ -55,6 +55,10 @@ class ReserveBatchItem(BaseModel):
         None,
         description="External identifiers (stored in IPFS metadata)"
     )
+    client_item_id: str = Field(
+        ...,
+        description="Client-side ID for correlation (required in batch)"
+    )
 
 
 

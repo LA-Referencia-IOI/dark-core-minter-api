@@ -43,9 +43,13 @@ def test_batch_reserve(client):
             "items": [
                 {
                     "target": "http://example.com/1",
-                    "alternate_identifiers": [{"schema": "oai", "value": "oai:1"}]
+                    "alternate_identifiers": [{"schema": "oai", "value": "oai:1"}],
+                    "client_item_id": "req-001"
                 },
-                {"target": "http://example.com/2"}
+                {
+                    "target": "http://example.com/2",
+                    "client_item_id": "req-002"
+                }
             ]
         },
     )
@@ -53,6 +57,8 @@ def test_batch_reserve(client):
     assert response.status_code == 200
     data = response.json()
     assert len(data["results"]) == 2
+    assert data["results"][0]["client_item_id"] == "req-001"
+    assert data["results"][1]["client_item_id"] == "req-002"
     assert data["results"][0]["alternate_identifiers"][0]["value"] == "oai:1"
     assert data["results"][0]["target"] == "http://example.com/1"
     assert data["results"][1]["alternate_identifiers"] is None
