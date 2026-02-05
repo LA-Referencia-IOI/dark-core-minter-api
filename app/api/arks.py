@@ -34,7 +34,9 @@ router = APIRouter()
 @router.post(
     "",
     response_model=ARKResponse,
-    summary="Reserve new ARK",
+    response_model_exclude_none=True,
+    status_code=201,
+    summary="Reserve ARK",
     description="Reserve a new ARK identifier. Initial state is 'reserved'.",
 )
 async def reserve_ark(
@@ -80,6 +82,7 @@ async def reserve_ark(
 @router.post(
     "/batch",
     response_model=ARKBatchResponse,
+    response_model_exclude_none=True,
     summary="Batch Reserve ARKs",
     description="Reserve multiple ARKs, optionally with initial targets.",
 )
@@ -91,11 +94,12 @@ async def batch_reserve_ark(
     """
     Reserve multiple ARKs.
     """
+    settings = get_settings()
     results = []
     
     for item in request.items:
         # 1. Generate ID
-        full_ark = mint_ark_id(request.naan)
+        full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
         
         # 2. TODO: Persistence
         
@@ -116,6 +120,7 @@ async def batch_reserve_ark(
 @router.get(
     "/{ark:path}",
     response_model=ARKResponse,
+    response_model_exclude_none=True,
     summary="Get ARK",
     description="Retrieve ARK details.",
 )
@@ -165,6 +170,7 @@ async def get_ark(
 @router.put(
     "/{ark:path}",
     response_model=ARKResponse,
+    response_model_exclude_none=True,
     summary="Update Metadata & Publish",
     description="Submit metadata and target. Transitions: RESERVED -> DRAFT -> PUBLISHED.",
 )
@@ -221,8 +227,8 @@ async def update_ark_metadata(
     except ARKError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.error(f"Error publishing ARK {ark}: {e}")
-        raise HTTPException(status_code=500, detail="Internal server error during publication")
+        logger.exception(f"Unexpected error publishing ARK {ark}: {repr(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal server error during publication: {str(e)}")
 
     # Return resulting state
     return ARKResponse(

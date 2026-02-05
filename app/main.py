@@ -125,7 +125,7 @@ def run_server():
     settings = get_settings()
     uvicorn.run(
         "app.main:app",
-        host=settings.core_api_host,
-        port=settings.core_api_port,
+        host=settings.minter_api_host,
+        port=settings.minter_api_port,
         reload=False,
     )
