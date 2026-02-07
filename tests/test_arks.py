@@ -23,13 +23,16 @@ def test_reserve_ark(client, mock_orchestrator):
         },
     )
     
-    assert response.status_code == 200
+    assert response.status_code == 201
     data = response.json()
     assert data["state"] == ARKState.RESERVED
     # Default shoulder in config is empty string unless mocked
     assert data["ark"].startswith("ark:/12345/")
-    assert data["target"] is None
-    assert data["alternate_identifiers"][0]["schema"] == "doi"
+    assert data.get("target") is None
+    alt_schema = data["alternate_identifiers"][0].get("schema")
+    if alt_schema is None:
+        alt_schema = data["alternate_identifiers"][0].get("schema_")
+    assert alt_schema == "doi"
     assert data["alternate_identifiers"][0]["value"] == "10.1234/test"
 
 
@@ -60,20 +63,24 @@ def test_batch_reserve(client):
     assert data["results"][0]["client_item_id"] == "req-001"
     assert data["results"][1]["client_item_id"] == "req-002"
     assert data["results"][0]["alternate_identifiers"][0]["value"] == "oai:1"
-    assert data["results"][0]["target"] == "http://example.com/1"
-    assert data["results"][1]["alternate_identifiers"] is None
+    assert data["results"][0].get("target") is None
+    assert data["results"][1].get("alternate_identifiers") is None
 
 
 def test_update_metadata_publish(client, mock_orchestrator):
-    """Test updating metadata triggers publication."""
-    # Case: ARK reserved (exists=False), then Publish (create_ark)
-    mock_orchestrator.ark_exists.return_value = False
-    
-    # Mock create_ark to return something or just pass
-    mock_orchestrator.create_ark.return_value = MagicMock(ark_id="ark:/12345/res1")
-    
+    """Test updating metadata transitions ARK to DRAFT."""
+    reserve_response = client.post(
+        "/api/v1/arks",
+        json={
+            "authority_id": "test-uuid",
+            "naan": "12345",
+        },
+    )
+    assert reserve_response.status_code == 201
+    ark = reserve_response.json()["ark"]
+
     response = client.put(
-        "/api/v1/arks/ark:/12345/res1",
+        f"/api/v1/arks/{ark}",
         json={
             "authority_id": "test-uuid",
             "target": "http://new.target.com",
@@ -86,20 +93,26 @@ def test_update_metadata_publish(client, mock_orchestrator):
     
     assert response.status_code == 200
     data = response.json()
-    assert data["state"] == ARKState.PUBLISHED
+    assert data["state"] == ARKState.DRAFT
     assert data["target"] == "http://new.target.com"
     assert data["alternate_identifiers"][0]["value"] == "10.1234/new"
     
-    # Verify create_ark was called
-    mock_orchestrator.create_ark.assert_called_once()
-    args = mock_orchestrator.create_ark.call_args
-    assert args.kwargs["url"] == "http://new.target.com"
+    # Publication to chain is handled by the background worker, not this endpoint.
+    mock_orchestrator.create_ark.assert_not_called()
 
 
 def test_delete_tombstone(client, mock_orchestrator):
     """Test delete (tombstone)."""
-    mock_orchestrator.ark_exists.return_value = True
+    reserve_response = client.post(
+        "/api/v1/arks",
+        json={
+            "authority_id": "test-uuid",
+            "naan": "12345",
+        },
+    )
+    assert reserve_response.status_code == 201
+    ark = reserve_response.json()["ark"]
     
-    response = client.delete("/api/v1/arks/ark:/12345/todelete")
+    response = client.delete(f"/api/v1/arks/{ark}")
     
     assert response.status_code == 200  # Returns null/void

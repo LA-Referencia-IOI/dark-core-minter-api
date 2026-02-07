@@ -1,0 +1,39 @@
+version: '3.8'
+
+services:
+  minter-api:
+    build: .
+    ports:
+      - "8001:8001"
+    volumes:
+      - minter-data:/app/data
+    env_file:
+      - .env
+    environment:
+      # Override for Docker (SQLite in volume)
+      - DATABASE_URL=sqlite:////app/data/minter.db
+    restart: unless-stopped
+
+  # Uncomment for PostgreSQL in production
+  # postgres:
+  #   image: postgres:15-alpine
+  #   environment:
+  #     POSTGRES_USER: dark
+  #     POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
+  #     POSTGRES_DB: minter
+  #   volumes:
+  #     - postgres-data:/var/lib/postgresql/data
+  #   ports:
+  #     - "5432:5432"
+  #   restart: unless-stopped
+
+  # For PostgreSQL, update minter-api:
+  # minter-api:
+  #   depends_on:
+  #     - postgres
+  #   environment:
+  #     - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-changeme}@postgres:5432/minter
+
+volumes:
+  minter-data:
+  # postgres-data:  # Uncomment for PostgreSQL

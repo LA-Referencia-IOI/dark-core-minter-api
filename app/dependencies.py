@@ -80,3 +80,25 @@ def shutdown_orchestrator() -> None:
     if _orchestrator is not None:
         logger.info("Shutting down DARKOrchestrator")
         _orchestrator = None
+
+
+def get_db():
+    """
+    Database session dependency.
+    
+    Yields:
+        SQLAlchemy Session
+        
+    Usage:
+        @app.get("/items")
+        def get_items(db: Session = Depends(get_db)):
+            ...
+    """
+    from app.database.connection import SessionLocal
+    
+    session_factory = SessionLocal()
+    db = session_factory()
+    try:
+        yield db
+    finally:
+        db.close()

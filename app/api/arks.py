@@ -7,14 +7,18 @@ Implements the ARK lifecycle: reserved -> draft -> published -> tombstone.
 import logging
 from typing import List
 from fastapi import APIRouter, Depends, HTTPException, Path, Body
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from dark_orchestrator import DARKOrchestrator
 from dark_orchestrator.exceptions import ARKError, AuthorityError
 
-from app.dependencies import get_orchestrator
+from app.dependencies import get_orchestrator, get_db
 from app.middleware.auth import require_mtls
 from app.utils.noid import mint_ark_id
+from app.utils.auth_cache import check_authorization_cached
 from app.models.states import ARKState
+from app.repositories import ARKRepository
 from app.models.requests import (
     ReserveARKRequest,
     ReserveBatchRequest,
@@ -43,40 +47,73 @@ async def reserve_ark(
     request: ReserveARKRequest,
     cert_info: dict = Depends(require_mtls),
     orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    db: Session = Depends(get_db),
 ) -> ARKResponse:
     """
     Reserve a single ARK.
     
-    Generates a unique ID.
-    TODO: Persist reservation in local DB/Orchestrator (functionality missing in Orchestrator).
+    Generates a unique ID and persists in database.
     """
-    # 1. Generate ID
+    # 1. Validate authorization (with cache)
+    if not check_authorization_cached(orchestrator, request.authority_id, request.naan):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Authority {request.authority_id} not authorized for NAAN {request.naan}"
+        )
+    
+    # 2. Generate ID and Persist (with retry handling)
     settings = get_settings()
-    full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
+    ark_repo = ARKRepository(db)
     
-    # 2. Check existence (just in case of collision)
-    # Note: orchestrator.ark_exists checks on-chain. Reserved ARKs might not be on-chain yet.
-    # We assume for now that if it's not on chain, it's free, but in reality we need a reservation table.
-    try:
-        parts = full_ark.split(f"ark:/{request.naan}/")
-        if len(parts) > 1:
-            name = parts[1]
-            if orchestrator.ark_exists(request.naan, name):
-                raise HTTPException(status_code=409, detail="Generated ARK collided (rare). Please retry.")
-    except Exception as e:
-        logger.warning(f"Error checking existence for reserved ARK: {e}")
-        # Proceeding as this is a "soft" reservation in this MVP
-
-    # TODO: Call orchestrator.reserve_ark(uuid, naan, name) when available
-    logger.info(f"Reserved ARK: {full_ark} for {request.authority_id}")
-    
-    return ARKResponse(
-        ark=full_ark,
-        state=ARKState.RESERVED,
-        target=None,
-        metadata_cid=None,
-        alternate_identifiers=request.alternate_identifiers
-    )
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Generate ID
+            full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
+            
+            # Extract name from ARK
+            parts = full_ark.split(f"ark:/{request.naan}/")
+            name = parts[1] if len(parts) > 1 else ""
+            
+            # Persist reservation in database
+            db_ark = ark_repo.create_reserved(
+                ark=full_ark,
+                naan=request.naan,
+                name=name,
+                authority_id=request.authority_id,
+                alternate_identifiers=request.alternate_identifiers,
+                client_item_id=None,
+            )
+            db.commit()
+            db.refresh(db_ark)
+            
+            logger.info(f"Reserved ARK: {full_ark} for {request.authority_id}")
+            
+            return ARKResponse(
+                ark=db_ark.ark,
+                state=db_ark.state,
+                target=db_ark.target,
+                metadata_cid=db_ark.metadata_cid,
+                alternate_identifiers=db_ark.alternate_identifiers,
+            )
+            
+        except IntegrityError as e:
+            db.rollback()
+            # Log exact cause (UNIQUE, NOT NULL, CHECK, etc.)
+            logger.error(f"IntegrityError detailed: {e.orig}")
+            logger.warning(f"ARK insert failed: {full_ark} (attempt {attempt + 1}/{max_retries})")
+            
+            if attempt == max_retries - 1:
+                # Determine if it's actually a collision or something else
+                if "UNIQUE" in str(e.orig) or "unique" in str(e.orig).lower():
+                     raise HTTPException(status_code=409, detail="Generated ARK already exists after retries. Please retry.")
+                else:
+                     # It's a schema violation (e.g. valid checks, not nulls)
+                     raise HTTPException(status_code=500, detail=f"Database integrity error: {str(e.orig)}")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error creating ARK: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post(
@@ -90,31 +127,85 @@ async def batch_reserve_ark(
     request: ReserveBatchRequest,
     cert_info: dict = Depends(require_mtls),
     orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    db: Session = Depends(get_db),
 ) -> ARKBatchResponse:
     """
-    Reserve multiple ARKs.
+    Reserve multiple ARKs with individual error handling.
     """
+    # Validate authorization once for the batch (with cache)
+    if not check_authorization_cached(orchestrator, request.authority_id, request.naan):
+        raise HTTPException(
+            status_code=403,
+            detail=f"Authority {request.authority_id} not authorized for NAAN {request.naan}"
+        )
+    
     settings = get_settings()
+    ark_repo = ARKRepository(db)
     results = []
+    errors = []
     
-    for item in request.items:
-        # 1. Generate ID
-        full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
-        
-        # 2. TODO: Persistence
-        
-        results.append(ARKResponse(
-            ark=full_ark,
-            state=ARKState.RESERVED,
-            target=item.target,
-            metadata_cid=None,
-            alternate_identifiers=item.alternate_identifiers,
-            client_item_id=item.client_item_id
-        ))
-        
-    logger.info(f"Batch reserved {len(results)} ARKs for {request.authority_id}")
+    for idx, item in enumerate(request.items):
+        try:
+            # Isolate each item in a savepoint so one failure does not rollback
+            # already successful items in the same batch.
+            with db.begin_nested():
+                # 1. Generate ID
+                full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
+
+                # 2. Extract name
+                parts = full_ark.split(f"ark:/{request.naan}/")
+                name = parts[1] if len(parts) > 1 else ""
+
+                # 3. Create reserved record
+                db_ark = ark_repo.create_reserved(
+                    ark=full_ark,
+                    naan=request.naan,
+                    name=name,
+                    authority_id=request.authority_id,
+                    alternate_identifiers=item.alternate_identifiers,
+                    client_item_id=item.client_item_id,
+                )
+                db.flush()
+
+                batch_result = ARKResponse(
+                    ark=db_ark.ark,
+                    state=db_ark.state,
+                    target=db_ark.target,
+                    metadata_cid=db_ark.metadata_cid,
+                    alternate_identifiers=db_ark.alternate_identifiers,
+                    client_item_id=db_ark.client_item_id,
+                )
+
+            results.append(batch_result)
+
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(
+                f"Error creating ARK for item {idx} "
+                f"(client_item_id={item.client_item_id}): {error_msg}"
+            )
+            errors.append({
+                "client_item_id": item.client_item_id,
+                "error": error_msg,
+                "index": idx,
+            })
     
-    return ARKBatchResponse(results=results)
+    # Commit all successful items
+    if len(results) > 0:
+        try:
+            db.commit()
+            logger.info(f"Batch reserved {len(results)} ARKs for {request.authority_id} ({len(errors)} errors)")
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error committing batch: {e}")
+            raise HTTPException(status_code=500, detail=f"Error committing batch: {str(e)}")
+    else:
+        db.rollback()
+    
+    return ARKBatchResponse(
+        results=results,
+        errors=errors if errors else None,
+    )
 
 
 @router.get(
@@ -128,9 +219,10 @@ async def get_ark(
     ark: str = Path(..., description="Full ARK identifier (e.g. ark:/12345/xyz)"),
     cert_info: dict = Depends(require_mtls),
     orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    db: Session = Depends(get_db),
 ) -> ARKResponse:
     """
-    Get ARK details.
+    Get ARK details from database or blockchain.
     """
     # Parse ARK to get NAAN/Name
     try:
@@ -138,32 +230,73 @@ async def get_ark(
         if not ark.startswith("ark:/"):
             raise ValueError("Invalid format")
         
-        parts = ark.split("/", 2) # ark: / NAAN / Name
+        parts = ark.split("/", 2)  # ark: / NAAN / Name
         if len(parts) != 3:
-             raise ValueError("Invalid format")
-             
+            raise ValueError("Invalid format")
+        
         naan = parts[1]
         name = parts[2]
         
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format. Expected ark:/NAAN/suffix")
-
-    # Check existence
+    
+    # 1. Try database first
+    ark_repo = ARKRepository(db)
+    db_ark = ark_repo.get_by_ark(ark)
+    
+    if db_ark:
+        # Found in database
+        if db_ark.state in [ARKState.RESERVED, ARKState.DRAFT]:
+            # Return from DB directly (not yet on blockchain)
+            return ARKResponse(
+                ark=db_ark.ark,
+                state=db_ark.state,
+                target=db_ark.target,
+                metadata_cid=db_ark.metadata_cid,
+                alternate_identifiers=db_ark.alternate_identifiers,
+            )
+        elif db_ark.state == ARKState.PUBLISHED:
+            # Combine DB metadata with blockchain data
+            try:
+                info = orchestrator.get_ark(naan, name)
+                return ARKResponse(
+                    ark=ark,
+                    state=ARKState.PUBLISHED,
+                    target=info.url,  # From blockchain
+                    metadata_cid=info.cid,  # From blockchain
+                    alternate_identifiers=db_ark.alternate_identifiers,  # From DB
+                )
+            except Exception as e:
+                # Blockchain query failed, return DB data
+                logger.warning(f"Blockchain query failed for {ark}: {e}")
+                return ARKResponse(
+                    ark=db_ark.ark,
+                    state=db_ark.state,
+                    target=db_ark.target,
+                    metadata_cid=db_ark.metadata_cid,
+                    alternate_identifiers=db_ark.alternate_identifiers,
+                )
+        elif db_ark.state == ARKState.TOMBSTONE:
+            # Tombstoned
+            return ARKResponse(
+                ark=db_ark.ark,
+                state=db_ark.state,
+                target=db_ark.target,
+                metadata_cid=db_ark.metadata_cid,
+                alternate_identifiers=db_ark.alternate_identifiers,
+            )
+    
+    # 2. Fallback: Query blockchain (ARK might have been created outside this API)
     if not orchestrator.ark_exists(naan, name):
         raise HTTPException(status_code=404, detail="ARK not found")
-        
-    # Fetch details
-    info = orchestrator.get_ark(naan, name)
     
-    # Map to response
-    # If it exists on chain, it is PUBLISHED (or TOMBSTONE if state supported)
-    # TODO: Orchestrator needs to return state. Assuming PUBLISHED for now if exists.
+    info = orchestrator.get_ark(naan, name)
     
     return ARKResponse(
         ark=ark,
-        state=ARKState.PUBLISHED, 
+        state=ARKState.PUBLISHED,
         target=info.url,
-        metadata_cid=info.cid
+        metadata_cid=info.cid,
     )
 
 
@@ -171,73 +304,80 @@ async def get_ark(
     "/{ark:path}",
     response_model=ARKResponse,
     response_model_exclude_none=True,
-    summary="Update Metadata & Publish",
-    description="Submit metadata and target. Transitions: RESERVED -> DRAFT -> PUBLISHED.",
+    summary="Update Metadata & Move to DRAFT",
+    description="Submit metadata and target. Transitions RESERVED -> DRAFT (ready for publication).",
 )
 async def update_ark_metadata(
     request: UpdateARKMetadataRequest,
     ark: str = Path(..., description="Full ARK identifier"),
     cert_info: dict = Depends(require_mtls),
     orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    db: Session = Depends(get_db),
 ) -> ARKResponse:
     """
-    Update metadata and Publish (Persist).
+    Update metadata and transition to DRAFT state.
+    
+    Does NOT publish to blockchain/IPFS. That happens in a separate background process.
     """
     # Parse ARK
     try:
         parts = ark.split("/", 2)
-        if len(parts) != 3: raise ValueError
+        if len(parts) != 3:
+            raise ValueError
         naan = parts[1]
         name = parts[2]
     except:
         raise HTTPException(status_code=400, detail="Invalid ARK format")
-
-    # 1. TODO: Upload metadata to IPFS -> Get CID
-    # For now, we simulate a CID based on hash of metadata or placeholder
-    simulated_cid = "bafy...placeholder...cid" 
     
-    logger.info(f"Metadata received for {ark}. Simulated CID: {simulated_cid}")
-
-    # 2. Persist on-chain (Publish)
-    # Logic: If it exists, update it. If not (it was reserved locally), create it.
+    # 1. Get ARK from database
+    ark_repo = ARKRepository(db)
+    db_ark = ark_repo.get_by_ark(ark)
     
+    if not db_ark:
+        raise HTTPException(status_code=404, detail="ARK not found")
+    
+    # 2. Validate state (must be RESERVED)
+    if db_ark.state != ARKState.RESERVED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"ARK must be in RESERVED state to update, currently {db_ark.state}"
+        )
+    
+    # 3. Validate ownership
+    if db_ark.authority_id != request.authority_id:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Authority {request.authority_id} does not own this ARK"
+        )
+    
+    # 4. Update to DRAFT (validates required fields)
     try:
-        if orchestrator.ark_exists(naan, name):
-            # It exists on chain (already published). Update it.
-            # Only owner can update.
-            orchestrator.update_ark(
-                uuid=request.authority_id,
-                naan=naan,
-                name=name,
-                url=request.target,
-                cid=simulated_cid
-            )
-        else:
-            # It doesn't exist on chain (was RESERVED). Create it (PUBLISH).
-            orchestrator.create_ark(
-                uuid=request.authority_id,
-                naan=naan,
-                name=name,
-                url=request.target,
-                cid=simulated_cid
-            )
-            
-    except AuthorityError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ARKError as e:
+        db_ark = ark_repo.update_to_draft(
+            ark=ark,
+            target=request.target,
+            metadata=request.metadata,
+            alternate_identifiers=request.alternate_identifiers,
+        )
+        db.commit()
+        db.refresh(db_ark)
+        
+        logger.info(f"ARK {ark} updated to DRAFT state")
+        
+        return ARKResponse(
+            ark=db_ark.ark,
+            state=db_ark.state,
+            target=db_ark.target,
+            metadata_cid=None,  # Not yet published to IPFS
+            alternate_identifiers=db_ark.alternate_identifiers,
+        )
+    
+    except ValueError as e:
+        db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        logger.exception(f"Unexpected error publishing ARK {ark}: {repr(e)}")
-        raise HTTPException(status_code=500, detail=f"Internal server error during publication: {str(e)}")
-
-    # Return resulting state
-    return ARKResponse(
-        ark=ark,
-        state=ARKState.PUBLISHED,
-        target=request.target,
-        metadata_cid=simulated_cid,
-        alternate_identifiers=request.alternate_identifiers
-    )
+        db.rollback()
+        logger.error(f"Error updating ARK {ark}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete(
@@ -249,29 +389,47 @@ async def delete_ark(
     ark: str = Path(..., description="Full ARK identifier"),
     cert_info: dict = Depends(require_mtls),
     orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    db: Session = Depends(get_db),
 ) -> None:
     """
-    Tombstone an ARK.
+    Tombstone an ARK (soft delete).
     """
     # Parse ARK
     try:
         parts = ark.split("/", 2)
-        if len(parts) != 3: raise ValueError
+        if len(parts) != 3:
+            raise ValueError
         naan = parts[1]
         name = parts[2]
     except:
         raise HTTPException(status_code=400, detail="Invalid ARK format")
-
-    # TODO: Orchestrator needs delete_ark or tombstone_ark method
-    # Currently not supported on-chain.
     
-    logger.warning(f"Tombstone requested for {ark} but not implemented in Orchestrator yet.")
+    # Get ARK from database
+    ark_repo = ARKRepository(db)
+    db_ark = ark_repo.get_by_ark(ark)
     
-    # We could check existence at least
-    if not orchestrator.ark_exists(naan, name):
-         raise HTTPException(status_code=404, detail="ARK not found")
-         
-    # Return 501 Not Implemented or just 200 OK with logging?
-    # User asked to "señalar si se tienen que implementar otras funciones"
-    # Returning 200 but logging that it didn't strictly happen on chain yet seems safest for API contract
-    return None
+    if not db_ark:
+        raise HTTPException(status_code=404, detail="ARK not found")
+    
+    # Validate ownership (extract from cert_info)
+    # Note: cert_info comes from mTLS middleware, contains certificate subject info
+    # For now, we'll allow any authenticated user to tombstone (adjust as needed)
+    # TODO: Extract authority_id from cert and validate ownership
+    
+    # Update to TOMBSTONE state
+    try:
+        ark_repo.update_to_tombstone(ark)
+        db.commit()
+        
+        logger.info(f"ARK {ark} marked as TOMBSTONE")
+        
+        # TODO: Orchestrator needs delete_ark or tombstone_ark method
+        # Currently not supported on-chain.
+        logger.warning(f"Tombstone state saved in DB, but not yet propagated to blockchain")
+        
+        return None
+    
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error tombstoning ARK {ark}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

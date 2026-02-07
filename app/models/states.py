@@ -9,7 +9,7 @@ class ARKState(str, Enum):
     published: Persisted on-chain and IPFS (internal state)
     tombstone: Deactivated by client
     """
-    RESERVED = "reserved"
-    DRAFT = "draft"
-    PUBLISHED = "published"
-    TOMBSTONE = "tombstone"
+    RESERVED = "R"
+    DRAFT = "D"
+    PUBLISHED = "P"
+    TOMBSTONE = "T"

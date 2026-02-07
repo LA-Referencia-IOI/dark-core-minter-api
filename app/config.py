@@ -25,6 +25,27 @@ class Settings(BaseSettings):
     # Batch processing
     batch_size_limit: int = 100
     
+    # Database Configuration
+    database_url: str = "sqlite:///./minter.db"
+    database_echo: bool = False
+    database_pool_size: int = 5
+    database_max_overflow: int = 10
+    
+    # Authorization Cache (LRU cache for NAAN validation)
+    auth_cache_ttl: int = 60  # seconds
+    auth_cache_maxsize: int = 1000
+    
+    # Worker Configuration
+    worker_enabled: bool = True
+    worker_interval_seconds: int = 60  # Run every 60 seconds
+    worker_batch_size: int = 10  # Process up to 10 ARKs per cycle
+    worker_max_retries: int = 5  # Max retry attempts before marking as failed
+    worker_retry_backoff_base: float = 2.0  # Exponential backoff base (seconds)
+    
+    # Metadata Storage Configuration
+    metadata_storage_type: str = "filesystem"  # "filesystem" or "ipfs"
+    metadata_storage_path: str = "./metadata_storage"  # Path for filesystem storage
+    
     # Minter Configuration
     minter_shoulder: str = ""
     

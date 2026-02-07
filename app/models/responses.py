@@ -6,7 +6,7 @@ Pydantic models for API responses.
 
 from datetime import datetime
 from typing import Optional, Literal
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from app.models.states import ARKState
 
 
@@ -30,14 +30,17 @@ class ARKResponse(BaseModel):
     
     # Timestamps could be added here if we track them in DB/Orchestrator
     
-    class Config:
-        use_enum_values = True
+    model_config = ConfigDict(use_enum_values=True)
 
 
 class ARKBatchResponse(BaseModel):
     """Response for batch reservation."""
     
     results: list[ARKResponse] = Field(..., description="List of created/reserved ARKs")
+    errors: Optional[list[dict]] = Field(
+        None,
+        description="Errors for failed items with client_item_id, error message, and index"
+    )
 
 
 

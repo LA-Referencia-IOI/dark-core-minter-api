@@ -31,6 +31,10 @@ dependencies = [
     "web3>=6.0.0",
     "eth-account>=0.10.0",
     "cryptography>=41.0.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.13.0",
+    "psycopg2-binary>=2.9.0",
+    "apscheduler>=3.10.0",
 ]
 
 [project.optional-dependencies]
