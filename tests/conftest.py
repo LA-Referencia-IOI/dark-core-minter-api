@@ -29,13 +29,18 @@ if not os.getenv("DARK_CONTRACT_ADDRESS"):
     os.environ["DARK_CONTRACT_ADDRESS"] = "0x0000000000000000000000000000000000000002"
 if not os.getenv("DARK_ADMIN_PRIVATE_KEY"):
     os.environ["DARK_ADMIN_PRIVATE_KEY"] = "0x0000000000000000000000000000000000000000000000000000000000000003"
-if not os.getenv("DATABASE_URL"):
-    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+
+# PostgreSQL-only tests. Override DATABASE_URL for test runtime.
+_db_password = os.getenv("DB_PASSWORD", "dark_password")
+_test_db_url = os.getenv(
+    "TEST_DATABASE_URL",
+    f"postgresql://dark:{_db_password}@localhost:5432/minter_test",
+)
+os.environ["DATABASE_URL"] = _test_db_url
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
 from app.main import app
 import app.dependencies as dependencies_module
@@ -57,12 +62,13 @@ def mock_orchestrator():
 
 @pytest.fixture
 def test_db_engine():
-    """Create in-memory SQLite database engine for tests."""
+    """Create PostgreSQL test database engine for tests."""
     engine = create_engine(
-        "sqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
+        _test_db_url,
+        pool_pre_ping=True,
     )
+    # Isolated schema per test function.
+    Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
     yield engine
     Base.metadata.drop_all(bind=engine)

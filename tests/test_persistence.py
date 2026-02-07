@@ -7,6 +7,17 @@ import pytest
 from unittest.mock import patch
 from app.models.states import ARKState
 from app.database.models import ARKRecord
+from app.config import get_settings
+from app.utils.noid import ALPHABET, compute_checkdigit, encode_counter
+
+
+def _expected_name(naan: str, counter: int) -> str:
+    """Build expected deterministic name using current runtime settings."""
+    settings = get_settings()
+    stem = f"{settings.minter_shoulder}{encode_counter(counter, settings.minter_noid_min_length)}"
+    if settings.minter_noid_checkdigit:
+        return f"{stem}{compute_checkdigit(f'{naan}/{stem}')}"
+    return stem
 
 
 def test_reserve_ark_persists_to_db(client, test_db, mock_orchestrator):
@@ -35,6 +46,56 @@ def test_reserve_ark_persists_to_db(client, test_db, mock_orchestrator):
     assert db_ark.state == ARKState.RESERVED
     assert db_ark.authority_id == "test-uuid"
     assert db_ark.naan == "12345"
+
+
+def test_reserve_ark_uses_counter_sequence(client, mock_orchestrator):
+    """Reserved ARKs should use deterministic sequence values per namespace."""
+    mock_orchestrator.is_authorized_for_naan.return_value = True
+    first = client.post(
+        "/api/v1/arks",
+        json={"authority_id": "test-uuid", "naan": "12345"},
+    )
+    second = client.post(
+        "/api/v1/arks",
+        json={"authority_id": "test-uuid", "naan": "12345"},
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+
+    first_name = first.json()["ark"].split("/", 1)[1]
+    second_name = second.json()["ark"].split("/", 1)[1]
+
+    expected_first = _expected_name("12345", 0)
+    expected_second = _expected_name("12345", 1)
+
+    assert first_name == expected_first
+    assert second_name == expected_second
+
+
+def test_reserve_ark_skips_collided_counter_value(client, test_db, mock_orchestrator):
+    """If a generated name already exists, reservation should advance to next counter."""
+    mock_orchestrator.is_authorized_for_naan.return_value = True
+    first_name = _expected_name("12345", 0)
+
+    from app.repositories import ARKRepository
+
+    ARKRepository(test_db).create_reserved(
+        naan="12345",
+        name=first_name,
+        authority_id="someone-else",
+    )
+    test_db.commit()
+
+    response = client.post(
+        "/api/v1/arks",
+        json={"authority_id": "test-uuid", "naan": "12345"},
+    )
+
+    assert response.status_code == 201
+    name = response.json()["ark"].split("/", 1)[1]
+    expected = _expected_name("12345", 1)
+    assert name == expected
 
 
 def test_reserve_ark_unauthorized_naan(client, mock_orchestrator):
@@ -105,9 +166,10 @@ def test_update_ark_wrong_state(client, test_db, mock_orchestrator):
     # Create a DRAFT ARK directly in DB
     from app.repositories import ARKRepository
     ark_repo = ARKRepository(test_db)
+    name = _expected_name("12345", 42)
     db_ark = ark_repo.create_reserved(
         naan="12345",
-        name="test123",
+        name=name,
         authority_id="test-uuid",
     )
     # Manually change to DRAFT
@@ -119,7 +181,7 @@ def test_update_ark_wrong_state(client, test_db, mock_orchestrator):
     
     # Try to update again (should fail)
     response = client.put(
-        "/api/v1/arks/ark:12345/test123",
+        f"/api/v1/arks/ark:12345/{name}",
         json={
             "authority_id": "test-uuid",
             "target": "https://new-url.org",
@@ -216,20 +278,21 @@ def test_get_ark_from_db(client, test_db, mock_orchestrator):
     # Create ARK in DB
     from app.repositories import ARKRepository
     ark_repo = ARKRepository(test_db)
+    name = _expected_name("12345", 77)
     db_ark = ark_repo.create_reserved(
         naan="12345",
-        name="dbonly",
+        name=name,
         authority_id="test-uuid",
         alternate_identifiers=[{"schema": "doi", "value": "10.1234/test"}],
     )
     test_db.commit()
     
     # Get ARK
-    response = client.get("/api/v1/arks/ark:12345/dbonly")
+    response = client.get(f"/api/v1/arks/ark:12345/{name}")
     
     assert response.status_code == 200
     data = response.json()
-    assert data["ark"] == "ark:12345/dbonly"
+    assert data["ark"] == f"ark:12345/{name}"
     assert data["state"] == ARKState.RESERVED
     assert data["alternate_identifiers"][0]["schema"] == "doi"
 
@@ -241,15 +304,16 @@ def test_tombstone_ark(client, test_db, mock_orchestrator):
     # Create ARK
     from app.repositories import ARKRepository
     ark_repo = ARKRepository(test_db)
+    name = _expected_name("12345", 88)
     db_ark = ark_repo.create_reserved(
         naan="12345",
-        name="todelete",
+        name=name,
         authority_id="test-uuid",
     )
     test_db.commit()
     
     # Delete/Tombstone
-    response = client.delete("/api/v1/arks/ark:12345/todelete")
+    response = client.delete(f"/api/v1/arks/ark:12345/{name}")
     
     assert response.status_code == 200
     
@@ -257,6 +321,21 @@ def test_tombstone_ark(client, test_db, mock_orchestrator):
     test_db.refresh(db_ark)
     assert db_ark.state == ARKState.TOMBSTONE
     assert db_ark.tombstoned_at is not None
+
+
+def test_get_ark_rejects_invalid_checkdigit_when_enabled(client):
+    """GET should reject ARKs with invalid checkdigit when strict mode is enabled."""
+    settings = get_settings()
+    if not settings.minter_noid_checkdigit:
+        pytest.skip("checkdigit validation disabled")
+
+    stem = f"{settings.minter_shoulder}{encode_counter(0, settings.minter_noid_min_length)}"
+    valid = compute_checkdigit(f"12345/{stem}")
+    invalid = next(ch for ch in ALPHABET if ch != valid)
+    response = client.get(f"/api/v1/arks/ark:12345/{stem}{invalid}")
+
+    assert response.status_code == 400
+    assert "checkdigit" in response.json()["detail"].lower()
 
 
 def test_health_check_with_db(client):

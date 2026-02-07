@@ -39,6 +39,20 @@ def parse_ark(ark: str) -> Tuple[str, str]:
     return parts[0], parts[1]
 
 
+def _is_ready_for_publish(draft: ARKRecord, now: datetime, backoff_base: float, max_retries: int) -> bool:
+    """Return True when draft can be claimed for publish attempt."""
+    if draft.publish_permanently_failed == 1:
+        return False
+    if draft.publish_retry_count >= max_retries:
+        return False
+    if draft.publish_last_attempt_at is None:
+        return True
+
+    backoff_seconds = (backoff_base ** draft.publish_retry_count) * 60
+    next_attempt_time = draft.publish_last_attempt_at + timedelta(seconds=backoff_seconds)
+    return now >= next_attempt_time
+
+
 class ARKRepository:
     """Repository for ARK database operations."""
     
@@ -238,33 +252,37 @@ class ARKRepository:
             ARKRecord.state == ARKState.DRAFT.value,
             ARKRecord.publish_permanently_failed == 0,  # Not marked as failed
         )
-        
-        # Apply backoff filtering: only include if enough time has passed since last attempt
+
+        # Apply backoff filtering and claim rows by updating publish_last_attempt_at.
         now = _utc_now()
-        
-        # Get all drafts and filter in Python (easier than complex SQL for backoff)
-        all_drafts = query.order_by(ARKRecord.created_at.asc()).all()
-        
+
+        dialect_name = self.db.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            # Lock a window of rows and skip rows already locked by other workers.
+            # We over-fetch to keep enough candidates after Python backoff filtering.
+            fetch_limit = max(limit * 5, limit)
+            candidates = (
+                query.order_by(ARKRecord.created_at.asc())
+                .limit(fetch_limit)
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+        else:
+            # Best effort fallback for non-PostgreSQL dialects.
+            candidates = query.order_by(ARKRecord.created_at.asc()).all()
+
         ready_drafts = []
-        for draft in all_drafts:
-            # First attempt or no previous attempt
-            if draft.publish_last_attempt_at is None:
-                ready_drafts.append(draft)
-                if len(ready_drafts) >= limit:
-                    break
+        for draft in candidates:
+            if not _is_ready_for_publish(draft, now, backoff_base, max_retries):
                 continue
-            
-            # Calculate backoff delay
-            retry_count = draft.publish_retry_count
-            backoff_seconds = (backoff_base ** retry_count) * 60
-            next_attempt_time = draft.publish_last_attempt_at + timedelta(seconds=backoff_seconds)
-            
-            # Ready if enough time has passed
-            if now >= next_attempt_time:
-                ready_drafts.append(draft)
-                if len(ready_drafts) >= limit:
-                    break
-        
+
+            # Claim for this cycle so concurrent workers skip the same draft.
+            draft.publish_last_attempt_at = now
+            draft.updated_at = now
+            ready_drafts.append(draft)
+            if len(ready_drafts) >= limit:
+                break
+
         return ready_drafts
     
     def update_to_published(

@@ -17,10 +17,10 @@ from app.dependencies import get_orchestrator, get_db, get_metadata_storage
 from app.storage.base import MetadataStorage
 from app.storage.exceptions import StorageError
 from app.middleware.auth import require_mtls
-from app.utils.noid import mint_ark_id
+from app.utils.noid import mint_ark_id, validate_name_checkdigit
 from app.utils.auth_cache import check_authorization_cached
 from app.models.states import ARKState
-from app.repositories import ARKRepository
+from app.repositories import ARKRepository, NoidCounterRepository
 from app.models.requests import (
     ReserveARKRequest,
     ReserveBatchRequest,
@@ -35,6 +35,24 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _is_unique_violation(exc: IntegrityError) -> bool:
+    """Return True when integrity error is caused by uniqueness constraints."""
+    detail = str(getattr(exc, "orig", exc))
+    lowered = detail.lower()
+    return "unique" in lowered or "duplicate" in lowered
+
+
+def _validate_ark_checkdigit_if_enabled(naan: str, name: str) -> None:
+    """Validate ARK name checkdigit when MINTER_NOID_CHECKDIGIT is enabled."""
+    settings = get_settings()
+    if not settings.minter_noid_checkdigit:
+        return
+    try:
+        validate_name_checkdigit(naan, name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid ARK checkdigit: {exc}") from exc
 
 
 @router.post(
@@ -63,32 +81,47 @@ async def reserve_ark(
             detail=f"Authority {request.authority_id} not authorized for NAAN {request.naan}"
         )
     
-    # 2. Generate ID and Persist (with retry handling)
+    # 2. Allocate deterministic counter and persist reservation
     settings = get_settings()
     ark_repo = ARKRepository(db)
-    
-    max_retries = 3
+    counter_repo = NoidCounterRepository(db)
+    namespace_key = counter_repo.build_namespace_key(request.naan, settings.minter_shoulder)
+
+    max_retries = 8
+    full_ark = ""
     for attempt in range(max_retries):
         try:
-            # Generate unique name (mint_ark_id returns full ark, we extract name)
-            full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
-            
+            # Allocate next sequence number for this namespace.
+            counter_value = counter_repo.allocate_next(namespace_key)
+
+            # Build deterministic ARK from allocated counter.
+            full_ark = mint_ark_id(
+                naan=request.naan,
+                counter=counter_value,
+                shoulder=settings.minter_shoulder,
+                min_length=settings.minter_noid_min_length,
+                checkdigit=settings.minter_noid_checkdigit,
+            )
+
             # Extract name from ARK (format: ark:{naan}/{name})
             name = full_ark.split("/", 1)[1] if "/" in full_ark else ""
-            
-            # Persist reservation in database (ark is computed property)
-            db_ark = ark_repo.create_reserved(
-                naan=request.naan,
-                name=name,
-                authority_id=request.authority_id,
-                alternate_identifiers=request.alternate_identifiers,
-                client_item_id=None,
-            )
+
+            # Savepoint isolates ARK insert errors without rolling back allocated counter.
+            with db.begin_nested():
+                db_ark = ark_repo.create_reserved(
+                    naan=request.naan,
+                    name=name,
+                    authority_id=request.authority_id,
+                    alternate_identifiers=request.alternate_identifiers,
+                    client_item_id=None,
+                )
+                db.flush()
+
             db.commit()
             db.refresh(db_ark)
-            
+
             logger.info(f"Reserved ARK: {db_ark.ark} for {request.authority_id}")
-            
+
             return ARKResponse(
                 ark=db_ark.ark,
                 state=db_ark.state,
@@ -96,20 +129,28 @@ async def reserve_ark(
                 metadata_cid=db_ark.metadata_cid,
                 alternate_identifiers=db_ark.alternate_identifiers,
             )
-            
+
         except IntegrityError as e:
+            # Uniqueness collisions are retried with a new counter value.
+            if _is_unique_violation(e):
+                logger.warning(
+                    f"ARK insert unique collision for {full_ark} "
+                    f"(attempt {attempt + 1}/{max_retries})"
+                )
+                if attempt < max_retries - 1:
+                    # Persist consumed counter allocation so retries advance.
+                    db.commit()
+                    continue
+
+                db.commit()
+                raise HTTPException(
+                    status_code=409,
+                    detail="Generated ARK already exists after retries. Please retry.",
+                )
+
             db.rollback()
-            # Log exact cause (UNIQUE, NOT NULL, CHECK, etc.)
-            logger.error(f"IntegrityError detailed: {e.orig}")
-            logger.warning(f"ARK insert failed: {full_ark} (attempt {attempt + 1}/{max_retries})")
-            
-            if attempt == max_retries - 1:
-                # Determine if it's actually a collision or something else
-                if "UNIQUE" in str(e.orig) or "unique" in str(e.orig).lower():
-                     raise HTTPException(status_code=409, detail="Generated ARK already exists after retries. Please retry.")
-                else:
-                     # It's a schema violation (e.g. valid checks, not nulls)
-                     raise HTTPException(status_code=500, detail=f"Database integrity error: {str(e.orig)}")
+            logger.error(f"Database integrity error: {e}")
+            raise HTTPException(status_code=500, detail=f"Database integrity error: {str(e.orig)}")
         except Exception as e:
             db.rollback()
             logger.error(f"Error creating ARK: {e}")
@@ -141,65 +182,83 @@ async def batch_reserve_ark(
     
     settings = get_settings()
     ark_repo = ARKRepository(db)
+    counter_repo = NoidCounterRepository(db)
+    namespace_key = counter_repo.build_namespace_key(request.naan, settings.minter_shoulder)
     results = []
     errors = []
-    
-    for idx, item in enumerate(request.items):
-        try:
-            # Isolate each item in a savepoint so one failure does not rollback
-            # already successful items in the same batch.
-            with db.begin_nested():
-                # 1. Generate ID
-                full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
 
-                # 2. Extract name (format: ark:{naan}/{name})
+    max_retries_per_item = 8
+
+    for idx, item in enumerate(request.items):
+        item_saved = False
+        last_error = None
+
+        for attempt in range(max_retries_per_item):
+            try:
+                counter_value = counter_repo.allocate_next(namespace_key)
+                full_ark = mint_ark_id(
+                    naan=request.naan,
+                    counter=counter_value,
+                    shoulder=settings.minter_shoulder,
+                    min_length=settings.minter_noid_min_length,
+                    checkdigit=settings.minter_noid_checkdigit,
+                )
+
                 name = full_ark.split("/", 1)[1] if "/" in full_ark else ""
 
-                # 3. Create reserved record (ark is computed property)
-                db_ark = ark_repo.create_reserved(
-                    naan=request.naan,
-                    name=name,
-                    authority_id=request.authority_id,
-                    alternate_identifiers=item.alternate_identifiers,
-                    client_item_id=item.client_item_id,
+                with db.begin_nested():
+                    db_ark = ark_repo.create_reserved(
+                        naan=request.naan,
+                        name=name,
+                        authority_id=request.authority_id,
+                        alternate_identifiers=item.alternate_identifiers,
+                        client_item_id=item.client_item_id,
+                    )
+                    db.flush()
+
+                results.append(
+                    ARKResponse(
+                        ark=db_ark.ark,
+                        state=db_ark.state,
+                        target=db_ark.target,
+                        metadata_cid=db_ark.metadata_cid,
+                        alternate_identifiers=db_ark.alternate_identifiers,
+                        client_item_id=db_ark.client_item_id,
+                    )
                 )
-                db.flush()
+                item_saved = True
+                break
+            except IntegrityError as e:
+                last_error = e
+                if _is_unique_violation(e):
+                    logger.warning(
+                        f"Batch ARK unique collision for item {idx} "
+                        f"(client_item_id={item.client_item_id}) "
+                        f"attempt {attempt + 1}/{max_retries_per_item}"
+                    )
+                    continue
+                break
+            except Exception as e:
+                last_error = e
+                break
 
-                batch_result = ARKResponse(
-                    ark=db_ark.ark,
-                    state=db_ark.state,
-                    target=db_ark.target,
-                    metadata_cid=db_ark.metadata_cid,
-                    alternate_identifiers=db_ark.alternate_identifiers,
-                    client_item_id=db_ark.client_item_id,
-                )
-
-            results.append(batch_result)
-
-        except Exception as e:
-            error_msg = str(e)
-            logger.warning(
-                f"Error creating ARK for item {idx} "
-                f"(client_item_id={item.client_item_id}): {error_msg}"
+        if not item_saved:
+            errors.append(
+                {
+                    "client_item_id": item.client_item_id,
+                    "error": str(last_error) if last_error else "Unknown error",
+                    "index": idx,
+                }
             )
-            errors.append({
-                "client_item_id": item.client_item_id,
-                "error": error_msg,
-                "index": idx,
-            })
-    
-    # Commit all successful items
-    if len(results) > 0:
-        try:
-            db.commit()
-            logger.info(f"Batch reserved {len(results)} ARKs for {request.authority_id} ({len(errors)} errors)")
-        except Exception as e:
-            db.rollback()
-            logger.error(f"Error committing batch: {e}")
-            raise HTTPException(status_code=500, detail=f"Error committing batch: {str(e)}")
-    else:
+
+    try:
+        db.commit()
+        logger.info(f"Batch reserved {len(results)} ARKs for {request.authority_id} ({len(errors)} errors)")
+    except Exception as e:
         db.rollback()
-    
+        logger.error(f"Error committing batch: {e}")
+        raise HTTPException(status_code=500, detail=f"Error committing batch: {str(e)}")
+
     return ARKBatchResponse(
         results=results,
         errors=errors if errors else None,
@@ -226,6 +285,7 @@ async def get_ark(
     from app.repositories.ark_repository import parse_ark
     try:
         naan, name = parse_ark(ark)
+        _validate_ark_checkdigit_if_enabled(naan, name)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format. Expected ark:NAAN/suffix")
     
@@ -318,6 +378,7 @@ async def update_ark_metadata(
     from app.repositories.ark_repository import parse_ark
     try:
         naan, name = parse_ark(ark)
+        _validate_ark_checkdigit_if_enabled(naan, name)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format")
     
@@ -400,6 +461,7 @@ async def delete_ark(
     from app.repositories.ark_repository import parse_ark
     try:
         naan, name = parse_ark(ark)
+        _validate_ark_checkdigit_if_enabled(naan, name)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format")
     

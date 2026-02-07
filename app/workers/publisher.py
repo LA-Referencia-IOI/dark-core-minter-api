@@ -197,6 +197,9 @@ class ARKPublisher:
                     max_retries=self.max_retries,
                     backoff_base=self.backoff_base,
                 )
+
+                # Persist claim updates (publish_last_attempt_at) and release row locks.
+                db.commit()
                 
                 if not drafts:
                     logger.debug("No DRAFT ARKs pending publish")

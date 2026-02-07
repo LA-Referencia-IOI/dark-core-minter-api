@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     batch_size_limit: int = 100
     
     # Database Configuration
-    database_url: str = "sqlite:///./minter.db"
+    database_url: str = "postgresql://dark:dark_password@localhost:5432/minter"
     database_echo: bool = False
     database_pool_size: int = 5
     database_max_overflow: int = 10
@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     
     # Minter Configuration
     minter_shoulder: str = ""
+    minter_noid_min_length: int = 7
+    minter_noid_checkdigit: bool = True
     
     # mTLS Configuration
     mtls_enabled: bool = False
@@ -93,6 +95,13 @@ class Settings(BaseSettings):
         
         if missing:
             raise ValueError(f"mTLS enabled but missing: {', '.join(missing)}")
+
+    def validate_database_config(self) -> None:
+        """Validate PostgreSQL-only database configuration."""
+        if not self.database_url.startswith("postgresql"):
+            raise ValueError(
+                "DATABASE_URL must use PostgreSQL (postgresql://...) in this deployment."
+            )
 
 
 @lru_cache

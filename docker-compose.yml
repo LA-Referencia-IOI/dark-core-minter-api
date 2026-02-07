@@ -1,58 +1,45 @@
-version: '3.8'
-
 services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: dark
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-dark_password}
+      POSTGRES_DB: minter
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dark -d minter"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   minter-api:
     build: .
     ports:
       - "8001:8001"
-    volumes:
-      - minter-data:/app/data
     env_file:
       - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      # Override for Docker (SQLite in volume)
-      - DATABASE_URL=sqlite:////app/data/minter.db
+      - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
     restart: unless-stopped
 
   minter-worker:
     build: .
     command: ["python", "-m", "app.main_worker"]
-    volumes:
-      - minter-data:/app/data
     env_file:
       - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
     environment:
-      # Override for Docker (SQLite in shared volume)
-      - DATABASE_URL=sqlite:////app/data/minter.db
+      - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
     restart: unless-stopped
 
-  # Uncomment for PostgreSQL in production
-  # postgres:
-  #   image: postgres:15-alpine
-  #   environment:
-  #     POSTGRES_USER: dark
-  #     POSTGRES_PASSWORD: ${DB_PASSWORD:-changeme}
-  #     POSTGRES_DB: minter
-  #   volumes:
-  #     - postgres-data:/var/lib/postgresql/data
-  #   ports:
-  #     - "5432:5432"
-  #   restart: unless-stopped
-
-  # For PostgreSQL, update minter-api:
-  # minter-api:
-  #   depends_on:
-  #     - postgres
-  #   environment:
-  #     - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-changeme}@postgres:5432/minter
-  #
-  # minter-worker:
-  #   depends_on:
-  #     - postgres
-  #   command: ["python", "-m", "app.main_worker"]
-  #   environment:
-  #     - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-changeme}@postgres:5432/minter
-
 volumes:
-  minter-data:
-  # postgres-data:  # Uncomment for PostgreSQL
+  postgres-data:

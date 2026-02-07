@@ -25,15 +25,15 @@ def get_engine():
     
     if _engine is None:
         settings = get_settings()
-        
-        # Create engine with connection pooling
+        settings.validate_database_config()
+
+        # Create PostgreSQL engine with connection pooling.
         _engine = create_engine(
             settings.database_url,
             echo=settings.database_echo,
             pool_size=settings.database_pool_size,
             max_overflow=settings.database_max_overflow,
-            # For SQLite, use check_same_thread=False for FastAPI
-            connect_args={"check_same_thread": False} if settings.database_url.startswith("sqlite") else {},
+            pool_pre_ping=True,
         )
         
         logger.info(f"Created database engine for: {settings.database_url}")

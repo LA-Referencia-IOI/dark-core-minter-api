@@ -7,6 +7,7 @@ Implementación activa con arquitectura separada:
 - API HTTP en proceso dedicado (`app.main`)
 - Worker publisher en proceso dedicado (`app.main_worker`)
 - Persistencia local completa del ciclo de vida de ARKs en `ark_records`
+- Minting secuencial determinístico por namespace en `noid_counters`
 
 ## 1. Arquitectura de Procesos
 
@@ -38,8 +39,7 @@ Implementación activa con arquitectura separada:
 
 - SQLAlchemy 2.0+
 - Alembic para migraciones
-- SQLite por defecto en desarrollo
-- PostgreSQL recomendado en producción
+- PostgreSQL como motor estándar (dev/staging/prod)
 
 ### Tabla principal: `ark_records`
 
@@ -64,6 +64,27 @@ Campos relevantes:
 - No existe columna `ark` física
 - El ARK completo se calcula como `ark:{naan}/{name}`
 - Restricción única real: `uq_naan_name` sobre `(naan, name)`
+
+### Tabla de secuencia: `noid_counters`
+
+Campos relevantes:
+
+- `namespace_key` (PK, formato `NAAN:SHOULDER`)
+- `next_value` (siguiente contador a asignar)
+- `updated_at`
+
+### Estrategia de minting y concurrencia
+
+- El nombre ARK ya no se genera random.
+- `POST /arks` y `POST /arks/batch` asignan contador secuencial por namespace.
+- El contador se incrementa atómicamente y luego se codifica en base29 (sin vocales).
+- Política actual: largo fijo `7` para la parte generada (operado vía `MINTER_NOID_MIN_LENGTH=7`).
+- Capacidad por namespace: `29^7 = 17,249,876,309`.
+- Se agrega checkdigit NOID al final del `name` (configurable, default activo).
+- `GET/PUT/DELETE` validan checkdigit cuando `MINTER_NOID_CHECKDIGIT=true`.
+- Con validación activa, ARKs legacy sin checkdigit válido son rechazados con `400`.
+- Inserción de `ark_records` en savepoint para manejar colisiones sin perder avance del contador.
+- Worker usa claim de filas con locking PostgreSQL (`FOR UPDATE SKIP LOCKED`) para evitar doble publicación concurrente.
 
 ## 3. Flujo de Estados
 
@@ -142,7 +163,7 @@ RESERVED (POST /arks)
 
 ```bash
 # DB
-DATABASE_URL=sqlite:///./minter.db
+DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter
 DATABASE_ECHO=false
 DATABASE_POOL_SIZE=5
 DATABASE_MAX_OVERFLOW=10
@@ -160,16 +181,22 @@ WORKER_HEARTBEAT_STALE_AFTER_SECONDS=180
 # Cache autorización
 AUTH_CACHE_TTL=60
 AUTH_CACHE_MAXSIZE=1000
+
+# Minting secuencial
+MINTER_SHOULDER=
+MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_CHECKDIGIT=true
 ```
 
 ## 8. Docker y Compose
 
 `docker-compose.yml` define servicios separados:
 
+- `postgres`
 - `minter-api`
 - `minter-worker`
 
-Ambos pueden compartir SQLite por volumen (`/app/data`) o usar PostgreSQL según `DATABASE_URL`.
+API y worker dependen de `postgres` y usan `DATABASE_URL` PostgreSQL compartida.
 
 ## 9. Testing
 
@@ -199,10 +226,10 @@ Validación reciente de regresión (worker + persistencia): `22 passed`.
 - `docker-compose.yml` (servicios API/worker separados)
 - `pyproject.toml` (scripts `dark-core-worker` y `dark-core-worker-status`)
 - `README.md` (operación actual)
+- `noid.md` (especificación detallada de esquema y minting NOID)
 
 ## 12. Pendientes Técnicos Recomendados
 
-- Locking de concurrencia API/worker a nivel DB (claim/lease por fila)
 - Endurecer transición de estados con compare-and-set atómico
 - Validación estricta de ownership en DELETE (mTLS -> `authority_id`)
 - Alertas operativas sobre heartbeat stale (Prometheus/Grafana o equivalente)

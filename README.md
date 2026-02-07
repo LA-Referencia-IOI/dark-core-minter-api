@@ -8,7 +8,7 @@
 ## Overview
 
 The Core Minter API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It handles the full lifecycle of ARK identifiers:
-- **Reserve**: Generate IDs locally (with optional external identifiers like DOI/OAI).
+- **Reserve**: Generate IDs locally using deterministic DB counters + NOID checkdigit (with optional external identifiers like DOI/OAI).
 - **Publish**: Persist metadata to IPFS and register on blockchain (`draft` -> `published`).
 - **Resolve**: Retrieve current state and metadata.
 - **Tombstone**: Deactivate identifiers.
@@ -63,6 +63,26 @@ API supports both execution styles:
 | `/api/v1/worker/status` | GET | Standalone worker status via DB heartbeat |
 | `/health` | GET | Health check (DB, blockchain, storage) |
 
+When `MINTER_NOID_CHECKDIGIT=true`, API operations that receive an ARK (`GET/PUT/DELETE`) validate the trailing checkdigit. IDs without valid checkdigit return `400`.
+
+## NOID Scheme
+
+Current policy:
+
+- Alphabet: `0-9bcdfghjkmnpqrstvwxz` (base29).
+- Namespace counter key: `"{NAAN}:{SHOULDER}"`.
+- Generated-part length: fixed `7`.
+- Checkdigit: enabled by default (`MINTER_NOID_CHECKDIGIT=true`).
+- Name format: `{shoulder}{counter_part}{checkdigit}`.
+
+Capacity per namespace:
+
+- Formula: `29^7`.
+- Result: `17,249,876,309` IDs per namespace.
+- Checkdigit does not reduce this capacity because it is appended.
+
+Detailed spec and implementation notes: [`noid.md`](./noid.md)
+
 ## Documentation
 
 Once running, visit:
@@ -108,26 +128,24 @@ All settings are configured via environment variables or a `.env` file.
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `MINTER_SHOULDER` | Unique prefix for ARK generation (e.g., `x`, `s1`, `test`) | `""` | No |
+| `MINTER_NOID_MIN_LENGTH` | Generated-part length for NOID counter (operated as fixed) | `7` | No |
+| `MINTER_NOID_CHECKDIGIT` | Append and enforce trailing NOID checkdigit | `true` | No |
 
 > **Note**: The shoulder helps identify ARKs from this minter instance. Use different shoulders for different environments (dev, staging, prod).
+> **Note**: Current policy uses fixed generated-part length `7` (the setting name is historical).
 
 #### 🗄️ Database
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `DATABASE_URL` | Database connection string | `sqlite:///./minter.db` | No |
+| `DATABASE_URL` | Database connection string | `postgresql://dark:dark_password@localhost:5432/minter` | No |
 | `DATABASE_ECHO` | Enable SQL query logging | `false` | No |
 | `DATABASE_POOL_SIZE` | Connection pool size | `5` | No |
 | `DATABASE_MAX_OVERFLOW` | Max overflow connections | `10` | No |
 
-**Development (SQLite):**
+**Recommended (PostgreSQL):**
 ```env
-DATABASE_URL=sqlite:///./minter.db
-```
-
-**Production (PostgreSQL):**
-```env
-DATABASE_URL=postgresql://user:password@localhost:5432/minter_db
+DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter
 DATABASE_POOL_SIZE=10
 DATABASE_MAX_OVERFLOW=20
 ```
@@ -188,9 +206,11 @@ DARK_ADMIN_PRIVATE_KEY=0xYourPrivateKey
 
 # Development minter
 MINTER_SHOULDER=dev
+MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_CHECKDIGIT=true
 
-# SQLite for simplicity
-DATABASE_URL=sqlite:///./minter_dev.db
+# PostgreSQL local
+DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter_dev
 DATABASE_ECHO=true
 
 # Faster worker for testing
@@ -222,6 +242,8 @@ DARK_ADMIN_PRIVATE_KEY=0xProductionPrivateKey  # Use secrets manager!
 
 # Production minter identity
 MINTER_SHOULDER=prod
+MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_CHECKDIGIT=true
 
 # PostgreSQL
 DATABASE_URL=postgresql://dark_user:secure_password@db.example.com:5432/minter_prod
@@ -263,8 +285,11 @@ DARK_CONTRACT_ADDRESS=0xContainerContractAddress
 DARK_ADMIN_PRIVATE_KEY=0xContainerPrivateKey
 
 MINTER_SHOULDER=docker
+MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_CHECKDIGIT=true
 
 # PostgreSQL container
+DB_PASSWORD=dark_password
 DATABASE_URL=postgresql://dark:dark_password@postgres:5432/minter
 
 # Container paths
@@ -289,6 +314,9 @@ The Minter API manages ARKs through the following states:
 
 1. **RESERVED**: ARK ID generated and reserved locally
    - Created via `POST /api/v1/arks`
+   - Counter allocation comes from DB table `noid_counters` (namespace = `NAAN + shoulder`)
+   - Generated name uses base29 encoding with trailing checkdigit (default on)
+   - Generated-part length is fixed to `7` (`29^7` per namespace)
    - No blockchain interaction yet
    - Can be batch reserved with `POST /api/v1/arks/batch`
 
@@ -318,6 +346,7 @@ The publisher worker runs as a separate process (`dark-core-worker`) and publish
 - **Batch Size**: Configurable (default: 10 ARKs per cycle)
 - **Error Handling**: 
   - Independent transactions per ARK (one failure doesn't affect others)
+  - PostgreSQL row claim with `FOR UPDATE SKIP LOCKED` to avoid duplicate processing
   - Exponential backoff for retriable errors (network, gas, etc.)
   - Permanent failure for authority errors (unauthorized, invalid NAAN)
   - Max retries before marking as permanently failed (default: 5)
@@ -340,8 +369,7 @@ CID is calculated from raw content, independent of format. Switch backends via `
 
 ### Database
 
-- **Development**: SQLite (file-based, zero configuration)
-- **Production**: PostgreSQL recommended (set `DATABASE_URL`)
+- **All environments**: PostgreSQL (`DATABASE_URL`)
 - **Migrations**: Automatic via Alembic on startup
 - **Schema**: Tracks full ARK lifecycle with publish retry tracking
 
@@ -415,6 +443,12 @@ Response includes:
 - `metadata_storage`: Storage backend health
 
 ## Testing
+
+Tests are configured for PostgreSQL. Set a dedicated test database before running:
+
+```bash
+export TEST_DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter_test
+```
 
 Run all tests:
 ```bash

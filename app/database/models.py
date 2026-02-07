@@ -8,6 +8,7 @@ from typing import Optional
 from sqlalchemy import (
     Column,
     Integer,
+    BigInteger,
     String,
     Text,
     DateTime,
@@ -66,7 +67,7 @@ class ARKRecord(Base):
     publish_retry_count = Column(Integer, default=0, nullable=False, server_default="0")
     publish_last_error = Column(Text, nullable=True)
     publish_last_attempt_at = Column(DateTime, nullable=True)
-    publish_permanently_failed = Column(Integer, default=0, nullable=False, server_default="0")  # SQLite uses 0/1 for boolean
+    publish_permanently_failed = Column(Integer, default=0, nullable=False, server_default="0")
     
     # Composite indexes for common queries
     __table_args__ = (
@@ -83,6 +84,23 @@ class ARKRecord(Base):
     
     def __repr__(self):
         return f"<ARKRecord(ark={self.ark}, state={self.state}, authority={self.authority_id})>"
+
+
+class NoidCounter(Base):
+    """
+    Per-namespace sequential counter used for deterministic NOID minting.
+
+    `next_value` stores the next integer to allocate for this namespace.
+    """
+
+    __tablename__ = "noid_counters"
+
+    namespace_key = Column(String(160), primary_key=True)
+    next_value = Column(BigInteger, nullable=False, default=0, server_default="0")
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<NoidCounter(namespace={self.namespace_key}, next_value={self.next_value})>"
 
 
 class WorkerRuntimeStatus(Base):
