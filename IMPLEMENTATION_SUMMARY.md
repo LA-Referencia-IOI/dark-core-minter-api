@@ -1,101 +1,133 @@
-# Implementación Actual - dARK Core Minter API
+# Current Implementation - dARK Core Minter API
 
-## Estado
+## Status
 
-Implementación activa con arquitectura separada:
+Active implementation with separated runtime architecture:
 
-- API HTTP en proceso dedicado (`app.main`)
-- Worker publisher en proceso dedicado (`app.main_worker`)
-- Persistencia local completa del ciclo de vida de ARKs en `ark_records`
-- Minting secuencial determinístico por namespace en `noid_counters`
+- API HTTP process (`app.main`)
+- Publisher worker process (`app.main_worker`)
+- Full local ARK lifecycle persistence in `ark_records`
+- Deterministic sequential minting per namespace in `noid_counters`
 
-## 1. Arquitectura de Procesos
+## 1. Process Architecture
 
-### API (solo HTTP)
+### API (HTTP only)
 
 - Entry point: `app/main.py`
 - CLI: `dark-core-api`
-- Uvicorn directo: `uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 4`
-- Expone endpoints ARK y Authority
-- No ejecuta scheduler ni publisher interno
+- Direct Uvicorn: `uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 4`
+- Exposes ARK and Authority endpoints
+- Does not run internal scheduler/publisher
 
-### Worker (solo publicación)
+### Worker (publish/update only)
 
 - Entry point: `app/main_worker.py`
 - CLI: `dark-core-worker`
-- Scheduler APScheduler con ciclo de publicación por intervalo
-- Comando de estado de proceso: `dark-core-worker-status`
-- También disponible por módulo: `python -m app.main_worker status`
+- APScheduler-based interval loop
+- Process status command: `dark-core-worker-status`
+- Also available as module command: `python -m app.main_worker status`
 
-### Modelo operacional
+### Operational model
 
-- API y worker corren desacoplados
-- Se despliegan y escalan de forma independiente
-- El estado del worker se expone vía API usando heartbeat en DB
+- API and worker run decoupled
+- Deployment and scaling are independent
+- Worker runtime status is exposed through DB heartbeat
 
-## 2. Persistencia y Modelo de Datos
+## 2. Persistence and Data Model
 
-### Base de datos
+### Database
 
 - SQLAlchemy 2.0+
-- Alembic para migraciones
-- PostgreSQL como motor estándar (dev/staging/prod)
+- Alembic migrations
+- PostgreSQL as standard engine (dev/staging/prod)
 
-### Tabla principal: `ark_records`
+### Main table: `ark_records`
 
-Campos relevantes:
+Relevant fields:
 
 - `id` (PK autoincrement)
 - `naan`, `name`
-- `state` (`R`, `D`, `P`, `T`)
+- `state` (`R`, `D`, `U`, `P`, `T`)
 - `authority_id`
 - `target`, `metadata_cid`, `metadata_format`
 - `alternate_identifiers`
 - `created_at`, `updated_at`, `tombstoned_at`
 - `client_item_id`
-- tracking de publicación:
+- publish tracking:
   - `publish_retry_count`
   - `publish_last_error`
   - `publish_last_attempt_at`
   - `publish_permanently_failed`
 
-### Decisión de modelado
+### Modeling decisions
 
-- No existe columna `ark` física
-- El ARK completo se calcula como `ark:{naan}/{name}`
-- Restricción única real: `uq_naan_name` sobre `(naan, name)`
+- No physical `ark` column
+- Full ARK is computed as `ark:{naan}/{name}`
+- Real uniqueness boundary: `uq_naan_name` on `(naan, name)`
 
-### Tabla de secuencia: `noid_counters`
+### Counter table: `noid_counters`
 
-Campos relevantes:
+Relevant fields:
 
-- `namespace_key` (PK, formato `NAAN:SHOULDER`)
-- `next_value` (siguiente contador a asignar)
+- `namespace_key` (PK, format `NAAN:SHOULDER`)
+- `next_value` (next integer to allocate)
 - `updated_at`
 
-### Estrategia de minting y concurrencia
+### Worker runtime table: `worker_runtime_status`
 
-- El nombre ARK ya no se genera random.
-- `POST /arks` y `POST /arks/batch` asignan contador secuencial por namespace.
-- El contador se incrementa atómicamente y luego se codifica en base29 (sin vocales).
-- Política actual: largo fijo `7` para la parte generada (operado vía `MINTER_NOID_MIN_LENGTH=7`).
-- Capacidad por namespace: `29^7 = 17,249,876,309`.
-- Se agrega checkdigit NOID al final del `name` (configurable, default activo).
-- `GET/PUT/DELETE` validan checkdigit cuando `MINTER_NOID_CHECKDIGIT=true`.
-- Con validación activa, ARKs legacy sin checkdigit válido son rechazados con `400`.
-- Inserción de `ark_records` en savepoint para manejar colisiones sin perder avance del contador.
-- Worker usa claim de filas con locking PostgreSQL (`FOR UPDATE SKIP LOCKED`) para evitar doble publicación concurrente.
+Relevant fields:
 
-## 3. Flujo de Estados
+- `worker_name` (PK)
+- `instance_id`, `host`, `pid`, `status`
+- `last_heartbeat_at`, `started_at`, `last_cycle_at`
+- runtime counters (`total_processed`, `total_succeeded`, `total_failed`, `total_permanent_failures`)
+
+## 3. Minting and Concurrency Strategy
+
+- ARK names are deterministic (not random).
+- `POST /arks` and `POST /arks/batch` allocate a sequential counter per namespace.
+- Counter increment is atomic and encoded in base29.
+- Current policy: fixed generated-part length `7` (`MINTER_NOID_LENGTH=7`).
+- Capacity per namespace: `29^7 = 17,249,876,309`.
+- NOID checkdigit is appended by default.
+- `GET/PUT/DELETE` validate checkdigit when `MINTER_NOID_CHECKDIGIT=true`.
+- ARK insert uses savepoint so collisions do not lose consumed counter progress.
+
+PostgreSQL concurrency hardening:
+
+- Draft claim uses `FOR UPDATE SKIP LOCKED`.
+- Lifecycle transitions use SQL compare-and-set (CAS):
+  - `RESERVED -> DRAFT`
+  - `PUBLISHED/UPDATE -> UPDATE`
+  - `DRAFT/UPDATE -> PUBLISHED`
+  - `* -> TOMBSTONE` (idempotent)
+- `publish_retry_count` increments atomically in SQL.
+- Worker singleton is enforced with PostgreSQL advisory lock (`pg_try_advisory_lock`) keyed by `WORKER_RUNTIME_NAME`.
+
+## 4. Lifecycle Flows
 
 ```text
 RESERVED (POST /arks)
     -> DRAFT (PUT /arks/{ark})
-    -> PUBLISHED (worker standalone)
+    -> PUBLISHED (worker: create_ark)
+
+PUBLISHED (local/chain)
+    -> UPDATE (PUT /arks/{ark})
+    -> PUBLISHED (worker: update_ark)
+
+RESERVED|DRAFT|UPDATE|PUBLISHED
     -> TOMBSTONE (DELETE /arks/{ark})
 ```
 
-## 4. Endpoints API
+Behavior details for `PUT /api/v1/arks/{ark}`:
+
+- If local state is `RESERVED`: move to `DRAFT`.
+- If local state is `DRAFT`: overwrite pending payload, remain `DRAFT`.
+- If local state is `PUBLISHED` or `UPDATE`: move to/keep `UPDATE`.
+- If local record is missing but ARK exists on-chain: import local `PUBLISHED`, then move to `UPDATE`.
+- If local state is `TOMBSTONE`: reject update.
+
+## 5. API Endpoints
 
 ### ARKs
 
@@ -113,53 +145,49 @@ RESERVED (POST /arks)
 
 ### Worker
 
-- `GET /api/v1/worker/status` (lee heartbeat en DB, sin acoplar procesos)
+- `GET /api/v1/worker/status` (DB heartbeat based)
 
 ### Health
 
 - `GET /health`
-- Verifica blockchain, DB y metadata storage
-- Para estado del worker usar `GET /api/v1/worker/status`
+- Verifies blockchain, DB, and metadata storage
 
-## 5. Worker Publisher Standalone
+## 6. Worker Publisher
 
-### Comportamiento
+### Behavior
 
-- Toma ARKs `DRAFT` pendientes
-- Aplica backoff exponencial por reintentos
-- Publica en blockchain via orchestrator
-- Actualiza estado a `PUBLISHED` o marca fallos de publicación
+- Claims pending ARKs in `DRAFT`/`UPDATE`
+- Applies exponential backoff for retries
+- Publishes to blockchain via orchestrator
+- Updates state to `PUBLISHED` or marks publish failures
 
 ### Scheduler
 
-- Basado en `APScheduler`
-- Configurado por:
+- `APScheduler`
+- Configured by:
   - `WORKER_INTERVAL_SECONDS`
   - `WORKER_BATCH_SIZE`
   - `WORKER_MAX_RETRIES`
   - `WORKER_RETRY_BACKOFF_BASE`
 
-### Operación singleton por proceso
+### Distributed singleton operation
 
-- Usa pid file: `/tmp/dark-core-worker.pid`
-- Evita doble instancia local del worker
-- `dark-core-worker-status` retorna:
+- PostgreSQL advisory lock per `WORKER_RUNTIME_NAME`
+- If lock is already held, worker startup aborts
+- Local pidfile (`/tmp/dark-core-worker.pid`) remains for host-level process status
+- `dark-core-worker-status` returns:
   - `RUNNING pid=<pid>` (exit code 0)
   - `NOT_RUNNING` (exit code 1)
-- Publica heartbeat periódico en DB:
-  - `worker_name`
-  - `status` (`STARTING`, `RUNNING`, `ERROR`, `STOPPED`)
-  - `last_heartbeat_at`
-  - métricas de procesamiento
+- Periodic heartbeat persisted in DB with status and counters
 
-## 6. Metadata Multi-Formato
+## 7. Metadata Formats
 
-- `metadata` se recibe como string raw
-- `metadata_format` soporta `json` y `xml`
-- Contenido se persiste en storage externo
-- DB guarda `metadata_cid` + `metadata_format`
+- `metadata` is received as raw string
+- `metadata_format` supports `json` and `xml`
+- Content is persisted in external storage
+- DB stores `metadata_cid` + `metadata_format`
 
-## 7. Configuración Relevante
+## 8. Relevant Configuration
 
 ```bash
 # DB
@@ -178,62 +206,64 @@ WORKER_RUNTIME_NAME=ark-publisher
 WORKER_HEARTBEAT_INTERVAL_SECONDS=10
 WORKER_HEARTBEAT_STALE_AFTER_SECONDS=180
 
-# Cache autorización
+# Authorization cache
 AUTH_CACHE_TTL=60
 AUTH_CACHE_MAXSIZE=1000
 
-# Minting secuencial
+# Deterministic minting
 MINTER_SHOULDER=
-MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_LENGTH=7
 MINTER_NOID_CHECKDIGIT=true
 ```
 
-## 8. Docker y Compose
+## 9. Docker and Compose
 
-`docker-compose.yml` define servicios separados:
+`docker-compose.yml` defines separated services:
 
 - `postgres`
 - `minter-api`
 - `minter-worker`
 
-API y worker dependen de `postgres` y usan `DATABASE_URL` PostgreSQL compartida.
+API and worker share PostgreSQL via `DATABASE_URL`.
 
-## 9. Testing
+## 10. Testing
 
-Suite principal:
+Main suites:
 
 - `tests/test_persistence.py`
 - `tests/test_worker.py`
 - `tests/test_worker_unit.py`
+- `tests/test_main_worker_lock.py`
 - `tests/test_storage.py`
 - `tests/test_auth_cache.py`
 - `tests/test_middleware.py`
 
-Validación reciente de regresión (worker + persistencia): `22 passed`.
+Recent full regression result: `99 passed`.
 
-## 10. Migraciones
+## 11. Migrations
 
-- Migraciones en `alembic/versions/`
-- Auto-ejecución de `alembic upgrade head` en startup de API y worker
-- Fail-fast si migración falla
+- Migration files in `alembic/versions/`
+- `alembic upgrade head` auto-runs on API and worker startup
+- Fail-fast if migration fails
 
-## 11. Archivos Clave Actualizados
+## 12. Key Updated Files
 
-- `app/main.py` (API sin scheduler interno)
-- `app/main_worker.py` (worker standalone + heartbeat DB + status/pidfile)
-- `app/api/worker.py` (status API basado en heartbeat DB)
-- `app/api/router.py` (rutas de worker restauradas con backend DB)
-- `docker-compose.yml` (servicios API/worker separados)
-- `pyproject.toml` (scripts `dark-core-worker` y `dark-core-worker-status`)
-- `README.md` (operación actual)
-- `noid.md` (especificación detallada de esquema y minting NOID)
+- `app/main.py` (API without internal scheduler)
+- `app/main_worker.py` (standalone worker + DB heartbeat + advisory lock)
+- `app/api/arks.py` (`PUT` state-aware transitions including import path)
+- `app/api/worker.py` (worker status from DB heartbeat)
+- `app/repositories/ark_repository.py` (CAS transitions and atomic updates)
+- `app/workers/publisher.py` (`create_ark` vs `update_ark` by state)
+- `app/models/states.py` (new `UPDATE` state)
+- `README.md`
+- `minter-architecture.md`
+- `noid.md`
 
-## 12. Pendientes Técnicos Recomendados
+## 13. Recommended Next Improvements
 
-- Endurecer transición de estados con compare-and-set atómico
-- Validación estricta de ownership en DELETE (mTLS -> `authority_id`)
-- Alertas operativas sobre heartbeat stale (Prometheus/Grafana o equivalente)
+- Strict ownership validation for `DELETE` using mTLS identity mapping
+- Operational alerting for stale worker heartbeat (Prometheus/Grafana or equivalent)
 
 ---
 
-**Estado general:** Implementación operativa con separación completa API/worker y scheduler ejecutándose en proceso dedicado.
+**Overall status:** Operational implementation with full API/worker separation and robust PostgreSQL concurrency controls (row locks + CAS + advisory lock).

@@ -9,7 +9,7 @@
 
 The Core Minter API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It handles the full lifecycle of ARK identifiers:
 - **Reserve**: Generate IDs locally using deterministic DB counters + NOID checkdigit (with optional external identifiers like DOI/OAI).
-- **Publish**: Persist metadata to IPFS and register on blockchain (`draft` -> `published`).
+- **Publish/Update**: Persist metadata and publish create/update on blockchain (`draft|update` -> `published`).
 - **Resolve**: Retrieve current state and metadata.
 - **Tombstone**: Deactivate identifiers.
 
@@ -88,6 +88,7 @@ Detailed spec and implementation notes: [`noid.md`](./noid.md)
 Once running, visit:
 - Swagger UI: `http://localhost:8001/docs`
 - ReDoc: `http://localhost:8001/redoc`
+- Full architecture (Mermaid): [`minter-architecture.md`](./minter-architecture.md)
 
 ## Configuration Guide
 
@@ -128,11 +129,11 @@ All settings are configured via environment variables or a `.env` file.
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `MINTER_SHOULDER` | Unique prefix for ARK generation (e.g., `x`, `s1`, `test`) | `""` | No |
-| `MINTER_NOID_MIN_LENGTH` | Generated-part length for NOID counter (operated as fixed) | `7` | No |
+| `MINTER_NOID_LENGTH` | Generated-part length for NOID counter (operated as fixed) | `7` | No |
 | `MINTER_NOID_CHECKDIGIT` | Append and enforce trailing NOID checkdigit | `true` | No |
 
 > **Note**: The shoulder helps identify ARKs from this minter instance. Use different shoulders for different environments (dev, staging, prod).
-> **Note**: Current policy uses fixed generated-part length `7` (the setting name is historical).
+> **Note**: Current policy uses fixed generated-part length `7`.
 
 #### 🗄️ Database
 
@@ -206,7 +207,7 @@ DARK_ADMIN_PRIVATE_KEY=0xYourPrivateKey
 
 # Development minter
 MINTER_SHOULDER=dev
-MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_LENGTH=7
 MINTER_NOID_CHECKDIGIT=true
 
 # PostgreSQL local
@@ -242,7 +243,7 @@ DARK_ADMIN_PRIVATE_KEY=0xProductionPrivateKey  # Use secrets manager!
 
 # Production minter identity
 MINTER_SHOULDER=prod
-MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_LENGTH=7
 MINTER_NOID_CHECKDIGIT=true
 
 # PostgreSQL
@@ -285,7 +286,7 @@ DARK_CONTRACT_ADDRESS=0xContainerContractAddress
 DARK_ADMIN_PRIVATE_KEY=0xContainerPrivateKey
 
 MINTER_SHOULDER=docker
-MINTER_NOID_MIN_LENGTH=7
+MINTER_NOID_LENGTH=7
 MINTER_NOID_CHECKDIGIT=true
 
 # PostgreSQL container
@@ -323,23 +324,29 @@ The Minter API manages ARKs through the following states:
 2. **DRAFT**: Metadata added, ready for publication
    - Transition via `PUT /api/v1/arks/{ark}`
    - Requires `target` URL, `metadata` (raw JSON/XML string), and `metadata_format` ("json" or "xml")
+   - If `target` is missing/empty, the request is rejected and state remains `RESERVED` (no DRAFT transition)
    - Metadata stored immediately, CID returned in response
    - Authorization validated before transition
-   - Async worker picks up for blockchain publication
+   - Async worker picks up and executes on-chain `create_ark`
 
-3. **PUBLISHED**: Published to blockchain and metadata stored
+3. **UPDATE**: Existing published ARK pending on-chain update
+   - Triggered by `PUT /api/v1/arks/{ark}` when local state is `PUBLISHED`/`UPDATE`
+   - Also used when ARK is missing in DB but exists on-chain (record is imported first)
+   - Async worker picks up and executes on-chain `update_ark`
+
+4. **PUBLISHED**: Published to blockchain and metadata stored
    - Automated by async worker
    - Metadata stored (filesystem or IPFS)
    - ARK registered on blockchain via orchestrator
    - CID stored in database
 
-4. **TOMBSTONE**: ARK deactivated
+5. **TOMBSTONE**: ARK deactivated
    - Soft delete via `DELETE /api/v1/arks/{ark}`
    - Retains historical record
 
 ### Async Worker
 
-The publisher worker runs as a separate process (`dark-core-worker`) and publishes DRAFT ARKs to the blockchain:
+The publisher worker runs as a separate process (`dark-core-worker`) and publishes pending ARKs (`DRAFT` and `UPDATE`) to the blockchain:
 
 - **Trigger**: Runs on interval (default: every 60 seconds)
 - **Processing**: FIFO order (oldest drafts first)
@@ -347,10 +354,13 @@ The publisher worker runs as a separate process (`dark-core-worker`) and publish
 - **Error Handling**: 
   - Independent transactions per ARK (one failure doesn't affect others)
   - PostgreSQL row claim with `FOR UPDATE SKIP LOCKED` to avoid duplicate processing
+  - State transitions use DB compare-and-set (`UPDATE ... WHERE state=...`) to prevent lost updates
+  - Publish retry counters are incremented atomically in SQL
+  - `DRAFT` records call on-chain `create_ark`; `UPDATE` records call on-chain `update_ark`
   - Exponential backoff for retriable errors (network, gas, etc.)
   - Permanent failure for authority errors (unauthorized, invalid NAAN)
   - Max retries before marking as permanently failed (default: 5)
-- **Deployment**: Run as singleton service/container (separate from API)
+- **Deployment**: Run as singleton service/container (separate from API) with PostgreSQL advisory lock (`pg_try_advisory_lock`) plus local pidfile guard
 - **Monitoring**: API reads DB heartbeat at `GET /api/v1/worker/status`
 
 ### Metadata Storage
@@ -404,6 +414,7 @@ TLS_CA_FILE=/path/to/ca.crt
 4. Check API status endpoint: `GET /api/v1/worker/status`
 5. Check logs for errors
 6. Verify ARKs are in DRAFT state (not RESERVED or permanently failed)
+7. If logs show `Worker advisory lock already held`, stop the other worker instance or use a different `WORKER_RUNTIME_NAME`
 
 **ARKs stuck in DRAFT:**
 1. Check worker logs for recent errors
@@ -470,7 +481,7 @@ pytest tests/test_auth_cache.py -v
 pytest tests/test_middleware.py -v
 
 # Worker tests
-pytest tests/test_worker.py tests/test_worker_unit.py -v
+pytest tests/test_worker.py tests/test_worker_unit.py tests/test_main_worker_lock.py -v
 ```
 
 ### Test Coverage
@@ -482,6 +493,7 @@ pytest tests/test_worker.py tests/test_worker_unit.py -v
 | `middleware/auth.py` | mTLS enabled/disabled, cert validation |
 | `workers/publisher.py` | Batch processing, retry logic, error handling |
 | `repositories/ark_repository.py` | Full CRUD, state transitions |
+| `main_worker.py` | Worker singleton advisory lock behavior |
 
 ## License
 

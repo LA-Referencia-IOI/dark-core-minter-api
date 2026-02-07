@@ -14,7 +14,7 @@ from app.utils.noid import ALPHABET, compute_checkdigit, encode_counter
 def _expected_name(naan: str, counter: int) -> str:
     """Build expected deterministic name using current runtime settings."""
     settings = get_settings()
-    stem = f"{settings.minter_shoulder}{encode_counter(counter, settings.minter_noid_min_length)}"
+    stem = f"{settings.minter_shoulder}{encode_counter(counter, settings.minter_noid_length)}"
     if settings.minter_noid_checkdigit:
         return f"{stem}{compute_checkdigit(f'{naan}/{stem}')}"
     return stem
@@ -159,8 +159,8 @@ def test_update_ark_to_draft(client, test_db, mock_orchestrator):
     assert db_ark.metadata_cid is not None
 
 
-def test_update_ark_wrong_state(client, test_db, mock_orchestrator):
-    """Test that updating non-RESERVED ARK fails."""
+def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_orchestrator):
+    """Updating an ARK already in DRAFT should overwrite pending payload."""
     mock_orchestrator.is_authorized_for_naan.return_value = True
     
     # Create a DRAFT ARK directly in DB
@@ -179,7 +179,7 @@ def test_update_ark_wrong_state(client, test_db, mock_orchestrator):
     db_ark.metadata_cid = "abc123"
     test_db.commit()
     
-    # Try to update again (should fail)
+    # Update again (should overwrite and remain DRAFT)
     response = client.put(
         f"/api/v1/arks/ark:12345/{name}",
         json={
@@ -190,8 +190,124 @@ def test_update_ark_wrong_state(client, test_db, mock_orchestrator):
         },
     )
     
-    assert response.status_code == 400
-    assert "RESERVED state" in response.json()["detail"]
+    assert response.status_code == 200
+    body = response.json()
+    assert body["state"] == ARKState.DRAFT
+    assert body["target"] == "https://new-url.org"
+    assert body["metadata_format"] == "json"
+    assert body["metadata_cid"] is not None
+
+
+def test_update_ark_published_transitions_to_update(client, test_db, mock_orchestrator):
+    """Updating a local PUBLISHED ARK should transition it to UPDATE."""
+    from app.repositories import ARKRepository
+
+    repo = ARKRepository(test_db)
+    name = _expected_name("12345", 43)
+    db_ark = repo.create_published_import(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+        target="https://published.example/original",
+        metadata_cid="cid-original",
+        metadata_format="json",
+    )
+    test_db.commit()
+
+    response = client.put(
+        f"/api/v1/arks/ark:12345/{name}",
+        json={
+            "authority_id": "test-uuid",
+            "target": "https://published.example/new",
+            "metadata": json.dumps({"title": "Updated Title"}),
+            "metadata_format": "json",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == ARKState.UPDATE
+    assert data["target"] == "https://published.example/new"
+    assert data["metadata_cid"] is not None
+
+    test_db.refresh(db_ark)
+    assert db_ark.state == ARKState.UPDATE
+
+
+def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock_orchestrator):
+    """If ARK is missing in DB but exists on-chain, API imports and queues UPDATE."""
+    from types import SimpleNamespace
+
+    imported_name = _expected_name("12345", 700)
+    mock_orchestrator.ark_exists.return_value = True
+    mock_orchestrator.get_ark.return_value = SimpleNamespace(
+        naan="12345",
+        name=imported_name,
+        url="https://chain.example/original",
+        cid="cid-chain",
+        owner="0xabc",
+    )
+
+    response = client.put(
+        f"/api/v1/arks/ark:12345/{imported_name}",
+        json={
+            "authority_id": "test-uuid",
+            "target": "https://chain.example/new",
+            "metadata": json.dumps({"title": "Imported then updated"}),
+            "metadata_format": "json",
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["ark"] == f"ark:12345/{imported_name}"
+    assert data["state"] == ARKState.UPDATE
+    assert data["target"] == "https://chain.example/new"
+    assert data["metadata_cid"] is not None
+
+    db_ark = test_db.query(ARKRecord).filter_by(naan="12345", name=imported_name).first()
+    assert db_ark is not None
+    assert db_ark.state == ARKState.UPDATE
+    assert db_ark.authority_id == "test-uuid"
+
+
+def test_update_to_published_requires_draft_state(test_db):
+    """Repository CAS should reject publish transition when state is not DRAFT."""
+    from app.repositories import ARKRepository
+
+    repo = ARKRepository(test_db)
+    name = _expected_name("12345", 52)
+    repo.create_reserved(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+    )
+    test_db.commit()
+
+    with pytest.raises(ValueError, match=r"one of \[D, U\]"):
+        repo.update_to_published(f"ark:12345/{name}", "cid-test")
+
+
+def test_tombstone_transition_is_idempotent(test_db):
+    """Tombstone transition should be safe to call multiple times."""
+    from app.repositories import ARKRepository
+
+    repo = ARKRepository(test_db)
+    name = _expected_name("12345", 53)
+    repo.create_reserved(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+    )
+    test_db.commit()
+
+    first = repo.update_to_tombstone(f"ark:12345/{name}")
+    test_db.commit()
+    second = repo.update_to_tombstone(f"ark:12345/{name}")
+    test_db.commit()
+
+    assert first.state == ARKState.TOMBSTONE
+    assert second.state == ARKState.TOMBSTONE
 
 
 def test_batch_partial_failure(client, test_db, mock_orchestrator):
@@ -329,7 +445,7 @@ def test_get_ark_rejects_invalid_checkdigit_when_enabled(client):
     if not settings.minter_noid_checkdigit:
         pytest.skip("checkdigit validation disabled")
 
-    stem = f"{settings.minter_shoulder}{encode_counter(0, settings.minter_noid_min_length)}"
+    stem = f"{settings.minter_shoulder}{encode_counter(0, settings.minter_noid_length)}"
     valid = compute_checkdigit(f"12345/{stem}")
     invalid = next(ch for ch in ALPHABET if ch != valid)
     response = client.get(f"/api/v1/arks/ark:12345/{stem}{invalid}")

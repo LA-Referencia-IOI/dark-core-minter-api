@@ -6,6 +6,7 @@ deployed as a singleton service.
 """
 
 import argparse
+import hashlib
 import logging
 import os
 import signal
@@ -19,6 +20,7 @@ from typing import Any, Dict, Optional
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+from sqlalchemy import text
 
 from app.config import get_settings
 from app.database import init_db, close_db
@@ -172,6 +174,62 @@ def _extract_runtime_stats(publisher: Optional[ARKPublisher]) -> Dict[str, Any]:
     }
 
 
+def _build_advisory_lock_key(worker_name: str) -> int:
+    """
+    Build a stable PostgreSQL advisory lock key from worker name.
+
+    Uses 63-bit positive integer range accepted by bigint advisory locks.
+    """
+    digest = hashlib.sha256(worker_name.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big") & 0x7FFFFFFFFFFFFFFF
+
+
+class _WorkerAdvisoryLock:
+    """Session-scoped PostgreSQL advisory lock held for worker lifetime."""
+
+    def __init__(self, key: int):
+        self.key = key
+        self._db = None
+
+    def acquire(self) -> bool:
+        """Try to acquire advisory lock. Returns True when acquired."""
+        session_factory = SessionLocal()
+        db = session_factory()
+        try:
+            acquired = bool(
+                db.execute(
+                    text("SELECT pg_try_advisory_lock(:key)"),
+                    {"key": self.key},
+                ).scalar()
+            )
+            if acquired:
+                self._db = db
+                return True
+        except Exception:
+            db.close()
+            raise
+
+        db.close()
+        return False
+
+    def release(self) -> None:
+        """Release advisory lock and close dedicated lock session."""
+        if self._db is None:
+            return
+        try:
+            self._db.execute(
+                text("SELECT pg_advisory_unlock(:key)"),
+                {"key": self.key},
+            )
+            self._db.commit()
+        except Exception as e:
+            logger.warning(f"Failed to release advisory lock: {e}")
+            self._db.rollback()
+        finally:
+            self._db.close()
+            self._db = None
+
+
 def _persist_worker_heartbeat(
     worker_name: str,
     instance_id: str,
@@ -235,6 +293,7 @@ def run_worker() -> None:
     started_at = _utc_now()
     heartbeat_interval = max(1, settings.worker_heartbeat_interval_seconds)
     publisher: Optional[ARKPublisher] = None
+    advisory_lock: Optional[_WorkerAdvisoryLock] = None
 
     logger.info("Starting dARK Core Worker...")
 
@@ -242,6 +301,15 @@ def run_worker() -> None:
         logger.info("Initializing database...")
         init_db()
         logger.info("Database initialized successfully")
+        lock_key = _build_advisory_lock_key(settings.worker_runtime_name)
+        advisory_lock = _WorkerAdvisoryLock(lock_key)
+        if not advisory_lock.acquire():
+            raise RuntimeError(
+                f"Worker advisory lock already held for {settings.worker_runtime_name}"
+            )
+        logger.info(
+            f"Acquired PostgreSQL advisory lock for worker={settings.worker_runtime_name} key={lock_key}"
+        )
         _persist_worker_heartbeat(
             worker_name=settings.worker_runtime_name,
             instance_id=instance_id,
@@ -339,6 +407,9 @@ def run_worker() -> None:
         )
         shutdown_orchestrator()
         shutdown_metadata_storage()
+        if advisory_lock is not None:
+            advisory_lock.release()
+            logger.info("Released PostgreSQL advisory lock")
         close_db()
         if acquired_pid:
             _release_worker_pid()

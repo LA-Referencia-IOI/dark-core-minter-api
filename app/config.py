@@ -51,7 +51,7 @@ class Settings(BaseSettings):
     
     # Minter Configuration
     minter_shoulder: str = ""
-    minter_noid_min_length: int = 7
+    minter_noid_length: int = 7
     minter_noid_checkdigit: bool = True
     
     # mTLS Configuration

@@ -1,194 +1,193 @@
 # NOID Implementation (dARK Core Minter API)
 
-Este documento describe en detalle la implementación actual de NOID en `dark-core-minter-api`.
+This document describes the current NOID implementation in `dark-core-minter-api`.
 
-## 1. Resumen Ejecutivo
+## 1. Executive Summary
 
-El minting de ARKs usa un esquema determinístico, secuencial y persistente:
+ARK minting uses a deterministic, sequential, persistent scheme:
 
-- Contador por namespace en DB (`noid_counters`).
-- Codificación base29 sin vocales.
-- Largo de parte generada operado como fijo (`7`).
-- Checkdigit NOID al final (activo por defecto).
+- Per-namespace counter in DB (`noid_counters`)
+- Base29 encoding without vowels
+- Generated-part length operated as fixed (`7`)
+- NOID checkdigit suffix (enabled by default)
 
-Resultado: IDs estables, sin dependencia de RNG, con capacidad predecible por namespace.
+Result: stable IDs, no RNG dependency, and predictable per-namespace capacity.
 
-## 2. Formato del Identificador
+## 2. Identifier Format
 
-ARK completo:
+Full ARK:
 
 ```text
 ark:{naan}/{name}
 ```
 
-`name` actual:
+Current `name`:
 
 ```text
 {shoulder}{counter_part}{checkdigit}
 ```
 
-Donde:
+Where:
 
-- `shoulder`: prefijo opcional del minter.
-- `counter_part`: contador codificado en base29 con largo fijo `7`.
-- `checkdigit`: caracter calculado sobre `"{naan}/{shoulder}{counter_part}"`.
+- `shoulder`: optional minter prefix
+- `counter_part`: base29-encoded counter with fixed length `7`
+- `checkdigit`: character computed over `"{naan}/{shoulder}{counter_part}"`
 
-Ejemplo:
+Examples:
 
 - `ark:12345/x0000000d`
 - `ark:12345/x0000001w`
 
-## 3. Alfabeto y Base
+## 3. Alphabet and Base
 
-Alfabeto:
+Alphabet:
 
 ```text
 0123456789bcdfghjkmnpqrstvwxz
 ```
 
-- Base = 29.
-- Se excluyen vocales para evitar palabras accidentales.
+- Base = 29
+- Vowels are excluded to reduce accidental words
 
-Implementado en:
+Implemented in:
 
-- `app/utils/noid.py` (`ALPHABET`, `BASE`).
+- `app/utils/noid.py` (`ALPHABET`, `BASE`)
 
-## 4. Configuración Relevante
+## 4. Relevant Configuration
 
 Variables:
 
 - `MINTER_SHOULDER` (default `""`)
-- `MINTER_NOID_MIN_LENGTH` (default `7`)
+- `MINTER_NOID_LENGTH` (default `7`)
 - `MINTER_NOID_CHECKDIGIT` (default `true`)
 
-Nota importante:
+Important note:
 
-- El nombre de la variable `MINTER_NOID_MIN_LENGTH` es histórico.
-- Política actual: se opera como largo fijo recomendado `7`.
+- Current policy operates it as fixed length (recommended `7`).
 
-## 5. Capacidad por Namespace
+## 5. Namespace Capacity
 
-Capacidad de `counter_part`:
+`counter_part` capacity:
 
 ```text
 base^length = 29^7 = 17,249,876,309
 ```
 
-Esto es por cada namespace:
+Per namespace:
 
 ```text
 namespace = "{NAAN}:{SHOULDER}"
 ```
 
-El checkdigit no reduce esta capacidad porque se agrega al final.
+Checkdigit does not reduce this capacity because it is appended.
 
-## 6. Modelo de Datos
+## 6. Data Model
 
-Tabla:
+Table:
 
 - `noid_counters`
   - `namespace_key` (PK, `NAAN:SHOULDER`)
-  - `next_value` (siguiente valor a asignar)
+  - `next_value` (next value to allocate)
   - `updated_at`
 
-Migración:
+Migration:
 
 - `alembic/versions/0002_add_noid_counters.py`
 
-## 7. Flujo de Minting
+## 7. Minting Flow
 
-### 7.1 Reserva simple (`POST /api/v1/arks`)
+### 7.1 Single reserve (`POST /api/v1/arks`)
 
-1. Validar autorización de authority/NAAN.
-2. Construir `namespace_key`.
-3. Reservar contador atómicamente (`allocate_next`).
-4. Codificar `counter_part` en base29.
-5. Construir `name` con shoulder.
-6. Si `MINTER_NOID_CHECKDIGIT=true`, agregar checkdigit.
-7. Insertar `ark_records` en savepoint.
-8. `commit` transacción.
+1. Validate authority/NAAN authorization
+2. Build `namespace_key`
+3. Allocate counter atomically (`allocate_next`)
+4. Encode `counter_part` in base29
+5. Build `name` with shoulder
+6. Append checkdigit when `MINTER_NOID_CHECKDIGIT=true`
+7. Insert `ark_records` within savepoint
+8. Commit transaction
 
-### 7.2 Reserva batch (`POST /api/v1/arks/batch`)
+### 7.2 Batch reserve (`POST /api/v1/arks/batch`)
 
-- Mismo flujo por item.
-- Cada item usa retries por colisión.
-- Se acumulan resultados y errores.
-- Commit al final del batch.
+- Same flow per item
+- Per-item collision retries
+- Collect results and errors
+- Commit once at end of batch
 
-## 8. Concurrencia y Atomicidad
+## 8. Concurrency and Atomicity
 
-Repositorio:
+Repository:
 
 - `app/repositories/noid_counter_repository.py`
 
-Estrategia:
+Strategy:
 
-- Inserción lazy de fila namespace (`INSERT ... ON CONFLICT DO NOTHING` en SQLite/PostgreSQL).
-- Incremento atómico con `UPDATE ... RETURNING` cuando disponible.
-- Fallback con lock transaccional (`with_for_update`) para dialectos sin `RETURNING`.
+- Lazy namespace-row creation (`INSERT ... ON CONFLICT DO NOTHING` on PostgreSQL)
+- Atomic increment with `UPDATE ... RETURNING` when available
+- Fallback transactional lock (`with_for_update`) for dialects without `RETURNING`
 
-Objetivo:
+Goal:
 
-- Evitar que dos procesos asignen el mismo `counter_value` en el mismo namespace.
+- Prevent two concurrent processes from allocating the same `counter_value` in the same namespace
 
 ## 9. Checkdigit
 
-Funciones:
+Functions:
 
 - `compute_checkdigit(payload: str) -> str`
 - `validate_name_checkdigit(naan: str, name: str) -> bool`
 
-Regla:
+Rule:
 
-- Para cada caracter, tomar su ordinal dentro de `ALPHABET`.
-- Caracteres fuera del alfabeto aportan `0`.
-- Suma ponderada por posición (base 1).
-- `sum % 29` determina el caracter checkdigit.
+- Map each character to its ordinal inside `ALPHABET`
+- Characters outside alphabet contribute `0`
+- Weighted positional sum (1-based)
+- `sum % 29` selects the checkdigit character
 
-Payload usado para mint:
+Mint payload:
 
 ```text
-{naan}/{name_sin_checkdigit}
+{naan}/{name_without_checkdigit}
 ```
 
-## 10. Validación en API
+## 10. API Validation
 
-Cuando `MINTER_NOID_CHECKDIGIT=true`:
+When `MINTER_NOID_CHECKDIGIT=true`:
 
 - `GET /api/v1/arks/{ark}`
 - `PUT /api/v1/arks/{ark}`
 - `DELETE /api/v1/arks/{ark}`
 
-validan el checkdigit del `name`.
+validate `name` checkdigit.
 
-Si no coincide:
+On mismatch:
 
-- HTTP `400` con detalle de checkdigit inválido.
+- HTTP `400` with invalid-checkdigit detail
 
-Efecto colateral esperado:
+Expected side effect:
 
-- ARKs legacy sin checkdigit válido quedan rechazados por estas rutas mientras la validación esté activa.
+- Legacy ARKs without valid checkdigit are rejected by those routes while validation is enabled
 
-## 11. Política de Overflow
+## 11. Overflow Policy
 
-Con largo fijo `7`, si `counter_value` excede la capacidad del espacio, la codificación crecería naturalmente.
+With fixed length `7`, if `counter_value` exceeds namespace capacity, encoded length can grow naturally.
 
-Política operativa actual:
+Current operational policy:
 
-- Mantener `MINTER_NOID_MIN_LENGTH=7` como estándar de desarrollo.
-- Monitorear consumo por namespace.
-- Si hiciera falta ampliar espacio, migrar a largo `8` de forma controlada.
+- Keep `MINTER_NOID_LENGTH=7` as development standard
+- Monitor per-namespace consumption
+- If needed, move to length `8` in a controlled migration
 
-## 12. Errores y Retries
+## 12. Errors and Retries
 
-- Colisiones únicas en `ark_records` (`uq_naan_name`):
-  - Se reintenta con siguiente contador.
-- Errores de integridad no-unique:
-  - `500`.
-- Si se agotan retries por colisión:
-  - `409`.
+- Unique collisions in `ark_records` (`uq_naan_name`):
+  - Retry with next counter
+- Non-unique integrity errors:
+  - Return `500`
+- Collision retries exhausted:
+  - Return `409`
 
-## 13. Archivos Clave
+## 13. Key Files
 
 - `app/utils/noid.py`
 - `app/api/arks.py`
@@ -197,13 +196,13 @@ Política operativa actual:
 - `alembic/versions/0002_add_noid_counters.py`
 - `tests/test_persistence.py`
 
-## 14. Decisiones de Diseño
+## 14. Design Decisions
 
-1. Contador en DB en lugar de random:
-   - evita colisiones probabilísticas y facilita trazabilidad.
-2. Namespace por `NAAN + shoulder`:
-   - aislamiento por emisor/contexto.
-3. Checkdigit por defecto:
-   - detección temprana de errores de tipeo/corrupción.
-4. Largo fijo operativo:
-   - formato estable y predecible para clientes.
+1. DB counter instead of random generation:
+   - avoids probabilistic collisions and improves traceability
+2. Namespace by `NAAN + shoulder`:
+   - issuer/context isolation
+3. Default checkdigit:
+   - early typo/corruption detection
+4. Fixed operational length:
+   - stable and predictable client-facing format

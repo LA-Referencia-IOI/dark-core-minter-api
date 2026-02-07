@@ -5,6 +5,7 @@ ARK repository for database operations.
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.database.models import ARKRecord
@@ -111,6 +112,45 @@ class ARKRepository:
         )
         self.db.add(db_ark)
         return db_ark
+
+    def create_published_import(
+        self,
+        naan: str,
+        name: str,
+        authority_id: str,
+        target: Optional[str] = None,
+        metadata_cid: Optional[str] = None,
+        metadata_format: Optional[str] = None,
+        alternate_identifiers: Optional[list] = None,
+    ) -> ARKRecord:
+        """
+        Create a local record for an ARK that already exists on-chain.
+
+        Initial local state is PUBLISHED.
+        """
+        if alternate_identifiers:
+            serialized_ids = []
+            for item in alternate_identifiers:
+                if hasattr(item, "model_dump"):
+                    serialized_ids.append(item.model_dump())
+                elif hasattr(item, "dict"):
+                    serialized_ids.append(item.dict())
+                else:
+                    serialized_ids.append(item)
+            alternate_identifiers = serialized_ids
+
+        db_ark = ARKRecord(
+            naan=naan,
+            name=name,
+            state=ARKState.PUBLISHED.value,
+            authority_id=authority_id,
+            target=target,
+            metadata_cid=metadata_cid,
+            metadata_format=metadata_format,
+            alternate_identifiers=alternate_identifiers,
+        )
+        self.db.add(db_ark)
+        return db_ark
     
     def get_by_ark(self, ark: str) -> Optional[ARKRecord]:
         """
@@ -194,13 +234,11 @@ class ARKRepository:
             Does NOT commit. Caller must commit the transaction.
             Metadata content is stored externally via MetadataStorage before calling this.
         """
-        db_ark = self.get_by_ark(ark)
-        if not db_ark:
-            raise ValueError(f"ARK not found: {ark}")
-        
-        if db_ark.state != ARKState.RESERVED:
-            raise ValueError(f"ARK must be in RESERVED state, currently {db_ark.state}")
-        
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError as exc:
+            raise ValueError(f"ARK not found: {ark}") from exc
+
         # Validate required fields
         if not target:
             raise ValueError("Target URL is required")
@@ -221,14 +259,162 @@ class ARKRepository:
                     serialized_ids.append(item)
             alternate_identifiers = serialized_ids
 
-        # Update record
-        db_ark.state = ARKState.DRAFT.value
-        db_ark.target = target
-        db_ark.metadata_cid = metadata_cid
-        db_ark.metadata_format = metadata_format
-        db_ark.alternate_identifiers = alternate_identifiers
-        db_ark.updated_at = _utc_now()
-        
+        now = _utc_now()
+        result = self.db.execute(
+            update(ARKRecord)
+            .where(
+                ARKRecord.naan == naan,
+                ARKRecord.name == name,
+                ARKRecord.state == ARKState.RESERVED.value,
+            )
+            .values(
+                state=ARKState.DRAFT.value,
+                target=target,
+                metadata_cid=metadata_cid,
+                metadata_format=metadata_format,
+                alternate_identifiers=alternate_identifiers,
+                updated_at=now,
+            )
+        )
+
+        if result.rowcount == 0:
+            existing = self.get_by_naan_name(naan, name)
+            if not existing:
+                raise ValueError(f"ARK not found: {ark}")
+            raise ValueError(f"ARK must be in RESERVED state, currently {existing.state}")
+
+        db_ark = self.get_by_naan_name(naan, name)
+        if db_ark is None:
+            raise ValueError(f"ARK not found: {ark}")
+        return db_ark
+
+    def update_draft_content(
+        self,
+        ark: str,
+        target: str,
+        metadata_cid: str,
+        metadata_format: str,
+        alternate_identifiers: Optional[list] = None,
+    ) -> ARKRecord:
+        """
+        Update an ARK already in DRAFT without changing state.
+        """
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError as exc:
+            raise ValueError(f"ARK not found: {ark}") from exc
+
+        if not target:
+            raise ValueError("Target URL is required")
+        if not metadata_cid:
+            raise ValueError("Metadata CID is required")
+        if not metadata_format:
+            raise ValueError("Metadata format is required")
+
+        if alternate_identifiers:
+            serialized_ids = []
+            for item in alternate_identifiers:
+                if hasattr(item, "model_dump"):
+                    serialized_ids.append(item.model_dump())
+                elif hasattr(item, "dict"):
+                    serialized_ids.append(item.dict())
+                else:
+                    serialized_ids.append(item)
+            alternate_identifiers = serialized_ids
+
+        now = _utc_now()
+        result = self.db.execute(
+            update(ARKRecord)
+            .where(
+                ARKRecord.naan == naan,
+                ARKRecord.name == name,
+                ARKRecord.state == ARKState.DRAFT.value,
+            )
+            .values(
+                target=target,
+                metadata_cid=metadata_cid,
+                metadata_format=metadata_format,
+                alternate_identifiers=alternate_identifiers,
+                updated_at=now,
+            )
+        )
+
+        if result.rowcount == 0:
+            existing = self.get_by_naan_name(naan, name)
+            if not existing:
+                raise ValueError(f"ARK not found: {ark}")
+            raise ValueError(f"ARK must be in DRAFT state, currently {existing.state}")
+
+        db_ark = self.get_by_naan_name(naan, name)
+        if db_ark is None:
+            raise ValueError(f"ARK not found: {ark}")
+        return db_ark
+
+    def update_to_update(
+        self,
+        ark: str,
+        target: str,
+        metadata_cid: str,
+        metadata_format: str,
+        alternate_identifiers: Optional[list] = None,
+    ) -> ARKRecord:
+        """
+        Transition ARK to UPDATE state with pending metadata changes.
+
+        Allowed source states: PUBLISHED and UPDATE.
+        """
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError as exc:
+            raise ValueError(f"ARK not found: {ark}") from exc
+
+        if not target:
+            raise ValueError("Target URL is required")
+        if not metadata_cid:
+            raise ValueError("Metadata CID is required")
+        if not metadata_format:
+            raise ValueError("Metadata format is required")
+
+        if alternate_identifiers:
+            serialized_ids = []
+            for item in alternate_identifiers:
+                if hasattr(item, "model_dump"):
+                    serialized_ids.append(item.model_dump())
+                elif hasattr(item, "dict"):
+                    serialized_ids.append(item.dict())
+                else:
+                    serialized_ids.append(item)
+            alternate_identifiers = serialized_ids
+
+        now = _utc_now()
+        result = self.db.execute(
+            update(ARKRecord)
+            .where(
+                ARKRecord.naan == naan,
+                ARKRecord.name == name,
+                ARKRecord.state.in_([ARKState.PUBLISHED.value, ARKState.UPDATE.value]),
+            )
+            .values(
+                state=ARKState.UPDATE.value,
+                target=target,
+                metadata_cid=metadata_cid,
+                metadata_format=metadata_format,
+                alternate_identifiers=alternate_identifiers,
+                updated_at=now,
+            )
+        )
+
+        if result.rowcount == 0:
+            existing = self.get_by_naan_name(naan, name)
+            if not existing:
+                raise ValueError(f"ARK not found: {ark}")
+            raise ValueError(
+                f"ARK must be in PUBLISHED or UPDATE state, currently {existing.state}"
+            )
+
+        db_ark = self.get_by_naan_name(naan, name)
+        if db_ark is None:
+            raise ValueError(f"ARK not found: {ark}")
         return db_ark
     
     def get_drafts_pending_publish(
@@ -249,7 +435,7 @@ class ARKRepository:
             List of ARKRecord in DRAFT state ready to publish
         """
         query = self.db.query(ARKRecord).filter(
-            ARKRecord.state == ARKState.DRAFT.value,
+            ARKRecord.state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value]),
             ARKRecord.publish_permanently_failed == 0,  # Not marked as failed
         )
 
@@ -289,6 +475,7 @@ class ARKRepository:
         self,
         ark: str,
         metadata_cid: str,
+        expected_states: Optional[Tuple[str, ...]] = None,
     ) -> ARKRecord:
         """
         Update ARK to PUBLISHED state.
@@ -306,14 +493,39 @@ class ARKRepository:
         Note:
             Does NOT commit. Caller must commit the transaction.
         """
-        db_ark = self.get_by_ark(ark)
-        if not db_ark:
+        if expected_states is None:
+            expected_states = (ARKState.DRAFT.value, ARKState.UPDATE.value)
+
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError as exc:
+            raise ValueError(f"ARK not found: {ark}") from exc
+
+        now = _utc_now()
+        result = self.db.execute(
+            update(ARKRecord)
+            .where(
+                ARKRecord.naan == naan,
+                ARKRecord.name == name,
+                ARKRecord.state.in_(list(expected_states)),
+            )
+            .values(
+                state=ARKState.PUBLISHED.value,
+                metadata_cid=metadata_cid,
+                updated_at=now,
+            )
+        )
+
+        if result.rowcount == 0:
+            existing = self.get_by_naan_name(naan, name)
+            if not existing:
+                raise ValueError(f"ARK not found: {ark}")
+            expected_str = ", ".join(expected_states)
+            raise ValueError(f"ARK must be in one of [{expected_str}], currently {existing.state}")
+
+        db_ark = self.get_by_naan_name(naan, name)
+        if db_ark is None:
             raise ValueError(f"ARK not found: {ark}")
-        
-        db_ark.state = ARKState.PUBLISHED.value
-        db_ark.metadata_cid = metadata_cid
-        db_ark.updated_at = _utc_now()
-        
         return db_ark
     
     def update_to_tombstone(self, ark: str) -> ARKRecord:
@@ -332,14 +544,35 @@ class ARKRepository:
         Note:
             Does NOT commit. Caller must commit the transaction.
         """
-        db_ark = self.get_by_ark(ark)
-        if not db_ark:
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError as exc:
+            raise ValueError(f"ARK not found: {ark}") from exc
+
+        now = _utc_now()
+        result = self.db.execute(
+            update(ARKRecord)
+            .where(
+                ARKRecord.naan == naan,
+                ARKRecord.name == name,
+                ARKRecord.state != ARKState.TOMBSTONE.value,
+            )
+            .values(
+                state=ARKState.TOMBSTONE.value,
+                tombstoned_at=now,
+                updated_at=now,
+            )
+        )
+
+        if result.rowcount == 0:
+            existing = self.get_by_naan_name(naan, name)
+            if not existing:
+                raise ValueError(f"ARK not found: {ark}")
+            return existing
+
+        db_ark = self.get_by_naan_name(naan, name)
+        if db_ark is None:
             raise ValueError(f"ARK not found: {ark}")
-        
-        db_ark.state = ARKState.TOMBSTONE.value
-        db_ark.tombstoned_at = _utc_now()
-        db_ark.updated_at = _utc_now()
-        
         return db_ark
     
     def mark_publish_failed(
@@ -365,19 +598,36 @@ class ARKRepository:
         Note:
             Does NOT commit. Caller must commit the transaction.
         """
-        db_ark = self.get_by_ark(ark)
-        if not db_ark:
-            raise ValueError(f"ARK not found: {ark}")
-        
-        db_ark.publish_retry_count += 1
-        db_ark.publish_last_error = error_message[:1000]  # Truncate long errors
-        db_ark.publish_last_attempt_at = _utc_now()
-        
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError as exc:
+            raise ValueError(f"ARK not found: {ark}") from exc
+
+        now = _utc_now()
+        values = {
+            "publish_retry_count": ARKRecord.publish_retry_count + 1,
+            "publish_last_error": error_message[:1000],  # Truncate long errors
+            "publish_last_attempt_at": now,
+            "updated_at": now,
+        }
         if is_permanent:
-            db_ark.publish_permanently_failed = 1
-        
-        db_ark.updated_at = _utc_now()
-        
+            values["publish_permanently_failed"] = 1
+
+        result = self.db.execute(
+            update(ARKRecord)
+            .where(
+                ARKRecord.naan == naan,
+                ARKRecord.name == name,
+            )
+            .values(**values)
+        )
+
+        if result.rowcount == 0:
+            raise ValueError(f"ARK not found: {ark}")
+
+        db_ark = self.get_by_naan_name(naan, name)
+        if db_ark is None:
+            raise ValueError(f"ARK not found: {ark}")
         return db_ark
     
     def reset_publish_tracking(self, ark: str) -> ARKRecord:

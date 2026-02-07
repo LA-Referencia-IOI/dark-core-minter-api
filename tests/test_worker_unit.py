@@ -113,6 +113,45 @@ class TestARKPublisherUnit:
         
         # Verify stats updated
         assert publisher.stats["total_succeeded"] == 1
+
+    def test_publish_single_ark_update_calls_update_ark(self):
+        """When local state is UPDATE, worker should call orchestrator.update_ark."""
+        ark_record = MockARKRecord(
+            naan="12345",
+            name="test-update",
+            authority_id="auth-uuid-123",
+            target="https://example.com/updated",
+            metadata_cid="updated_cid",
+            metadata_format="json",
+        )
+        ark_record.state = ARKState.UPDATE
+
+        mock_repo = Mock()
+        mock_repo.get_by_ark.return_value = ark_record
+
+        mock_orchestrator = Mock()
+        mock_orchestrator.update_ark = Mock()
+        mock_orchestrator.create_ark = Mock()
+
+        publisher = ARKPublisher(
+            orchestrator=mock_orchestrator,
+            metadata_storage=MockMetadataStorage(),
+            batch_size=10,
+            max_retries=5,
+            backoff_base=2.0,
+        )
+
+        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
+            mock_session = Mock()
+            mock_session_local.return_value = mock_session
+
+            with patch('app.workers.publisher.ARKRepository') as mock_repo_class:
+                mock_repo_class.return_value = mock_repo
+                success = publisher.publish_single_ark("ark:12345/test-update")
+
+        assert success is True
+        mock_orchestrator.update_ark.assert_called_once()
+        mock_orchestrator.create_ark.assert_not_called()
     
     def test_publish_single_ark_no_metadata_cid(self):
         """Test ARK publication fails gracefully when metadata_cid is missing."""

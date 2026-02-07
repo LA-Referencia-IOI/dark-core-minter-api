@@ -43,7 +43,7 @@ class ARKRecord(Base):
     naan = Column(String(50), nullable=False)
     name = Column(String(100), nullable=False)
     
-    # State tracking
+    # State tracking (R=reserved, D=draft, U=update, P=published, T=tombstone)
     state = Column(String(1), nullable=False, index=True)
     
     # Authority/ownership

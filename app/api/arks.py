@@ -99,7 +99,7 @@ async def reserve_ark(
                 naan=request.naan,
                 counter=counter_value,
                 shoulder=settings.minter_shoulder,
-                min_length=settings.minter_noid_min_length,
+                min_length=settings.minter_noid_length,
                 checkdigit=settings.minter_noid_checkdigit,
             )
 
@@ -200,7 +200,7 @@ async def batch_reserve_ark(
                     naan=request.naan,
                     counter=counter_value,
                     shoulder=settings.minter_shoulder,
-                    min_length=settings.minter_noid_min_length,
+                    min_length=settings.minter_noid_length,
                     checkdigit=settings.minter_noid_checkdigit,
                 )
 
@@ -385,25 +385,49 @@ async def update_ark_metadata(
     # 1. Get ARK from database
     ark_repo = ARKRepository(db)
     db_ark = ark_repo.get_by_ark(ark)
-    
+
+    # 2. If local record is missing, import from blockchain as PUBLISHED.
     if not db_ark:
-        raise HTTPException(status_code=404, detail="ARK not found")
-    
-    # 2. Validate state (must be RESERVED)
-    if db_ark.state != ARKState.RESERVED:
-        raise HTTPException(
-            status_code=400,
-            detail=f"ARK must be in RESERVED state to update, currently {db_ark.state}"
-        )
-    
-    # 3. Validate ownership
+        if not orchestrator.ark_exists(naan, name):
+            raise HTTPException(status_code=404, detail="ARK not found")
+
+        try:
+            chain_info = orchestrator.get_ark(naan, name)
+        except Exception as e:
+            logger.error(f"Failed to fetch ARK from blockchain for local import {ark}: {e}")
+            raise HTTPException(status_code=502, detail="Failed to read ARK from blockchain")
+
+        try:
+            with db.begin_nested():
+                db_ark = ark_repo.create_published_import(
+                    naan=naan,
+                    name=name,
+                    authority_id=request.authority_id,
+                    target=getattr(chain_info, "url", None),
+                    metadata_cid=getattr(chain_info, "cid", None),
+                    metadata_format=None,
+                    alternate_identifiers=None,
+                )
+                db.flush()
+        except IntegrityError:
+            # Lost race importing same on-chain ARK; fetch the row created by concurrent request.
+            db_ark = ark_repo.get_by_ark(ark)
+            if not db_ark:
+                db.rollback()
+                raise HTTPException(status_code=500, detail="Failed to import ARK from blockchain")
+
+    # 3. Tombstone records cannot be modified.
+    if db_ark.state == ARKState.TOMBSTONE:
+        raise HTTPException(status_code=409, detail="ARK is tombstoned and cannot be updated")
+
+    # 4. Validate ownership
     if db_ark.authority_id != request.authority_id:
         raise HTTPException(
             status_code=403,
             detail=f"Authority {request.authority_id} does not own this ARK"
         )
     
-    # 4. Store metadata content and get CID
+    # 5. Store metadata content and get CID
     try:
         metadata_cid = storage.store_metadata(request.metadata, request.metadata_format)
         logger.info(f"Stored metadata for {ark}, CID: {metadata_cid}")
@@ -411,19 +435,40 @@ async def update_ark_metadata(
         logger.error(f"Metadata storage failed for {ark}: {e}")
         raise HTTPException(status_code=500, detail=f"Metadata storage failed: {e}")
     
-    # 5. Update to DRAFT with CID
+    # 6. Apply state-aware transition/update.
     try:
-        db_ark = ark_repo.update_to_draft(
-            ark=ark,
-            target=request.target,
-            metadata_cid=metadata_cid,
-            metadata_format=request.metadata_format,
-            alternate_identifiers=request.alternate_identifiers,
-        )
+        if db_ark.state == ARKState.RESERVED:
+            # New local ARK: pending create_ark.
+            db_ark = ark_repo.update_to_draft(
+                ark=ark,
+                target=request.target,
+                metadata_cid=metadata_cid,
+                metadata_format=request.metadata_format,
+                alternate_identifiers=request.alternate_identifiers,
+            )
+        elif db_ark.state == ARKState.DRAFT:
+            # Idempotent overwrite of pending create_ark payload.
+            db_ark = ark_repo.update_draft_content(
+                ark=ark,
+                target=request.target,
+                metadata_cid=metadata_cid,
+                metadata_format=request.metadata_format,
+                alternate_identifiers=request.alternate_identifiers,
+            )
+        else:
+            # Existing on-chain ARK: queue update_ark via worker.
+            db_ark = ark_repo.update_to_update(
+                ark=ark,
+                target=request.target,
+                metadata_cid=metadata_cid,
+                metadata_format=request.metadata_format,
+                alternate_identifiers=request.alternate_identifiers,
+            )
+
         db.commit()
         db.refresh(db_ark)
         
-        logger.info(f"ARK {ark} updated to DRAFT state (format: {request.metadata_format})")
+        logger.info(f"ARK {ark} updated to state {db_ark.state} (format: {request.metadata_format})")
         
         return ARKResponse(
             ark=db_ark.ark,

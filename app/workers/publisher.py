@@ -11,7 +11,7 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 from dark_orchestrator import DARKOrchestrator
-from dark_orchestrator.exceptions import AuthorityError
+from dark_orchestrator.exceptions import ARKError, AuthorityError
 
 from app.database.connection import SessionLocal
 from app.repositories.ark_repository import ARKRepository
@@ -97,8 +97,8 @@ class ARKPublisher:
                 logger.warning(f"ARK not found during publish: {ark_id}")
                 return False
             
-            if ark_record.state != ARKState.DRAFT:
-                logger.warning(f"ARK {ark_id} not in DRAFT state: {ark_record.state}")
+            if ark_record.state not in (ARKState.DRAFT, ARKState.UPDATE):
+                logger.warning(f"ARK {ark_id} not in publishable state: {ark_record.state}")
                 return False
             
             # Metadata is already stored; CID should be in DB
@@ -119,20 +119,40 @@ class ARKPublisher:
                 from app.repositories.ark_repository import parse_ark
                 naan, name = parse_ark(ark_id)
                 
-                # Create ARK on blockchain
-                self.orchestrator.create_ark(
-                    uuid=ark_record.authority_id,
-                    naan=naan,
-                    name=name,
-                    url=ark_record.target,
-                    cid=cid,
-                )
+                if ark_record.state == ARKState.DRAFT:
+                    self.orchestrator.create_ark(
+                        uuid=ark_record.authority_id,
+                        naan=naan,
+                        name=name,
+                        url=ark_record.target,
+                        cid=cid,
+                    )
+                    operation = "create"
+                else:
+                    self.orchestrator.update_ark(
+                        uuid=ark_record.authority_id,
+                        naan=naan,
+                        name=name,
+                        url=ark_record.target,
+                        cid=cid,
+                    )
+                    operation = "update"
                 
-                logger.info(f"ARK published to blockchain: {ark_id}")
+                logger.info(f"ARK {operation} published to blockchain: {ark_id}")
                 
             except AuthorityError as e:
                 # Authority errors are permanent (unauthorized, etc.)
                 error_msg = f"Authority error (permanent): {e}"
+                logger.error(f"{error_msg} for ARK {ark_id}")
+                repo.mark_publish_failed(ark_id, error_msg, is_permanent=True)
+                db.commit()
+                self.stats["total_permanent_failures"] += 1
+                self._add_recent_error(ark_id, error_msg)
+                return False
+
+            except ARKError as e:
+                # Contract-level ARK errors are usually semantic (already exists/not found).
+                error_msg = f"ARK error (permanent): {e}"
                 logger.error(f"{error_msg} for ARK {ark_id}")
                 repo.mark_publish_failed(ark_id, error_msg, is_permanent=True)
                 db.commit()
@@ -158,8 +178,20 @@ class ARKPublisher:
                 return False
             
             # Step 3: Update DB to PUBLISHED
-            repo.update_to_published(ark_id, cid)
-            db.commit()
+            try:
+                repo.update_to_published(ark_id, cid)
+                db.commit()
+            except ValueError as e:
+                db.rollback()
+                latest = repo.get_by_ark(ark_id)
+                if latest and latest.state == ARKState.PUBLISHED:
+                    logger.info(f"ARK already published by concurrent worker: {ark_id}")
+                    self.stats["total_succeeded"] += 1
+                    return True
+
+                logger.warning(f"CAS conflict finalizing publish for {ark_id}: {e}")
+                self._add_recent_error(ark_id, f"CAS conflict: {e}")
+                return False
             
             logger.info(f"✓ Successfully published ARK: {ark_id}")
             self.stats["total_succeeded"] += 1
