@@ -11,3 +11,5 @@ build/
 htmlcov/
 *.log
 .DS_Store
+metadata_storage/*
+minter.db

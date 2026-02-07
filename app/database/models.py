@@ -14,6 +14,7 @@ from sqlalchemy import (
     Enum,
     Index,
     JSON,
+    UniqueConstraint,
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import declarative_base
@@ -29,6 +30,8 @@ class ARKRecord(Base):
     
     Tracks the full lifecycle of ARK identifiers from reservation
     through publication to tombstone.
+    
+    The full ARK identifier is computed from naan and name: ark:{naan}/{name}
     """
     
     __tablename__ = "ark_records"
@@ -36,8 +39,7 @@ class ARKRecord(Base):
     # Primary key
     id = Column(Integer, primary_key=True, autoincrement=True)
     
-    # ARK identifiers
-    ark = Column(String(255), unique=True, nullable=False, index=True)
+    # ARK components (ark is computed as ark:{naan}/{name})
     naan = Column(String(50), nullable=False)
     name = Column(String(100), nullable=False)
     
@@ -50,7 +52,7 @@ class ARKRecord(Base):
     # ARK data
     target = Column(Text, nullable=True)
     metadata_cid = Column(String(100), nullable=True)
-    metadata_json = Column(JSON, nullable=True)
+    metadata_format = Column(String(20), nullable=True)  # "json", "xml", etc.
     alternate_identifiers = Column(JSON, nullable=True)
     
     # Timestamps
@@ -69,9 +71,17 @@ class ARKRecord(Base):
     
     # Composite indexes for common queries
     __table_args__ = (
+        UniqueConstraint("naan", "name", name="uq_naan_name"),
+        Index("ix_naan_name", "naan", "name"),
         Index("ix_state_authority", "state", "authority_id"),
         Index("ix_state_permanently_failed_created", "state", "publish_permanently_failed", "created_at"),
     )
     
+    @property
+    def ark(self) -> str:
+        """Compute full ARK identifier from naan and name."""
+        return f"ark:{self.naan}/{self.name}"
+    
     def __repr__(self):
         return f"<ARKRecord(ark={self.ark}, state={self.state}, authority={self.authority_id})>"
+

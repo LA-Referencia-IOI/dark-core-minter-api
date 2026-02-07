@@ -3,7 +3,7 @@ ARK repository for database operations.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -14,6 +14,29 @@ from app.models.states import ARKState
 def _utc_now() -> datetime:
     """Return current UTC time as naive datetime for DB compatibility."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def parse_ark(ark: str) -> Tuple[str, str]:
+    """
+    Parse full ARK identifier into naan and name components.
+    
+    Args:
+        ark: Full ARK identifier (e.g., "ark:12345/abc123")
+    
+    Returns:
+        Tuple of (naan, name)
+    
+    Raises:
+        ValueError: If ARK format is invalid
+    """
+    if not ark.startswith("ark:"):
+        raise ValueError(f"Invalid ARK format: {ark}")
+    
+    parts = ark[4:].split("/", 1)  # Remove "ark:" prefix and split
+    if len(parts) != 2:
+        raise ValueError(f"Invalid ARK format: {ark}")
+    
+    return parts[0], parts[1]
 
 
 class ARKRepository:
@@ -30,7 +53,6 @@ class ARKRepository:
     
     def create_reserved(
         self,
-        ark: str,
         naan: str,
         name: str,
         authority_id: str,
@@ -41,7 +63,6 @@ class ARKRepository:
         Create a new ARK record in RESERVED state.
         
         Args:
-            ark: Full ARK identifier
             naan: Name Assigning Authority Number
             name: ARK name/suffix
             authority_id: Authority UUID that owns this ARK
@@ -49,7 +70,7 @@ class ARKRepository:
             client_item_id: Optional client tracking ID
         
         Returns:
-            Created ARKRecord
+            Created ARKRecord (ark property computes full identifier)
         
         Note:
             Does NOT commit. Caller must commit the transaction.
@@ -67,7 +88,6 @@ class ARKRepository:
             alternate_identifiers = serialized_ids
 
         db_ark = ARKRecord(
-            ark=ark,
             naan=naan,
             name=name,
             state=ARKState.RESERVED.value,
@@ -83,12 +103,35 @@ class ARKRepository:
         Get ARK record by full ARK identifier.
         
         Args:
-            ark: Full ARK identifier
+            ark: Full ARK identifier (e.g., "ark:12345/abc123")
         
         Returns:
             ARKRecord if found, None otherwise
         """
-        return self.db.query(ARKRecord).filter(ARKRecord.ark == ark).first()
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError:
+            return None
+        return self.db.query(ARKRecord).filter(
+            ARKRecord.naan == naan,
+            ARKRecord.name == name
+        ).first()
+    
+    def get_by_naan_name(self, naan: str, name: str) -> Optional[ARKRecord]:
+        """
+        Get ARK record by naan and name components.
+        
+        Args:
+            naan: Name Assigning Authority Number
+            name: ARK name/suffix
+        
+        Returns:
+            ARKRecord if found, None otherwise
+        """
+        return self.db.query(ARKRecord).filter(
+            ARKRecord.naan == naan,
+            ARKRecord.name == name
+        ).first()
     
     def exists(self, ark: str) -> bool:
         """
@@ -100,22 +143,31 @@ class ARKRepository:
         Returns:
             True if exists, False otherwise
         """
-        return self.db.query(ARKRecord).filter(ARKRecord.ark == ark).count() > 0
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError:
+            return False
+        return self.db.query(ARKRecord).filter(
+            ARKRecord.naan == naan,
+            ARKRecord.name == name
+        ).count() > 0
     
     def update_to_draft(
         self,
         ark: str,
         target: str,
-        metadata: dict,
+        metadata_cid: str,
+        metadata_format: str,
         alternate_identifiers: Optional[list] = None,
     ) -> ARKRecord:
         """
-        Update ARK to DRAFT state with metadata.
+        Update ARK to DRAFT state with stored metadata CID.
         
         Args:
             ark: Full ARK identifier
             target: Target URL
-            metadata: Metadata payload
+            metadata_cid: CID of stored metadata content
+            metadata_format: Format of metadata ("json", "xml", etc.)
             alternate_identifiers: Optional alternate identifiers
         
         Returns:
@@ -126,6 +178,7 @@ class ARKRepository:
         
         Note:
             Does NOT commit. Caller must commit the transaction.
+            Metadata content is stored externally via MetadataStorage before calling this.
         """
         db_ark = self.get_by_ark(ark)
         if not db_ark:
@@ -137,8 +190,10 @@ class ARKRepository:
         # Validate required fields
         if not target:
             raise ValueError("Target URL is required")
-        if not metadata:
-            raise ValueError("Metadata is required")
+        if not metadata_cid:
+            raise ValueError("Metadata CID is required")
+        if not metadata_format:
+            raise ValueError("Metadata format is required")
         
         # Serialize alternate identifiers if they are Pydantic models
         if alternate_identifiers:
@@ -155,7 +210,8 @@ class ARKRepository:
         # Update record
         db_ark.state = ARKState.DRAFT.value
         db_ark.target = target
-        db_ark.metadata_json = metadata
+        db_ark.metadata_cid = metadata_cid
+        db_ark.metadata_format = metadata_format
         db_ark.alternate_identifiers = alternate_identifiers
         db_ark.updated_at = _utc_now()
         

@@ -20,11 +20,14 @@ Se ha implementado exitosamente la capa de persistencia local para el ciclo de v
 - naan, name
 - state (RESERVED, DRAFT, PUBLISHED, TOMBSTONE)
 - authority_id (indexed)
-- target, metadata_cid, metadata_json
+- target, metadata_cid, metadata_format
 - alternate_identifiers (JSON)
 - created_at, updated_at, tombstoned_at
 - client_item_id (para batch tracking)
+- publish_attempts, last_publish_error, last_publish_attempt_at
 ```
+
+> **Nota**: `metadata_json` fue reemplazado por `metadata_format` (String). El contenido raw se almacena externamente vía `MetadataStorage`.
 
 ### 3. Flujo de Estados Implementado
 
@@ -55,9 +58,10 @@ TOMBSTONE (DELETE /arks/{ark})
 #### PUT /arks/{ark}
 - ✅ Valida estado RESERVED
 - ✅ Valida ownership (authority_id)
-- ✅ Valida campos requeridos (target y metadata no nulos)
+- ✅ Acepta `metadata` (raw JSON/XML string) y `metadata_format` ("json" o "xml")
+- ✅ Almacena metadata via `MetadataStorage`, obtiene CID
 - ✅ Transiciona a DRAFT (NO publica a blockchain)
-- ✅ Retorna con metadata_cid=None
+- ✅ Retorna con `metadata_cid` y `metadata_format`
 
 #### GET /arks/{ark}
 - ✅ Consulta DB primero
@@ -129,8 +133,9 @@ AUTH_CACHE_MAXSIZE=1000
   - Tombstone
   - Health check con DB
 - ✅ Tests de storage (`test_storage.py`):
-  - FileSystemMetadataStorage completo
-  - Operaciones store/get/health_check
+  - FileSystemMetadataStorage con soporte multi-formato (JSON/XML)
+  - Operaciones store_metadata(content, format)/get_metadata(cid) -> (content, format)
+  - CID independiente del formato
   - Concurrencia y edge cases
 - ✅ Tests de cache (`test_auth_cache.py`):
   - TTL expiration
@@ -144,9 +149,38 @@ AUTH_CACHE_MAXSIZE=1000
 
 ### 10. Migraciones Alembic
 - ✅ Configuración completa en `alembic/`
-- ✅ Migración inicial: `001_initial_create_ark_records.py`
+- ✅ Migración inicial: `d8bae116f993_initial_schema_optimized.py`
+- ✅ Migración metadata format: `a1b2c3d4e5f6_replace_metadata_json_with_format.py`
 - ✅ Auto-ejecución en startup con `init_db()`
 - ✅ Fallo rápido si migración falla
+
+### 11. Refactoring de Metadata Multi-Formato
+
+Se refactorizó el manejo de metadata para soportar múltiples formatos (JSON, XML):
+
+#### Cambios en Storage Interface
+```python
+# Antes
+store_metadata(metadata: Dict) -> str
+get_metadata(cid: str) -> Dict
+
+# Después
+store_metadata(content: str, format: str) -> str
+get_metadata(cid: str) -> Tuple[str, str]  # (content, format)
+```
+
+#### Cambios en API Request
+```python
+class UpdateARKMetadataRequest:
+    metadata: str  # Raw content (JSON/XML string)
+    metadata_format: Literal["json", "xml"]
+```
+
+#### Flujo de Datos
+1. API recibe `metadata` (raw string) + `metadata_format`
+2. API almacena metadata via `MetadataStorage.store_metadata(content, format)`
+3. API guarda `metadata_cid` y `metadata_format` en DB
+4. Worker usa CID existente para publicar a blockchain
 
 ## 📋 Archivos Creados
 

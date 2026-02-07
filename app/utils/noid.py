@@ -24,10 +24,10 @@ def mint_ark_id(naan: str, shoulder: str = "") -> str:
         shoulder: Optional shoulder/prefix
         
     Returns:
-        Full ARK string e.g. "ark:/12345/xyz123"
+        Full ARK string e.g. "ark:12345/xyz123" (new standard without slash after ark:)
     """
-    # Simple check to avoid double slashes if shoulder implies it
     suffix = generate_noid()
     if shoulder:
-        return f"ark:/{naan}/{shoulder}{suffix}"
-    return f"ark:/{naan}/{suffix}"
+        return f"ark:{naan}/{shoulder}{suffix}"
+    return f"ark:{naan}/{suffix}"
+

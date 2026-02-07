@@ -101,26 +101,23 @@ class ARKPublisher:
                 logger.warning(f"ARK {ark_id} not in DRAFT state: {ark_record.state}")
                 return False
             
-            # Step 1: Store metadata and get CID
-            try:
-                cid = self.metadata_storage.store_metadata(ark_record.metadata_json)
-                logger.info(f"Metadata stored for {ark_id}, CID: {cid}")
-            except StorageError as e:
-                error_msg = f"Metadata storage failed: {e}"
+            # Metadata is already stored; CID should be in DB
+            cid = ark_record.metadata_cid
+            if not cid:
+                error_msg = "No metadata CID found - metadata must be stored first"
                 logger.error(f"{error_msg} for ARK {ark_id}")
-                repo.mark_publish_failed(ark_id, error_msg, is_permanent=False)
+                repo.mark_publish_failed(ark_id, error_msg, is_permanent=True)
                 db.commit()
+                self.stats["total_permanent_failures"] += 1
                 return False
+            
+            logger.info(f"Using existing metadata CID for {ark_id}: {cid}")
             
             # Step 2: Publish to blockchain
             try:
-                # Extract components from ark: ark:/{naan}/{name}
-                parts = ark_id.split('/')
-                if len(parts) != 3:
-                    raise ValueError(f"Invalid ARK format: {ark_id}")
-                
-                naan = parts[1]
-                name = parts[2]
+                # Extract components using helper
+                from app.repositories.ark_repository import parse_ark
+                naan, name = parse_ark(ark_id)
                 
                 # Create ARK on blockchain
                 self.orchestrator.create_ark(

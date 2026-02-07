@@ -74,12 +74,8 @@ async def lifespan(app: FastAPI):
     
     # Initialize metadata storage
     try:
-        from app.storage import get_metadata_storage
-        metadata_storage = get_metadata_storage(
-            storage_type=settings.metadata_storage_type,
-            storage_path=settings.metadata_storage_path,
-        )
-        logger.info(f"Metadata storage initialized: {settings.metadata_storage_type}")
+        from app.dependencies import init_metadata_storage
+        metadata_storage = init_metadata_storage()
         
         # Store globally for health check and worker access
         app.state.metadata_storage = metadata_storage

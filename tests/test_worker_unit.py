@@ -22,15 +22,15 @@ class MockMetadataStorage:
         self.should_fail = should_fail
         self.stored = {}
     
-    def store_metadata(self, metadata):
+    def store_metadata(self, content, format):
         if self.should_fail:
             raise StorageError("Mock storage error")
         cid = f"mock_cid_{len(self.stored)}"
-        self.stored[cid] = metadata
+        self.stored[cid] = (content, format)
         return cid
     
     def get_metadata(self, cid):
-        return self.stored.get(cid)
+        return self.stored.get(cid, (None, None))
     
     def health_check(self):
         return not self.should_fail
@@ -39,19 +39,23 @@ class MockMetadataStorage:
 class MockARKRecord:
     """Mock ARK record for testing."""
     
-    def __init__(self, ark, naan, name, authority_id, target, metadata_json=None):
-        self.ark = ark
+    def __init__(self, naan, name, authority_id, target, metadata_cid=None, metadata_format=None):
         self.naan = naan
         self.name = name
         self.authority_id = authority_id
         self.target = target
-        self.metadata_json = metadata_json or {}
+        self.metadata_cid = metadata_cid  # Now required for DRAFT state
+        self.metadata_format = metadata_format or "json"
         self.state = ARKState.DRAFT
-        self.metadata_cid = None
         self.publish_retry_count = 0
         self.publish_last_error = None
         self.publish_last_attempt_at = None
         self.publish_permanently_failed = 0
+    
+    @property
+    def ark(self):
+        """Compute full ARK identifier from naan and name."""
+        return f"ark:{self.naan}/{self.name}"
 
 
 class TestARKPublisherUnit:
@@ -59,14 +63,14 @@ class TestARKPublisherUnit:
     
     def test_publish_single_ark_success(self):
         """Test successful ARK publication."""
-        # Create mock ARK
+        # Create mock ARK with pre-stored metadata CID
         ark_record = MockARKRecord(
-            ark="ark:/12345/test",
             naan="12345",
             name="test",
             authority_id="auth-uuid-123",
             target="https://example.com",
-            metadata_json={"title": "Test ARK"},
+            metadata_cid="pre_stored_cid",
+            metadata_format="json",
         )
         
         # Mock repository
@@ -78,7 +82,7 @@ class TestARKPublisherUnit:
         mock_orchestrator = Mock()
         mock_orchestrator.create_ark = Mock()
         
-        # Mock storage
+        # Mock storage (not used since metadata_cid already exists)
         mock_storage = MockMetadataStorage()
         
         # Create publisher
@@ -99,7 +103,7 @@ class TestARKPublisherUnit:
                 mock_repo_class.return_value = mock_repo
                 
                 # Publish
-                success = publisher.publish_single_ark("ark:/12345/test")
+                success = publisher.publish_single_ark("ark:12345/test")
         
         # Verify success
         assert success is True
@@ -110,16 +114,16 @@ class TestARKPublisherUnit:
         # Verify stats updated
         assert publisher.stats["total_succeeded"] == 1
     
-    def test_publish_single_ark_storage_failure(self):
-        """Test ARK publication with storage failure."""
-        # Create mock ARK
+    def test_publish_single_ark_no_metadata_cid(self):
+        """Test ARK publication fails gracefully when metadata_cid is missing."""
+        # Create mock ARK without metadata_cid
         ark_record = MockARKRecord(
-            ark="ark:/12345/test",
             naan="12345",
             name="test",
             authority_id="auth-uuid-123",
             target="https://example.com",
-            metadata_json={"title": "Test ARK"},
+            metadata_cid=None,  # Missing
+            metadata_format="json",
         )
         
         # Mock repository
@@ -130,8 +134,8 @@ class TestARKPublisherUnit:
         # Mock orchestrator
         mock_orchestrator = Mock()
         
-        # Mock storage that fails
-        mock_storage = MockMetadataStorage(should_fail=True)
+        # Mock storage
+        mock_storage = MockMetadataStorage()
         
         # Create publisher
         publisher = ARKPublisher(
@@ -151,27 +155,21 @@ class TestARKPublisherUnit:
                 mock_repo_class.return_value = mock_repo
                 
                 # Publish
-                success = publisher.publish_single_ark("ark:/12345/test")
+                success = publisher.publish_single_ark("ark:12345/test")
         
         # Verify failure
         assert success is False
-        
-        # Verify mark_publish_failed was called
-        assert mock_repo.mark_publish_failed.called
-        
-        # total_failed is tracked at batch-cycle level, not single-item method.
-        assert publisher.stats["total_failed"] == 0
     
     def test_publish_single_ark_authority_error(self):
         """Test ARK publication with authority error (permanent failure)."""
         # Create mock ARK
         ark_record = MockARKRecord(
-            ark="ark:/12345/test",
             naan="12345",
             name="test",
             authority_id="auth-uuid-123",
             target="https://example.com",
-            metadata_json={"title": "Test ARK"},
+            metadata_cid="pre_stored_cid",
+            metadata_format="json",
         )
         
         # Mock repository
@@ -204,7 +202,7 @@ class TestARKPublisherUnit:
                 mock_repo_class.return_value = mock_repo
                 
                 # Publish
-                success = publisher.publish_single_ark("ark:/12345/test")
+                success = publisher.publish_single_ark("ark:12345/test")
         
         # Verify failure
         assert success is False
@@ -218,12 +216,12 @@ class TestARKPublisherUnit:
         """Test ARK publication after max retries exceeded."""
         # Create mock ARK with max retries already exceeded
         ark_record = MockARKRecord(
-            ark="ark:/12345/test",
             naan="12345",
             name="test",
             authority_id="auth-uuid-123",
             target="https://example.com",
-            metadata_json={"title": "Test ARK"},
+            metadata_cid="pre_stored_cid",
+            metadata_format="json",
         )
         ark_record.publish_retry_count = 5
         ark_record.publish_last_attempt_at = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -258,27 +256,29 @@ class TestARKPublisherUnit:
                 mock_repo_class.return_value = mock_repo
                 
                 # Publish - should fail due to max retries
-                success = publisher.publish_single_ark("ark:/12345/test")
+                success = publisher.publish_single_ark("ark:12345/test")
         
         # Verify failure
         assert success is False
     
     def test_run_publish_cycle_processes_batch(self):
         """Test that run_publish_cycle processes a batch of ARKs."""
-        # Create mock ARKs
+        # Create mock ARKs with pre-stored metadata CIDs
         ark1 = MockARKRecord(
-            ark="ark:/12345/test1",
             naan="12345",
             name="test1",
             authority_id="auth-uuid-1",
             target="https://example.com/1",
+            metadata_cid="cid_1",
+            metadata_format="json",
         )
         ark2 = MockARKRecord(
-            ark="ark:/12345/test2",
             naan="12345",
             name="test2",
             authority_id="auth-uuid-2",
             target="https://example.com/2",
+            metadata_cid="cid_2",
+            metadata_format="json",
         )
         
         # Mock repository

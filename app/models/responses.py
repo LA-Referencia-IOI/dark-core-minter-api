@@ -24,7 +24,8 @@ class ARKResponse(BaseModel):
     ark: str = Field(..., description="Full ARK identifier")
     state: ARKState = Field(..., description="Current lifecycle state")
     target: Optional[str] = Field(None, description="Target URL")
-    metadata_cid: Optional[str] = Field(None, description="IPFS CID of metadata (if published)")
+    metadata_cid: Optional[str] = Field(None, description="CID of metadata (if stored)")
+    metadata_format: Optional[str] = Field(None, description="Format of metadata (json, xml, etc.)")
     alternate_identifiers: Optional[list] = Field(None, description="External identifiers")
     client_item_id: Optional[str] = Field(None, description="Client correlation ID")
     

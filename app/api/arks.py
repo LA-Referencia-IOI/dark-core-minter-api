@@ -13,7 +13,9 @@ from sqlalchemy.exc import IntegrityError
 from dark_orchestrator import DARKOrchestrator
 from dark_orchestrator.exceptions import ARKError, AuthorityError
 
-from app.dependencies import get_orchestrator, get_db
+from app.dependencies import get_orchestrator, get_db, get_metadata_storage
+from app.storage.base import MetadataStorage
+from app.storage.exceptions import StorageError
 from app.middleware.auth import require_mtls
 from app.utils.noid import mint_ark_id
 from app.utils.auth_cache import check_authorization_cached
@@ -68,16 +70,14 @@ async def reserve_ark(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            # Generate ID
+            # Generate unique name (mint_ark_id returns full ark, we extract name)
             full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
             
-            # Extract name from ARK
-            parts = full_ark.split(f"ark:/{request.naan}/")
-            name = parts[1] if len(parts) > 1 else ""
+            # Extract name from ARK (format: ark:{naan}/{name})
+            name = full_ark.split("/", 1)[1] if "/" in full_ark else ""
             
-            # Persist reservation in database
+            # Persist reservation in database (ark is computed property)
             db_ark = ark_repo.create_reserved(
-                ark=full_ark,
                 naan=request.naan,
                 name=name,
                 authority_id=request.authority_id,
@@ -87,7 +87,7 @@ async def reserve_ark(
             db.commit()
             db.refresh(db_ark)
             
-            logger.info(f"Reserved ARK: {full_ark} for {request.authority_id}")
+            logger.info(f"Reserved ARK: {db_ark.ark} for {request.authority_id}")
             
             return ARKResponse(
                 ark=db_ark.ark,
@@ -152,13 +152,11 @@ async def batch_reserve_ark(
                 # 1. Generate ID
                 full_ark = mint_ark_id(request.naan, settings.minter_shoulder)
 
-                # 2. Extract name
-                parts = full_ark.split(f"ark:/{request.naan}/")
-                name = parts[1] if len(parts) > 1 else ""
+                # 2. Extract name (format: ark:{naan}/{name})
+                name = full_ark.split("/", 1)[1] if "/" in full_ark else ""
 
-                # 3. Create reserved record
+                # 3. Create reserved record (ark is computed property)
                 db_ark = ark_repo.create_reserved(
-                    ark=full_ark,
                     naan=request.naan,
                     name=name,
                     authority_id=request.authority_id,
@@ -225,20 +223,11 @@ async def get_ark(
     Get ARK details from database or blockchain.
     """
     # Parse ARK to get NAAN/Name
+    from app.repositories.ark_repository import parse_ark
     try:
-        # Expecting ark:/NAAN/Name
-        if not ark.startswith("ark:/"):
-            raise ValueError("Invalid format")
-        
-        parts = ark.split("/", 2)  # ark: / NAAN / Name
-        if len(parts) != 3:
-            raise ValueError("Invalid format")
-        
-        naan = parts[1]
-        name = parts[2]
-        
+        naan, name = parse_ark(ark)
     except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid ARK format. Expected ark:/NAAN/suffix")
+        raise HTTPException(status_code=400, detail="Invalid ARK format. Expected ark:NAAN/suffix")
     
     # 1. Try database first
     ark_repo = ARKRepository(db)
@@ -253,6 +242,7 @@ async def get_ark(
                 state=db_ark.state,
                 target=db_ark.target,
                 metadata_cid=db_ark.metadata_cid,
+                metadata_format=db_ark.metadata_format,
                 alternate_identifiers=db_ark.alternate_identifiers,
             )
         elif db_ark.state == ARKState.PUBLISHED:
@@ -264,6 +254,7 @@ async def get_ark(
                     state=ARKState.PUBLISHED,
                     target=info.url,  # From blockchain
                     metadata_cid=info.cid,  # From blockchain
+                    metadata_format=db_ark.metadata_format,  # From DB
                     alternate_identifiers=db_ark.alternate_identifiers,  # From DB
                 )
             except Exception as e:
@@ -274,6 +265,7 @@ async def get_ark(
                     state=db_ark.state,
                     target=db_ark.target,
                     metadata_cid=db_ark.metadata_cid,
+                    metadata_format=db_ark.metadata_format,
                     alternate_identifiers=db_ark.alternate_identifiers,
                 )
         elif db_ark.state == ARKState.TOMBSTONE:
@@ -283,6 +275,7 @@ async def get_ark(
                 state=db_ark.state,
                 target=db_ark.target,
                 metadata_cid=db_ark.metadata_cid,
+                metadata_format=db_ark.metadata_format,
                 alternate_identifiers=db_ark.alternate_identifiers,
             )
     
@@ -313,20 +306,19 @@ async def update_ark_metadata(
     cert_info: dict = Depends(require_mtls),
     orchestrator: DARKOrchestrator = Depends(get_orchestrator),
     db: Session = Depends(get_db),
+    storage: MetadataStorage = Depends(get_metadata_storage),
 ) -> ARKResponse:
     """
     Update metadata and transition to DRAFT state.
     
-    Does NOT publish to blockchain/IPFS. That happens in a separate background process.
+    Stores metadata content immediately via storage backend.
+    Does NOT publish to blockchain. That happens in a separate background process.
     """
-    # Parse ARK
+    # Parse ARK using repository helper
+    from app.repositories.ark_repository import parse_ark
     try:
-        parts = ark.split("/", 2)
-        if len(parts) != 3:
-            raise ValueError
-        naan = parts[1]
-        name = parts[2]
-    except:
+        naan, name = parse_ark(ark)
+    except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format")
     
     # 1. Get ARK from database
@@ -350,24 +342,34 @@ async def update_ark_metadata(
             detail=f"Authority {request.authority_id} does not own this ARK"
         )
     
-    # 4. Update to DRAFT (validates required fields)
+    # 4. Store metadata content and get CID
+    try:
+        metadata_cid = storage.store_metadata(request.metadata, request.metadata_format)
+        logger.info(f"Stored metadata for {ark}, CID: {metadata_cid}")
+    except StorageError as e:
+        logger.error(f"Metadata storage failed for {ark}: {e}")
+        raise HTTPException(status_code=500, detail=f"Metadata storage failed: {e}")
+    
+    # 5. Update to DRAFT with CID
     try:
         db_ark = ark_repo.update_to_draft(
             ark=ark,
             target=request.target,
-            metadata=request.metadata,
+            metadata_cid=metadata_cid,
+            metadata_format=request.metadata_format,
             alternate_identifiers=request.alternate_identifiers,
         )
         db.commit()
         db.refresh(db_ark)
         
-        logger.info(f"ARK {ark} updated to DRAFT state")
+        logger.info(f"ARK {ark} updated to DRAFT state (format: {request.metadata_format})")
         
         return ARKResponse(
             ark=db_ark.ark,
             state=db_ark.state,
             target=db_ark.target,
-            metadata_cid=None,  # Not yet published to IPFS
+            metadata_cid=db_ark.metadata_cid,
+            metadata_format=db_ark.metadata_format,
             alternate_identifiers=db_ark.alternate_identifiers,
         )
     
@@ -395,13 +397,10 @@ async def delete_ark(
     Tombstone an ARK (soft delete).
     """
     # Parse ARK
+    from app.repositories.ark_repository import parse_ark
     try:
-        parts = ark.split("/", 2)
-        if len(parts) != 3:
-            raise ValueError
-        naan = parts[1]
-        name = parts[2]
-    except:
+        naan, name = parse_ark(ark)
+    except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format")
     
     # Get ARK from database

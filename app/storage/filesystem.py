@@ -1,15 +1,16 @@
 """
 Filesystem-based metadata storage implementation.
 
-Stores metadata as JSON files using MD5 hash as content identifier.
+Stores metadata files using MD5 hash as content identifier.
+Supports multiple formats (JSON, XML, etc.) via sidecar metadata files.
 Suitable for development and testing.
 """
 
-import json
 import hashlib
+import json
 import logging
 from pathlib import Path
-from typing import Dict, Any
+from typing import Tuple
 
 from .base import MetadataStorage
 from .exceptions import StorageError, MetadataNotFoundError
@@ -17,13 +18,20 @@ from .exceptions import StorageError, MetadataNotFoundError
 
 logger = logging.getLogger(__name__)
 
+# Supported format extensions
+FORMAT_EXTENSIONS = {
+    "json": ".json",
+    "xml": ".xml",
+}
+
 
 class FileSystemMetadataStorage(MetadataStorage):
     """
     Filesystem implementation of metadata storage.
     
-    Files are stored as {md5_hash}.json in the configured directory.
-    Uses MD5 hash of JSON content as the "CID" for content-addressable storage.
+    Files are stored as {md5_hash}.{ext} in the configured directory.
+    Format is tracked via a sidecar .meta file.
+    Uses MD5 hash of content as the "CID" for content-addressable storage.
     """
     
     def __init__(self, storage_path: str):
@@ -48,52 +56,65 @@ class FileSystemMetadataStorage(MetadataStorage):
         """Calculate MD5 hash of content."""
         return hashlib.md5(content.encode('utf-8')).hexdigest()
     
-    def _get_file_path(self, cid: str) -> Path:
-        """Get file path for a given CID."""
-        # Sanitize CID to prevent directory traversal
+    def _sanitize_cid(self, cid: str) -> str:
+        """Sanitize CID to prevent directory traversal."""
         safe_cid = Path(cid).name
         if safe_cid != cid:
-            raise ValueError(f"Invalid CID format: {cid}")
-        return self.storage_path / f"{safe_cid}.json"
+            raise StorageError(f"Invalid CID format: {cid}")
+        return safe_cid
     
-    def store_metadata(self, metadata: Dict[str, Any]) -> str:
+    def _get_content_path(self, cid: str, format: str) -> Path:
+        """Get content file path for a given CID and format."""
+        safe_cid = self._sanitize_cid(cid)
+        ext = FORMAT_EXTENSIONS.get(format, f".{format}")
+        return self.storage_path / f"{safe_cid}{ext}"
+    
+    def _get_meta_path(self, cid: str) -> Path:
+        """Get metadata sidecar file path."""
+        safe_cid = self._sanitize_cid(cid)
+        return self.storage_path / f"{safe_cid}.meta"
+    
+    def store_metadata(self, content: str, format: str) -> str:
         """
-        Store metadata as JSON file and return MD5 hash as CID.
-        
-        The content is serialized deterministically (sorted keys) to ensure
-        identical metadata produces the same CID.
+        Store raw metadata content and return MD5 hash as CID.
         
         Args:
-            metadata: Metadata dictionary to store
+            content: Raw metadata content (JSON string, XML string, etc.)
+            format: Format identifier ("json", "xml", etc.)
             
         Returns:
-            MD5 hash of the JSON content (as CID)
+            MD5 hash of the content (as CID)
             
         Raises:
             StorageError: If write operation fails
         """
         try:
-            # Serialize with sorted keys for deterministic output
-            json_content = json.dumps(metadata, sort_keys=True, indent=2)
+            # Calculate CID (MD5 hash of content)
+            cid = self._calculate_md5(content)
             
-            # Calculate CID (MD5 hash)
-            cid = self._calculate_md5(json_content)
+            # Get file paths
+            content_path = self._get_content_path(cid, format)
+            meta_path = self._get_meta_path(cid)
             
-            # Write atomically using temp file + rename
-            file_path = self._get_file_path(cid)
-            temp_path = file_path.with_suffix('.tmp')
+            # Write content atomically using temp file + rename
+            temp_content = content_path.with_suffix('.tmp')
+            temp_content.write_text(content, encoding='utf-8')
+            temp_content.replace(content_path)
             
-            temp_path.write_text(json_content, encoding='utf-8')
-            temp_path.replace(file_path)
+            # Write format metadata
+            meta_data = {"format": format}
+            temp_meta = meta_path.with_suffix('.tmp')
+            temp_meta.write_text(json.dumps(meta_data), encoding='utf-8')
+            temp_meta.replace(meta_path)
             
-            logger.info(f"Stored metadata with CID: {cid}")
+            logger.info(f"Stored metadata with CID: {cid} (format: {format})")
             return cid
             
         except Exception as e:
             logger.error(f"Failed to store metadata: {e}")
             raise StorageError(f"Metadata storage failed: {e}")
     
-    def get_metadata(self, cid: str) -> Dict[str, Any]:
+    def get_metadata(self, cid: str) -> Tuple[str, str]:
         """
         Retrieve metadata by CID.
         
@@ -101,23 +122,33 @@ class FileSystemMetadataStorage(MetadataStorage):
             cid: Content identifier (MD5 hash)
             
         Returns:
-            Metadata dictionary
+            Tuple of (raw_content, format)
             
         Raises:
             MetadataNotFoundError: If CID not found
             StorageError: If read operation fails
         """
         try:
-            file_path = self._get_file_path(cid)
+            safe_cid = self._sanitize_cid(cid)
+            meta_path = self._get_meta_path(cid)
             
-            if not file_path.exists():
+            # Read format from sidecar
+            if not meta_path.exists():
                 raise MetadataNotFoundError(f"Metadata not found for CID: {cid}")
             
-            content = file_path.read_text(encoding='utf-8')
-            metadata = json.loads(content)
+            meta_data = json.loads(meta_path.read_text(encoding='utf-8'))
+            format = meta_data.get("format", "json")
             
-            logger.debug(f"Retrieved metadata for CID: {cid}")
-            return metadata
+            # Get content file path
+            content_path = self._get_content_path(cid, format)
+            
+            if not content_path.exists():
+                raise MetadataNotFoundError(f"Content file not found for CID: {cid}")
+            
+            content = content_path.read_text(encoding='utf-8')
+            
+            logger.debug(f"Retrieved metadata for CID: {cid} (format: {format})")
+            return content, format
             
         except MetadataNotFoundError:
             raise

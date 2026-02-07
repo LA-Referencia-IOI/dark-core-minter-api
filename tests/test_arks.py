@@ -27,7 +27,7 @@ def test_reserve_ark(client, mock_orchestrator):
     data = response.json()
     assert data["state"] == ARKState.RESERVED
     # Default shoulder in config is empty string unless mocked
-    assert data["ark"].startswith("ark:/12345/")
+    assert data["ark"].startswith("ark:12345/")
     assert data.get("target") is None
     alt_schema = data["alternate_identifiers"][0].get("schema")
     if alt_schema is None:
@@ -84,7 +84,8 @@ def test_update_metadata_publish(client, mock_orchestrator):
         json={
             "authority_id": "test-uuid",
             "target": "http://new.target.com",
-            "metadata": {"title": "My Research"},
+            "metadata": '{"title": "My Research"}',
+            "metadata_format": "json",
             "alternate_identifiers": [
                  {"schema": "doi", "value": "10.1234/new"}
             ]
@@ -95,6 +96,8 @@ def test_update_metadata_publish(client, mock_orchestrator):
     data = response.json()
     assert data["state"] == ARKState.DRAFT
     assert data["target"] == "http://new.target.com"
+    assert data["metadata_format"] == "json"
+    assert data["metadata_cid"] is not None  # CID should be set after storage
     assert data["alternate_identifiers"][0]["value"] == "10.1234/new"
     
     # Publication to chain is handled by the background worker, not this endpoint.
@@ -116,3 +119,35 @@ def test_delete_tombstone(client, mock_orchestrator):
     response = client.delete(f"/api/v1/arks/{ark}")
     
     assert response.status_code == 200  # Returns null/void
+
+
+def test_update_metadata_xml_format(client, mock_orchestrator):
+    """Test updating metadata with XML format."""
+    reserve_response = client.post(
+        "/api/v1/arks",
+        json={
+            "authority_id": "test-uuid",
+            "naan": "12345",
+        },
+    )
+    assert reserve_response.status_code == 201
+    ark = reserve_response.json()["ark"]
+
+    xml_metadata = '<?xml version="1.0"?><oai_dc:dc xmlns:oai_dc="http://www.openarchives.org/OAI/2.0/oai_dc/"><dc:title>Test</dc:title></oai_dc:dc>'
+    
+    response = client.put(
+        f"/api/v1/arks/{ark}",
+        json={
+            "authority_id": "test-uuid",
+            "target": "http://example.com/resource",
+            "metadata": xml_metadata,
+            "metadata_format": "xml",
+        }
+    )
+    
+    assert response.status_code == 200
+    data = response.json()
+    assert data["state"] == ARKState.DRAFT
+    assert data["metadata_format"] == "xml"
+    assert data["metadata_cid"] is not None
+

@@ -102,3 +102,61 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# Singleton metadata storage instance
+_metadata_storage: Optional["MetadataStorage"] = None
+
+
+def get_metadata_storage() -> "MetadataStorage":
+    """
+    Get the MetadataStorage singleton instance.
+    
+    Returns:
+        MetadataStorage instance
+        
+    Raises:
+        RuntimeError: If storage not initialized
+    """
+    global _metadata_storage
+    if _metadata_storage is None:
+        raise RuntimeError(
+            "Metadata storage not initialized. "
+            "Call init_metadata_storage() during application startup."
+        )
+    return _metadata_storage
+
+
+def init_metadata_storage() -> "MetadataStorage":
+    """
+    Initialize the MetadataStorage singleton.
+    
+    Called during application lifespan startup.
+    
+    Returns:
+        Initialized MetadataStorage
+    """
+    global _metadata_storage
+    from app.storage.filesystem import FileSystemMetadataStorage
+    
+    settings = get_settings()
+    
+    logger.info(f"Initializing metadata storage at {settings.metadata_storage_path}")
+    _metadata_storage = FileSystemMetadataStorage(settings.metadata_storage_path)
+    logger.info("Metadata storage initialized successfully")
+    
+    return _metadata_storage
+
+
+def shutdown_metadata_storage() -> None:
+    """Cleanup metadata storage on shutdown."""
+    global _metadata_storage
+    if _metadata_storage is not None:
+        logger.info("Shutting down metadata storage")
+        _metadata_storage = None
+
+
+# Type hint for MetadataStorage
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from app.storage.base import MetadataStorage

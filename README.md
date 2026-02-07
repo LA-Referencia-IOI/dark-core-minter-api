@@ -45,7 +45,7 @@ dark-core-api
 | `/api/v1/arks` | POST | Reserve new ARK ID (supports `alternate_identifiers`) |
 | `/api/v1/arks/batch` | POST | Batch reserve ARK IDs (requires `client_item_id` for correlation) |
 | `/api/v1/arks/{ark}` | GET | Get ARK details |
-| `/api/v1/arks/{ark}` | PUT | Update metadata & transition to DRAFT state |
+| `/api/v1/arks/{ark}` | PUT | Update metadata (JSON/XML) & transition to DRAFT state |
 | `/api/v1/arks/{ark}` | DELETE | Tombstone/Deactivate ARK |
 | `/api/v1/authority/{uuid}` | GET | Get authority info |
 | `/api/v1/authority/{uuid}/naans` | GET | List authority NAANs |
@@ -281,9 +281,10 @@ The Minter API manages ARKs through the following states:
 
 2. **DRAFT**: Metadata added, ready for publication
    - Transition via `PUT /api/v1/arks/{ark}`
-   - Requires `target` URL and `metadata` payload
+   - Requires `target` URL, `metadata` (raw JSON/XML string), and `metadata_format` ("json" or "xml")
+   - Metadata stored immediately, CID returned in response
    - Authorization validated before transition
-   - Async worker picks up for publication
+   - Async worker picks up for blockchain publication
 
 3. **PUBLISHED**: Published to blockchain and metadata stored
    - Automated by async worker
@@ -311,12 +312,17 @@ The API includes a background worker that automatically publishes DRAFT ARKs to 
 
 ### Metadata Storage
 
-Metadata is stored through an abstraction layer supporting multiple backends:
+Metadata is stored through an abstraction layer supporting multiple backends and formats:
 
-- **Filesystem** (development): Stores JSON files with MD5 as CID
+**Supported Formats:**
+- **JSON**: Standard JSON metadata
+- **XML**: Dublin Core, OAI-DC, or custom XML schemas
+
+**Storage Backends:**
+- **Filesystem** (development): Stores files with format-appropriate extensions (`.json`, `.xml`) with MD5 as CID
 - **IPFS** (future): Will store on IPFS network with real CID
 
-Switch backends via `METADATA_STORAGE_TYPE` environment variable.
+CID is calculated from raw content, independent of format. Switch backends via `METADATA_STORAGE_TYPE` environment variable.
 
 ### Database
 

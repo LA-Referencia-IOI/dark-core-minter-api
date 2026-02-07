@@ -1,28 +1,28 @@
 """
 Abstract base class for metadata storage backends.
+
+Supports multiple metadata formats (JSON, XML, etc.) stored as raw content.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, Any
+from typing import Tuple
 
 
 class MetadataStorage(ABC):
     """Abstract interface for ARK metadata persistence."""
     
     @abstractmethod
-    def store_metadata(self, metadata: Dict[str, Any]) -> str:
+    def store_metadata(self, content: str, format: str) -> str:
         """
-        Store ARK metadata and return a content identifier (CID).
+        Store raw metadata content and return a content identifier (CID).
         
         Args:
-            metadata: ARK metadata dictionary containing:
-                - target: URL target
-                - alternate_identifiers: List of alternate IDs (optional)
-                - Any additional metadata fields
+            content: Raw metadata content (JSON string, XML string, etc.)
+            format: Format identifier ("json", "xml", etc.)
                 
         Returns:
             Content identifier (CID) as string.
-            For filesystem: MD5 hash of JSON content
+            For filesystem: MD5 hash of content
             For IPFS: IPFS CID
             
         Raises:
@@ -31,7 +31,7 @@ class MetadataStorage(ABC):
         pass
     
     @abstractmethod
-    def get_metadata(self, cid: str) -> Dict[str, Any]:
+    def get_metadata(self, cid: str) -> Tuple[str, str]:
         """
         Retrieve metadata by content identifier.
         
@@ -39,7 +39,7 @@ class MetadataStorage(ABC):
             cid: Content identifier
             
         Returns:
-            Metadata dictionary
+            Tuple of (raw_content, format)
             
         Raises:
             MetadataNotFoundError: If CID not found

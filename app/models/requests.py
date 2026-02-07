@@ -4,8 +4,7 @@ Request models for dARK Core API.
 Pydantic models for validating incoming API requests.
 """
 
-from typing import Optional
-from typing import Optional, Any
+from typing import Optional, Literal
 from pydantic import BaseModel, Field, HttpUrl
 from app.models.states import ARKState
 
@@ -91,9 +90,13 @@ class UpdateARKMetadataRequest(BaseModel):
         ...,
         description="Target URL for resolution"
     )
-    metadata: Any = Field(
+    metadata: str = Field(
         ...,
-        description="Metadata payload (JSON/Dict). Will be stored opaquely."
+        description="Raw metadata content (JSON or XML string)"
+    )
+    metadata_format: Literal["json", "xml"] = Field(
+        ...,
+        description="Format of the metadata content"
     )
     alternate_identifiers: Optional[list[AlternateIdentifier]] = Field(
         None,
