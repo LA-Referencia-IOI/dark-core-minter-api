@@ -28,15 +28,25 @@ pip install -e ../dark-core-orchestrator
 cp .env.example .env
 # Edit .env with your blockchain settings
 
-# Run (development)
+# Run API with Uvicorn (development)
 uvicorn app.main:app --reload
 
-# Run (production with workers)
+# Run API with Uvicorn (production, multiple API workers)
 uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 4
 
-# Run via package entrypoint
+# Run API via CLI entrypoint (equivalent entrypoint)
 dark-core-api
+
+# Run worker (singleton, separate process)
+dark-core-worker
+
+# Check worker process status
+dark-core-worker-status
 ```
+
+API supports both execution styles:
+- Direct Uvicorn: `uvicorn app.main:app ...`
+- CLI script: `dark-core-api`
 
 ## API Endpoints
 
@@ -50,8 +60,8 @@ dark-core-api
 | `/api/v1/authority/{uuid}` | GET | Get authority info |
 | `/api/v1/authority/{uuid}/naans` | GET | List authority NAANs |
 | `/api/v1/authority/{uuid}/authorized/{naan}` | GET | Check authority NAAN authorization |
-| `/api/v1/worker/status` | GET | Get async worker status and statistics |
-| `/health` | GET | Health check (includes DB, blockchain, storage, worker) |
+| `/api/v1/worker/status` | GET | Standalone worker status via DB heartbeat |
+| `/health` | GET | Health check (DB, blockchain, storage) |
 
 ## Documentation
 
@@ -135,11 +145,14 @@ DATABASE_MAX_OVERFLOW=20
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `WORKER_ENABLED` | Enable background publisher | `true` | No |
+| `WORKER_ENABLED` | Enable standalone worker process | `true` | No |
 | `WORKER_INTERVAL_SECONDS` | Cycle interval | `60` | No |
 | `WORKER_BATCH_SIZE` | ARKs per cycle | `10` | No |
 | `WORKER_MAX_RETRIES` | Max retries before failure | `5` | No |
 | `WORKER_RETRY_BACKOFF_BASE` | Exponential backoff base (seconds) | `2.0` | No |
+| `WORKER_RUNTIME_NAME` | Worker identity for heartbeat row | `ark-publisher` | No |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS` | Heartbeat write interval | `10` | No |
+| `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` | Stale threshold used by API status | `180` | No |
 
 #### 📦 Metadata Storage
 
@@ -298,7 +311,7 @@ The Minter API manages ARKs through the following states:
 
 ### Async Worker
 
-The API includes a background worker that automatically publishes DRAFT ARKs to the blockchain:
+The publisher worker runs as a separate process (`dark-core-worker`) and publishes DRAFT ARKs to the blockchain:
 
 - **Trigger**: Runs on interval (default: every 60 seconds)
 - **Processing**: FIFO order (oldest drafts first)
@@ -308,7 +321,8 @@ The API includes a background worker that automatically publishes DRAFT ARKs to 
   - Exponential backoff for retriable errors (network, gas, etc.)
   - Permanent failure for authority errors (unauthorized, invalid NAAN)
   - Max retries before marking as permanently failed (default: 5)
-- **Monitoring**: `/api/v1/worker/status` endpoint provides statistics
+- **Deployment**: Run as singleton service/container (separate from API)
+- **Monitoring**: API reads DB heartbeat at `GET /api/v1/worker/status`
 
 ### Metadata Storage
 
@@ -357,12 +371,14 @@ TLS_CA_FILE=/path/to/ca.crt
 
 **Worker not processing ARKs:**
 1. Check worker is enabled: `WORKER_ENABLED=true`
-2. Verify worker status: `GET /api/v1/worker/status`
-3. Check logs for errors
-4. Verify ARKs are in DRAFT state (not RESERVED or permanently failed)
+2. Verify the standalone worker process/container is running
+3. Run `dark-core-worker-status` (or `python -m app.main_worker status`)
+4. Check API status endpoint: `GET /api/v1/worker/status`
+5. Check logs for errors
+6. Verify ARKs are in DRAFT state (not RESERVED or permanently failed)
 
 **ARKs stuck in DRAFT:**
-1. Check `/api/v1/worker/status` for recent errors
+1. Check worker logs for recent errors
 2. Look for authority errors (indicates unauthorized NAAN)
 3. Check if max retries exceeded (ARK marked as permanently failed)
 4. Verify blockchain connectivity in health check
@@ -397,7 +413,6 @@ Response includes:
 - `blockchain_connected`: Blockchain RPC connectivity
 - `database`: Database health
 - `metadata_storage`: Storage backend health
-- `worker`: Worker status and last run time
 
 ## Testing
 

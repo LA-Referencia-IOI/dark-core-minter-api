@@ -11,7 +11,6 @@ from sqlalchemy import (
     String,
     Text,
     DateTime,
-    Enum,
     Index,
     JSON,
     UniqueConstraint,
@@ -85,3 +84,36 @@ class ARKRecord(Base):
     def __repr__(self):
         return f"<ARKRecord(ark={self.ark}, state={self.state}, authority={self.authority_id})>"
 
+
+class WorkerRuntimeStatus(Base):
+    """
+    Runtime status for standalone workers using DB heartbeat.
+
+    The API reads this table to expose worker status without
+    direct process coupling.
+    """
+
+    __tablename__ = "worker_runtime_status"
+
+    worker_name = Column(String(100), primary_key=True)
+    instance_id = Column(String(100), nullable=False)
+    host = Column(String(255), nullable=False)
+    pid = Column(Integer, nullable=False)
+    status = Column(String(32), nullable=False)
+    last_heartbeat_at = Column(DateTime, nullable=False, index=True)
+    started_at = Column(DateTime, nullable=False)
+    last_cycle_at = Column(DateTime, nullable=True)
+    last_error = Column(Text, nullable=True)
+
+    total_processed = Column(Integer, nullable=False, default=0, server_default="0")
+    total_succeeded = Column(Integer, nullable=False, default=0, server_default="0")
+    total_failed = Column(Integer, nullable=False, default=0, server_default="0")
+    total_permanent_failures = Column(Integer, nullable=False, default=0, server_default="0")
+
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def __repr__(self):
+        return (
+            f"<WorkerRuntimeStatus(worker={self.worker_name}, status={self.status}, "
+            f"heartbeat={self.last_heartbeat_at})>"
+        )

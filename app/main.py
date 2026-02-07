@@ -6,13 +6,10 @@ FastAPI application with lifespan management, middleware, and routing.
 
 import logging
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import get_settings
 from app.dependencies import init_orchestrator, shutdown_orchestrator, get_db
@@ -30,10 +27,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-# Global scheduler and worker instances
-_scheduler: Optional[BackgroundScheduler] = None
-_ark_publisher = None
 
 
 @asynccontextmanager
@@ -77,59 +70,17 @@ async def lifespan(app: FastAPI):
         from app.dependencies import init_metadata_storage
         metadata_storage = init_metadata_storage()
         
-        # Store globally for health check and worker access
+        # Store globally for health check.
         app.state.metadata_storage = metadata_storage
     except Exception as e:
         logger.error(f"Failed to initialize metadata storage: {e}")
         raise
     
-    # Initialize async worker if enabled
-    global _scheduler, _ark_publisher
-    if settings.worker_enabled:
-        try:
-            from app.workers.publisher import ARKPublisher
-            
-            _ark_publisher = ARKPublisher(
-                orchestrator=orchestrator,
-                metadata_storage=metadata_storage,
-                batch_size=settings.worker_batch_size,
-                max_retries=settings.worker_max_retries,
-                backoff_base=settings.worker_retry_backoff_base,
-            )
-            
-            # Create background scheduler
-            _scheduler = BackgroundScheduler()
-            _scheduler.add_job(
-                func=_ark_publisher.run_publish_cycle,
-                trigger=IntervalTrigger(seconds=settings.worker_interval_seconds),
-                id="ark_publisher",
-                name="ARK Publisher Worker",
-                max_instances=1,  # Only one instance running at a time
-                replace_existing=True,
-            )
-            _scheduler.start()
-            
-            # Store globally for monitoring endpoint
-            app.state.ark_publisher = _ark_publisher
-            
-            logger.info(f"ARK publisher worker started (interval: {settings.worker_interval_seconds}s)")
-        except Exception as e:
-            logger.error(f"Failed to initialize worker: {e}")
-            raise
-    else:
-        logger.info("ARK publisher worker disabled")
-    
     yield
     
     # Shutdown
     logger.info("Shutting down dARK Core API...")
-    
-    # Stop worker scheduler (access global from module level)
-    if _scheduler:
-        logger.info("Stopping ARK publisher worker...")
-        _scheduler.shutdown(wait=True)
-        logger.info("ARK publisher worker stopped")
-    
+
     shutdown_orchestrator()
     
     from app.database import close_db
@@ -220,19 +171,6 @@ def create_app() -> FastAPI:
             response["metadata_storage"] = "unhealthy"
             response["metadata_storage_error"] = str(e)
             status = "degraded"
-        
-        # Check worker status
-        if hasattr(app.state, "ark_publisher"):
-            try:
-                worker_stats = app.state.ark_publisher.get_stats()
-                response["worker"] = {
-                    "enabled": True,
-                    "last_run": worker_stats.get("last_run_at"),
-                }
-            except Exception as e:
-                response["worker"] = {"enabled": True, "error": str(e)}
-        else:
-            response["worker"] = {"enabled": False}
         
         response["status"] = status
         

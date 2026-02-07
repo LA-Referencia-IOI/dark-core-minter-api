@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     worker_batch_size: int = 10  # Process up to 10 ARKs per cycle
     worker_max_retries: int = 5  # Max retry attempts before marking as failed
     worker_retry_backoff_base: float = 2.0  # Exponential backoff base (seconds)
+    worker_runtime_name: str = "ark-publisher"
+    worker_heartbeat_interval_seconds: int = 10
+    worker_heartbeat_stale_after_seconds: int = 180
     
     # Metadata Storage Configuration
     metadata_storage_type: str = "filesystem"  # "filesystem" or "ipfs"

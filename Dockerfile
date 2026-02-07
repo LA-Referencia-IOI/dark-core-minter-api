@@ -29,5 +29,5 @@ ENV DATABASE_URL=sqlite:////app/data/minter.db
 # Expose port
 EXPOSE 8001
 
-# Run with multiple workers for scalability
+# Default command runs API only (worker runs in separate process/service)
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "4"]
