@@ -1,6 +1,6 @@
-"""Consolidated baseline schema.
+"""Initial schema - consolidated baseline.
 
-Revision ID: 0001_consolidated_schema
+Revision ID: 0001_initial_schema
 Revises: None
 Create Date: 2026-02-07
 
@@ -12,13 +12,14 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = "0001_consolidated_schema"
+revision: str = "0001_initial_schema"
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    # ark_records table
     op.create_table(
         "ark_records",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
@@ -63,6 +64,21 @@ def upgrade() -> None:
         unique=False,
     )
 
+    # noid_counters table
+    op.create_table(
+        "noid_counters",
+        sa.Column("namespace_key", sa.String(length=160), nullable=False),
+        sa.Column("next_value", sa.BigInteger(), server_default="0", nullable=False),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(),
+            server_default=sa.text("(CURRENT_TIMESTAMP)"),
+            nullable=False,
+        ),
+        sa.PrimaryKeyConstraint("namespace_key"),
+    )
+
+    # worker_runtime_status table
     op.create_table(
         "worker_runtime_status",
         sa.Column("worker_name", sa.String(length=100), nullable=False),
@@ -95,12 +111,9 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.drop_index(
-        op.f("ix_worker_runtime_status_last_heartbeat_at"),
-        table_name="worker_runtime_status",
-    )
+    op.drop_index(op.f("ix_worker_runtime_status_last_heartbeat_at"), table_name="worker_runtime_status")
     op.drop_table("worker_runtime_status")
-
+    op.drop_table("noid_counters")
     op.drop_index("ix_state_permanently_failed_created", table_name="ark_records")
     op.drop_index("ix_state_authority", table_name="ark_records")
     op.drop_index("ix_naan_name", table_name="ark_records")
@@ -108,4 +121,3 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_ark_records_created_at"), table_name="ark_records")
     op.drop_index(op.f("ix_ark_records_authority_id"), table_name="ark_records")
     op.drop_table("ark_records")
-
