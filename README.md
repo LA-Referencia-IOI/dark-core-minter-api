@@ -48,6 +48,24 @@ API supports both execution styles:
 - Direct Uvicorn: `uvicorn app.main:app ...`
 - CLI script: `dark-core-api`
 
+### Using `dark-store-api` as Metadata Backend
+
+If you want metadata persistence through `dark-store-api`:
+
+```bash
+# 1) Run dark-store-api
+cd /Users/lmatas/source/dark/dark-store-api
+uvicorn app.main:app --host 0.0.0.0 --port 8002
+
+# 2) Configure minter storage backend
+cd /Users/lmatas/source/dark/dark-core-minter-api
+export METADATA_STORAGE_TYPE=store_api
+export METADATA_STORE_API_URL=http://localhost:8002
+export METADATA_STORE_API_TIMEOUT_SECONDS=10.0
+```
+
+With this setup, `PUT /api/v1/arks/{ark}` stores metadata via `POST /v1/store` in `dark-store-api` and persists the returned CID in `ark_records.metadata_cid`.
+
 ## API Endpoints
 
 | Endpoint | Method | Purpose |
@@ -89,6 +107,22 @@ Once running, visit:
 - Swagger UI: `http://localhost:8001/docs`
 - ReDoc: `http://localhost:8001/redoc`
 - Full architecture (Mermaid): [`minter-architecture.md`](./minter-architecture.md)
+
+### Feature-Focused Notebooks
+
+The original end-to-end notebook is still available at:
+- [`notebooks/minter_api_test.ipynb`](./notebooks/minter_api_test.ipynb)
+
+Feature-specific notebooks:
+- [`notebooks/minter_01_smoke_authority.ipynb`](./notebooks/minter_01_smoke_authority.ipynb): service smoke and authority checks.
+- [`notebooks/minter_02_reserve_validation.ipynb`](./notebooks/minter_02_reserve_validation.ipynb): single reserve, validation, checkdigit behavior.
+- [`notebooks/minter_03_update_metadata_formats.ipynb`](./notebooks/minter_03_update_metadata_formats.ipynb): JSON/XML update to `DRAFT` and overwrite scenarios.
+- [`notebooks/minter_04_tombstone_missing.ipynb`](./notebooks/minter_04_tombstone_missing.ipynb): tombstone lifecycle and missing-record operations.
+- [`notebooks/minter_05_batch_concurrency.ipynb`](./notebooks/minter_05_batch_concurrency.ipynb): batch reserve and concurrent reserve uniqueness.
+- [`notebooks/minter_06_worker_publish_update.ipynb`](./notebooks/minter_06_worker_publish_update.ipynb): worker-driven publish/update flow.
+- [`notebooks/minter_07_chain_import_optional.ipynb`](./notebooks/minter_07_chain_import_optional.ipynb): optional on-chain import path (`EXISTING_CHAIN_ARK`).
+
+See [`notebooks/README.md`](./notebooks/README.md) for execution notes and environment variables.
 
 ## Configuration Guide
 
@@ -177,8 +211,10 @@ DATABASE_MAX_OVERFLOW=20
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `METADATA_STORAGE_TYPE` | Backend type: `filesystem` or `ipfs` | `filesystem` | No |
+| `METADATA_STORAGE_TYPE` | Backend type: `filesystem` or `store_api` | `filesystem` | No |
 | `METADATA_STORAGE_PATH` | Path for filesystem storage | `./metadata_storage` | No |
+| `METADATA_STORE_API_URL` | Base URL for `dark-store-api` backend | `http://localhost:8002` | No |
+| `METADATA_STORE_API_TIMEOUT_SECONDS` | HTTP timeout for storage calls | `10.0` | No |
 
 #### 🔐 Security (mTLS)
 
@@ -222,6 +258,7 @@ WORKER_BATCH_SIZE=5
 # Local storage
 METADATA_STORAGE_TYPE=filesystem
 METADATA_STORAGE_PATH=./metadata_dev
+# METADATA_STORE_API_URL=http://localhost:8002
 
 # No mTLS in development
 MTLS_ENABLED=false
@@ -261,9 +298,10 @@ WORKER_INTERVAL_SECONDS=30
 WORKER_BATCH_SIZE=50
 WORKER_MAX_RETRIES=10
 
-# IPFS for production (when implemented)
-METADATA_STORAGE_TYPE=filesystem
-METADATA_STORAGE_PATH=/data/metadata
+# dark-store-api for production metadata persistence
+METADATA_STORAGE_TYPE=store_api
+METADATA_STORE_API_URL=http://dark-store-api:8002
+METADATA_STORE_API_TIMEOUT_SECONDS=10.0
 
 # Enable mTLS
 MTLS_ENABLED=true
@@ -293,8 +331,9 @@ MINTER_NOID_CHECKDIGIT=true
 DB_PASSWORD=dark_password
 DATABASE_URL=postgresql://dark:dark_password@postgres:5432/minter
 
-# Container paths
-METADATA_STORAGE_PATH=/app/data/metadata
+# Metadata storage backend
+METADATA_STORAGE_TYPE=store_api
+METADATA_STORE_API_URL=http://store-api:8002
 ```
 
 ### Validation
@@ -336,7 +375,7 @@ The Minter API manages ARKs through the following states:
 
 4. **PUBLISHED**: Published to blockchain and metadata stored
    - Automated by async worker
-   - Metadata stored (filesystem or IPFS)
+   - Metadata stored (filesystem or dark-store-api)
    - ARK registered on blockchain via orchestrator
    - CID stored in database
 
@@ -373,7 +412,7 @@ Metadata is stored through an abstraction layer supporting multiple backends and
 
 **Storage Backends:**
 - **Filesystem** (development): Stores files with format-appropriate extensions (`.json`, `.xml`) with MD5 as CID
-- **IPFS** (future): Will store on IPFS network with real CID
+- **dark-store-api** (recommended): Delegates storage over HTTP to `/v1/store` and receives content-addressed CID
 
 CID is calculated from raw content, independent of format. Switch backends via `METADATA_STORAGE_TYPE` environment variable.
 

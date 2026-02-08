@@ -8,6 +8,7 @@ Active implementation with separated runtime architecture:
 - Publisher worker process (`app.main_worker`)
 - Full local ARK lifecycle persistence in `ark_records`
 - Deterministic sequential minting per namespace in `noid_counters`
+- Pluggable metadata persistence (`filesystem` or `store_api` via `dark-store-api`)
 
 ## 1. Process Architecture
 
@@ -180,12 +181,14 @@ Behavior details for `PUT /api/v1/arks/{ark}`:
   - `NOT_RUNNING` (exit code 1)
 - Periodic heartbeat persisted in DB with status and counters
 
-## 7. Metadata Formats
+## 7. Metadata Storage and Formats
 
 - `metadata` is received as raw string
 - `metadata_format` supports `json` and `xml`
-- Content is persisted in external storage
-- DB stores `metadata_cid` + `metadata_format`
+- DB stores `metadata_cid` + `metadata_format` regardless of backend
+- `filesystem` backend stores local files using MD5-based CIDs
+- `store_api` backend stores/retrieves metadata through `dark-store-api` (`/v1/store`, `/v1/retrieve/{cid}`)
+- If metadata storage fails, `PUT /api/v1/arks/{ark}` is rejected and ARK state is not transitioned
 
 ## 8. Relevant Configuration
 
@@ -206,6 +209,12 @@ WORKER_RUNTIME_NAME=ark-publisher
 WORKER_HEARTBEAT_INTERVAL_SECONDS=10
 WORKER_HEARTBEAT_STALE_AFTER_SECONDS=180
 
+# Metadata storage backend
+METADATA_STORAGE_TYPE=store_api
+METADATA_STORAGE_PATH=./metadata_storage
+METADATA_STORE_API_URL=http://localhost:8002
+METADATA_STORE_API_TIMEOUT_SECONDS=10.0
+
 # Authorization cache
 AUTH_CACHE_TTL=60
 AUTH_CACHE_MAXSIZE=1000
@@ -225,6 +234,7 @@ MINTER_NOID_CHECKDIGIT=true
 - `minter-worker`
 
 API and worker share PostgreSQL via `DATABASE_URL`.
+`dark-store-api` is an external companion service and should be reachable via `METADATA_STORE_API_URL` when using `METADATA_STORAGE_TYPE=store_api`.
 
 ## 10. Testing
 
@@ -235,6 +245,7 @@ Main suites:
 - `tests/test_worker_unit.py`
 - `tests/test_main_worker_lock.py`
 - `tests/test_storage.py`
+- `tests/test_storage_store_api.py`
 - `tests/test_auth_cache.py`
 - `tests/test_middleware.py`
 
@@ -255,6 +266,9 @@ Recent full regression result: `99 passed`.
 - `app/repositories/ark_repository.py` (CAS transitions and atomic updates)
 - `app/workers/publisher.py` (`create_ark` vs `update_ark` by state)
 - `app/models/states.py` (new `UPDATE` state)
+- `app/storage/store_api.py` (HTTP metadata backend for `dark-store-api`)
+- `app/storage/__init__.py` (storage backend factory with `store_api`)
+- `app/dependencies.py` (runtime backend selection by `METADATA_STORAGE_TYPE`)
 - `README.md`
 - `minter-architecture.md`
 - `noid.md`

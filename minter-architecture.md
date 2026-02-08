@@ -10,7 +10,7 @@ Language note: this document is intentionally maintained in English.
 flowchart LR
     C["API Client"] --> API["API Process (FastAPI)"]
     API --> DB["PostgreSQL"]
-    API --> ST["Metadata Storage (filesystem/ipfs)"]
+    API --> ST["Metadata Storage (filesystem/store_api)"]
     API --> ORCH["dark-core-orchestrator"]
     ORCH --> CHAIN["Blockchain (Authority + dARK)"]
 
@@ -31,6 +31,7 @@ flowchart LR
 - `app/repositories/noid_counter_repository.py`: deterministic NOID namespace counter.
 - `app/workers/publisher.py`: publish loop and retry policy.
 - `app/api/worker.py`: worker status endpoint backed by DB heartbeat.
+- `app/storage/store_api.py`: metadata backend that delegates persistence to `dark-store-api`.
 
 ## 3. ARK Reservation (POST /api/v1/arks)
 

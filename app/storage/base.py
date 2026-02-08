@@ -23,7 +23,7 @@ class MetadataStorage(ABC):
         Returns:
             Content identifier (CID) as string.
             For filesystem: MD5 hash of content
-            For IPFS: IPFS CID
+            For store_api: CID returned by dark-store-api
             
         Raises:
             StorageError: If storage operation fails

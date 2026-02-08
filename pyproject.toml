@@ -35,6 +35,7 @@ dependencies = [
     "alembic>=1.13.0",
     "psycopg2-binary>=2.9.0",
     "apscheduler>=3.10.0",
+    "httpx>=0.26.0",
 ]
 
 [project.optional-dependencies]

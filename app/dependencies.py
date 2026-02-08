@@ -137,12 +137,27 @@ def init_metadata_storage() -> "MetadataStorage":
         Initialized MetadataStorage
     """
     global _metadata_storage
-    from app.storage.filesystem import FileSystemMetadataStorage
+    from app.storage import get_metadata_storage as build_metadata_storage
     
     settings = get_settings()
-    
-    logger.info(f"Initializing metadata storage at {settings.metadata_storage_path}")
-    _metadata_storage = FileSystemMetadataStorage(settings.metadata_storage_path)
+
+    storage_type = settings.metadata_storage_type.lower()
+    logger.info(f"Initializing metadata storage backend: {storage_type}")
+
+    if storage_type == "filesystem":
+        _metadata_storage = build_metadata_storage(
+            storage_type="filesystem",
+            storage_path=settings.metadata_storage_path,
+        )
+    elif storage_type == "store_api":
+        _metadata_storage = build_metadata_storage(
+            storage_type="store_api",
+            store_api_url=settings.metadata_store_api_url,
+            timeout_seconds=settings.metadata_store_api_timeout_seconds,
+        )
+    else:
+        raise ValueError(f"Unsupported metadata storage type: {storage_type}")
+
     logger.info("Metadata storage initialized successfully")
     
     return _metadata_storage
