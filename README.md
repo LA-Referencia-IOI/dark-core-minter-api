@@ -8,7 +8,7 @@
 ## Overview
 
 The Core Minter API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It handles the full lifecycle of ARK identifiers:
-- **Reserve**: Generate IDs locally using deterministic DB counters + NOID checkdigit (with optional external identifiers like DOI/OAI).
+- **Reserve**: Generate IDs locally using deterministic DB counters + NOID checkdigit.
 - **Publish/Update**: Persist metadata and publish create/update on blockchain (`draft|update` -> `published`).
 - **Resolve**: Retrieve current state and metadata.
 - **Tombstone**: Deactivate identifiers.
@@ -64,16 +64,16 @@ export METADATA_STORE_API_URL=http://localhost:8002
 export METADATA_STORE_API_TIMEOUT_SECONDS=10.0
 ```
 
-With this setup, `PUT /api/v1/arks/{ark}` stores metadata via `POST /v1/store` in `dark-store-api` and persists the returned CID in `ark_records.metadata_cid`.
+With this setup, `PUT /api/v1/arks/{ark}` stores Level-1/Level-2 metadata in PostgreSQL (`ark_metadata`), and the worker persists both payloads to the configured storage backend (`filesystem` or `dark-store-api`) before publishing.
 
 ## API Endpoints
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1/arks` | POST | Reserve new ARK ID (supports `alternate_identifiers`) |
+| `/api/v1/arks` | POST | Reserve new ARK ID |
 | `/api/v1/arks/batch` | POST | Batch reserve ARK IDs (requires `client_item_id` for correlation) |
 | `/api/v1/arks/{ark}` | GET | Get ARK details |
-| `/api/v1/arks/{ark}` | PUT | Update metadata (JSON/XML) & transition to DRAFT state |
+| `/api/v1/arks/{ark}` | PUT | Update two-level metadata (`level1_metadata` + `original_metadata`) & transition to DRAFT/UPDATE |
 | `/api/v1/arks/{ark}` | DELETE | Tombstone/Deactivate ARK |
 | `/api/v1/authority/{uuid}` | GET | Get authority info |
 | `/api/v1/authority/{uuid}/naans` | GET | List authority NAANs |
@@ -116,7 +116,7 @@ The original end-to-end notebook is still available at:
 Feature-specific notebooks:
 - [`notebooks/minter_01_smoke_authority.ipynb`](./notebooks/minter_01_smoke_authority.ipynb): service smoke and authority checks.
 - [`notebooks/minter_02_reserve_validation.ipynb`](./notebooks/minter_02_reserve_validation.ipynb): single reserve, validation, checkdigit behavior.
-- [`notebooks/minter_03_update_metadata_formats.ipynb`](./notebooks/minter_03_update_metadata_formats.ipynb): JSON/XML update to `DRAFT` and overwrite scenarios.
+- [`notebooks/minter_03_update_metadata_formats.ipynb`](./notebooks/minter_03_update_metadata_formats.ipynb): two-level metadata update to `DRAFT`, overwrite scenarios, and validation checks.
 - [`notebooks/minter_04_tombstone_missing.ipynb`](./notebooks/minter_04_tombstone_missing.ipynb): tombstone lifecycle and missing-record operations.
 - [`notebooks/minter_05_batch_concurrency.ipynb`](./notebooks/minter_05_batch_concurrency.ipynb): batch reserve and concurrent reserve uniqueness.
 - [`notebooks/minter_06_worker_publish_update.ipynb`](./notebooks/minter_06_worker_publish_update.ipynb): worker-driven publish/update flow.
@@ -360,11 +360,12 @@ The Minter API manages ARKs through the following states:
    - No blockchain interaction yet
    - Can be batch reserved with `POST /api/v1/arks/batch`
 
-2. **DRAFT**: Metadata added, ready for publication
+2. **DRAFT**: Metadata staged, ready for publication
    - Transition via `PUT /api/v1/arks/{ark}`
-   - Requires `target` URL, `metadata` (raw JSON/XML string), and `metadata_format` ("json" or "xml")
+   - Requires `target`, `level1_metadata` (validated JSON), `original_metadata` (raw content), and `metadata_schema`
+   - `alternate_identifiers` and `alternate_urls` must be inside `level1_metadata` (not as top-level request fields)
    - If `target` is missing/empty, the request is rejected and state remains `RESERVED` (no DRAFT transition)
-   - Metadata stored immediately, CID returned in response
+   - Metadata is stored in DB first (`ark_metadata`); CIDs are assigned later by worker
    - Authorization validated before transition
    - Async worker picks up and executes on-chain `create_ark`
 
@@ -373,11 +374,11 @@ The Minter API manages ARKs through the following states:
    - Also used when ARK is missing in DB but exists on-chain (record is imported first)
    - Async worker picks up and executes on-chain `update_ark`
 
-4. **PUBLISHED**: Published to blockchain and metadata stored
+4. **PUBLISHED**: Published to blockchain with finalized L1 CID
    - Automated by async worker
-   - Metadata stored (filesystem or dark-store-api)
+   - Worker stores L2 first, injects L2 CID into L1, then stores L1
    - ARK registered on blockchain via orchestrator
-   - CID stored in database
+   - `ark_records.metadata_cid` points to L1 CID
 
 5. **TOMBSTONE**: ARK deactivated
    - Soft delete via `DELETE /api/v1/arks/{ark}`
@@ -404,17 +405,25 @@ The publisher worker runs as a separate process (`dark-core-worker`) and publish
 
 ### Metadata Storage
 
-Metadata is stored through an abstraction layer supporting multiple backends and formats:
+The service uses two-level metadata:
 
-**Supported Formats:**
-- **JSON**: Standard JSON metadata
-- **XML**: Dublin Core, OAI-DC, or custom XML schemas
+- **L1 (`level1_metadata`)**: validated JSON document used as canonical publish payload.
+- **L2 (`original_metadata`)**: original raw record provided by client (XML/JSON/text).
+- Alternate IDs/URLs are persisted in `ark_metadata.level1_json`, not in `ark_records`.
 
-**Storage Backends:**
-- **Filesystem** (development): Stores files with format-appropriate extensions (`.json`, `.xml`) with MD5 as CID
-- **dark-store-api** (recommended): Delegates storage over HTTP to `/v1/store` and receives content-addressed CID
+Write flow:
 
-CID is calculated from raw content, independent of format. Switch backends via `METADATA_STORAGE_TYPE` environment variable.
+1. API validates L1 and stores L1+L2 in `ark_metadata` (DB).
+2. Worker stores L2 to storage backend -> gets `level2_cid`.
+3. Worker injects `level2_cid` into L1 and stores L1 -> gets `level1_cid`.
+4. Worker updates DB and publishes using `level1_cid` (`ark_records.metadata_cid`).
+
+Storage backends:
+
+- **Filesystem** (development): local content-addressed store.
+- **dark-store-api**: external store via `/v1/store`.
+
+Switch backends via `METADATA_STORAGE_TYPE`.
 
 ### Database
 
@@ -494,33 +503,35 @@ Response includes:
 
 ## Testing
 
-Tests are configured for PostgreSQL. Set a dedicated test database before running:
+For PostgreSQL test runs, use the helper script:
 
 ```bash
-export TEST_DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter_test
+./run_tests_postgres.sh
 ```
 
-Run all tests:
+By default, pytest now uses local SQLite test DB (`tests/.test_minter.sqlite`) when `TEST_DATABASE_URL` is not set.
+
+Run all tests explicitly:
 ```bash
-pytest tests/ -v
+python3 -m pytest -q
 ```
 
 Run specific test categories:
 ```bash
 # Persistence tests
-pytest tests/test_persistence.py -v
+python3 -m pytest tests/test_persistence.py -q
 
 # Storage tests
-pytest tests/test_storage.py -v
+python3 -m pytest tests/test_storage.py -q
 
 # Cache thread-safety tests
-pytest tests/test_auth_cache.py -v
+python3 -m pytest tests/test_auth_cache.py -q
 
 # mTLS middleware tests
-pytest tests/test_middleware.py -v
+python3 -m pytest tests/test_middleware.py -q
 
 # Worker tests
-pytest tests/test_worker.py tests/test_worker_unit.py tests/test_main_worker_lock.py -v
+python3 -m pytest tests/test_worker.py tests/test_worker_unit.py tests/test_main_worker_lock.py -q
 ```
 
 ### Test Coverage

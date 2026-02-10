@@ -139,7 +139,7 @@ Canonical lifecycle:
 ```mermaid
 stateDiagram-v2
     [*] --> RESERVED: POST /arks
-    RESERVED --> DRAFT: PUT /arks/{ark} (target+metadata required)
+    RESERVED --> DRAFT: PUT /arks/{ark} (target + L1 + L2 required)
     DRAFT --> DRAFT: PUT /arks/{ark} (overwrite pending create)
     DRAFT --> PUBLISHED: Worker create_ark
     PUBLISHED --> UPDATE: PUT /arks/{ark}
@@ -180,10 +180,19 @@ erDiagram
         string authority_id
         string target
         string metadata_cid
-        string metadata_format
         int publish_retry_count
         datetime publish_last_attempt_at
         int publish_permanently_failed
+    }
+
+    ARK_METADATA {
+        int id PK
+        int ark_record_id FK
+        json level1_json
+        string level1_cid
+        text original_content
+        string original_schema
+        string original_cid
     }
 
     NOID_COUNTERS {
@@ -210,11 +219,13 @@ erDiagram
 - API:
   - validates authority.
   - reserves deterministic ARKs.
-  - applies `RESERVED -> DRAFT` transition.
+  - validates and stores L1/L2 metadata in DB.
+  - applies `RESERVED -> DRAFT` / `PUBLISHED -> UPDATE` transitions.
   - exposes worker status via heartbeat.
 - Worker:
-  - safely claims DRAFT records.
-  - publishes ARKs on-chain.
+  - safely claims DRAFT/UPDATE records.
+  - stores L2 first, then L1 with injected L2 CID.
+  - publishes ARKs on-chain using L1 CID.
   - applies `DRAFT -> PUBLISHED` with CAS.
   - reports heartbeat and runtime metrics.
 - PostgreSQL:

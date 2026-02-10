@@ -19,8 +19,8 @@ API Router
    :undoc-members:
    :show-inheritance:
 
-Enders Points
--------------
+Endpoints
+---------
 
 
 
@@ -51,6 +51,14 @@ Models
    :show-inheritance:
 
 .. automodule:: app.models.responses
+   :members:
+   :undoc-members:
+   :show-inheritance:
+
+Metadata Schemas
+----------------
+
+.. automodule:: app.metadata.schemas
    :members:
    :undoc-members:
    :show-inheritance:

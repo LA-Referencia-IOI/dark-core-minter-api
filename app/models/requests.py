@@ -4,9 +4,8 @@ Request models for dARK Core API.
 Pydantic models for validating incoming API requests.
 """
 
-from typing import Optional, Literal
-from pydantic import BaseModel, Field, HttpUrl
-from app.models.states import ARKState
+from typing import Optional
+from pydantic import BaseModel, ConfigDict, Field
 
 
 
@@ -20,14 +19,10 @@ from app.models.states import ARKState
 # =============================================================================
 
 
-class AlternateIdentifier(BaseModel):
-    """Alternate identifier (e.g. DOI, OAI)."""
-    schema_: str = Field(..., alias="schema", description="Identifier schema (doi, oai, etc.)")
-    value: str = Field(..., description="Identifier value")
-
-
 class ReserveARKRequest(BaseModel):
     """Request to reserve a new ARK."""
+
+    model_config = ConfigDict(extra="forbid")
     
     authority_id: str = Field(
         ...,
@@ -38,21 +33,13 @@ class ReserveARKRequest(BaseModel):
         description="NAAN to use for the ARK"
     )
 
-    alternate_identifiers: Optional[list[AlternateIdentifier]] = Field(
-        None,
-        description="External identifiers (stored in IPFS metadata)"
-    )
-
-
 class ReserveBatchItem(BaseModel):
     """Item for batch reservation."""
+
+    model_config = ConfigDict(extra="forbid")
     target: Optional[str] = Field(
         None,
         description="Initial target URL (optional)"
-    )
-    alternate_identifiers: Optional[list[AlternateIdentifier]] = Field(
-        None,
-        description="External identifiers (stored in IPFS metadata)"
     )
     client_item_id: str = Field(
         ...,
@@ -63,6 +50,8 @@ class ReserveBatchItem(BaseModel):
 
 class ReserveBatchRequest(BaseModel):
     """Request to reserve multiple ARKs."""
+
+    model_config = ConfigDict(extra="forbid")
     
     authority_id: str = Field(
         ...,
@@ -80,26 +69,31 @@ class ReserveBatchRequest(BaseModel):
 
 
 class UpdateARKMetadataRequest(BaseModel):
-    """Request to update ARK metadata and promote to DRAFT."""
+    """
+    Request to update ARK metadata and transition to DRAFT state.
     
-    authority_id: str = Field(
-        ...,
-        description="Authority UUID"
-    )
-    target: str = Field(
-        ...,
-        description="Target URL for resolution"
-    )
-    metadata: str = Field(
-        ...,
-        description="Raw metadata content (JSON or XML string)"
-    )
-    metadata_format: Literal["json", "xml"] = Field(
-        ...,
-        description="Format of the metadata content"
-    )
-    alternate_identifiers: Optional[list[AlternateIdentifier]] = Field(
-        None,
-        description="External identifiers to update/add"
-    )
+    The client provides both:
+    1. Level 1 (minimal extracted fields) as a JSON object
+    2. Level 2 (original record) as a raw string
+    """
 
+    model_config = ConfigDict(extra="forbid")
+    
+    authority_id: str = Field(..., description="Authority UUID")
+    target: str = Field(..., description="Target URL for resolution")
+    
+    # Level 1 — client-provided minimal JSON
+    level1_metadata: dict = Field(
+        ...,
+        description="Minimal metadata extracted from original record (validated against Level1Metadata schema)"
+    )
+    
+    # Level 2 — client-provided original metadata
+    original_metadata: str = Field(
+        ...,
+        description="Raw content of the original metadata record (XML/JSON/Text)"
+    )
+    metadata_schema: str = Field(
+        ...,
+        description="Schema type of the original metadata (dublin_core, datacite, etc.)"
+    )

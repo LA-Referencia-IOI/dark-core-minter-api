@@ -28,9 +28,6 @@ def upgrade() -> None:
         sa.Column("state", sa.String(length=1), nullable=False),
         sa.Column("authority_id", sa.String(length=255), nullable=False),
         sa.Column("target", sa.Text(), nullable=True),
-        sa.Column("metadata_cid", sa.String(length=100), nullable=True),
-        sa.Column("metadata_format", sa.String(length=20), nullable=True),
-        sa.Column("alternate_identifiers", sa.JSON(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(),
@@ -109,8 +106,38 @@ def upgrade() -> None:
         unique=False,
     )
 
+    # ark_metadata table
+    op.create_table(
+        "ark_metadata",
+        sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
+        sa.Column("ark_record_id", sa.Integer(), nullable=False),
+        sa.Column("level1_json", sa.JSON(), nullable=False),
+        sa.Column("level1_cid", sa.String(length=100), nullable=True),
+        sa.Column("original_content", sa.Text(), nullable=False),
+        sa.Column("original_schema", sa.String(length=50), nullable=False),
+        sa.Column("original_cid", sa.String(length=100), nullable=True),
+        sa.Column(
+            "created_at",
+            sa.DateTime(),
+            server_default=sa.text("(CURRENT_TIMESTAMP)"),
+            nullable=False,
+        ),
+        sa.Column(
+            "updated_at",
+            sa.DateTime(),
+            server_default=sa.text("(CURRENT_TIMESTAMP)"),
+            nullable=False,
+        ),
+        sa.ForeignKeyConstraint(["ark_record_id"], ["ark_records.id"]),
+        sa.PrimaryKeyConstraint("id"),
+        sa.UniqueConstraint("ark_record_id"),
+    )
+    op.create_index(op.f("ix_ark_metadata_ark_record_id"), "ark_metadata", ["ark_record_id"], unique=False)
+
 
 def downgrade() -> None:
+    op.drop_index(op.f("ix_ark_metadata_ark_record_id"), table_name="ark_metadata")
+    op.drop_table("ark_metadata")
     op.drop_index(op.f("ix_worker_runtime_status_last_heartbeat_at"), table_name="worker_runtime_status")
     op.drop_table("worker_runtime_status")
     op.drop_table("noid_counters")

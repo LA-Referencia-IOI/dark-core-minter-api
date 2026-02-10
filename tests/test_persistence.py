@@ -2,11 +2,10 @@
 Additional tests for ARK persistence and error handling.
 """
 
-import json
 import pytest
 from unittest.mock import patch
 from app.models.states import ARKState
-from app.database.models import ARKRecord
+from app.database.models import ARKRecord, ARKMetadata
 from app.config import get_settings
 from app.utils.noid import ALPHABET, compute_checkdigit, encode_counter
 
@@ -18,6 +17,28 @@ def _expected_name(naan: str, counter: int) -> str:
     if settings.minter_noid_checkdigit:
         return f"{stem}{compute_checkdigit(f'{naan}/{stem}')}"
     return stem
+
+
+def _build_update_payload(
+    authority_id: str = "test-uuid",
+    target: str = "https://example.org/resource",
+    title: str = "Test Resource",
+    year: int = 2024,
+    metadata_schema: str = "dublin_core",
+    original_metadata: str = "<raw>metadata</raw>",
+) -> dict:
+    """Build a valid two-level metadata update payload."""
+    return {
+        "authority_id": authority_id,
+        "target": target,
+        "level1_metadata": {
+            "title": title,
+            "authors": ["Test Author"],
+            "year": year,
+        },
+        "original_metadata": original_metadata,
+        "metadata_schema": metadata_schema,
+    }
 
 
 def test_reserve_ark_persists_to_db(client, test_db, mock_orchestrator):
@@ -130,33 +151,33 @@ def test_update_ark_to_draft(client, test_db, mock_orchestrator):
     assert reserve_response.status_code == 201
     ark = reserve_response.json()["ark"]
     
-    # 2. Update to DRAFT with new metadata format
-    metadata_content = json.dumps({"title": "Test Resource", "author": "Test Author"})
+    # 2. Update to DRAFT with two-level metadata payload
     update_response = client.put(
         f"/api/v1/arks/{ark}",
-        json={
-            "authority_id": "test-uuid",
-            "target": "https://example.org/resource",
-            "metadata": metadata_content,
-            "metadata_format": "json",
-        },
+        json=_build_update_payload(target="https://example.org/resource"),
     )
     
     assert update_response.status_code == 200
     data = update_response.json()
     assert data["state"] == ARKState.DRAFT
     assert data["target"] == "https://example.org/resource"
-    assert data.get("metadata_cid") is not None  # CID is now set at update time
-    assert data.get("metadata_format") == "json"
+    assert data.get("metadata_cid") is None
+    assert data.get("metadata_schema") == "dublin_core"
     
-    # 3. Verify in database
+    # 3. Verify in database (ARK + two-level metadata)
     from app.repositories.ark_repository import parse_ark
     naan, name = parse_ark(ark)
     db_ark = test_db.query(ARKRecord).filter_by(naan=naan, name=name).first()
     assert db_ark.state == ARKState.DRAFT
     assert db_ark.target == "https://example.org/resource"
-    assert db_ark.metadata_format == "json"
-    assert db_ark.metadata_cid is not None
+
+    db_meta = test_db.query(ARKMetadata).filter_by(ark_record_id=db_ark.id).first()
+    assert db_meta is not None
+    assert db_meta.original_schema == "dublin_core"
+    assert db_meta.level1_json["title"] == "Test Resource"
+    assert db_meta.level1_json["original_metadata"]["cid"] is None
+    assert db_meta.level1_cid is None
+    assert db_meta.original_cid is None
 
 
 def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_orchestrator):
@@ -172,30 +193,50 @@ def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_orchestrat
         name=name,
         authority_id="test-uuid",
     )
-    # Manually change to DRAFT
+    test_db.flush()
+    # Manually change to DRAFT with existing two-level metadata
     db_ark.state = ARKState.DRAFT
     db_ark.target = "https://example.org"
-    db_ark.metadata_format = "json"
-    db_ark.metadata_cid = "abc123"
+    old_meta = ark_repo.create_or_update_metadata(
+        ark_record_id=db_ark.id,
+        level1_json={
+            "title": "Old title",
+            "authors": ["Old Author"],
+            "year": 2021,
+            "original_metadata": {"schema": "dublin_core", "cid": None},
+        },
+        original_content="<old>raw</old>",
+        original_schema="dublin_core",
+    )
+    old_meta.level1_cid = "old-l1-cid"
+    old_meta.original_cid = "old-l2-cid"
     test_db.commit()
     
     # Update again (should overwrite and remain DRAFT)
     response = client.put(
         f"/api/v1/arks/ark:12345/{name}",
-        json={
-            "authority_id": "test-uuid",
-            "target": "https://new-url.org",
-            "metadata": json.dumps({"new": "data"}),
-            "metadata_format": "json",
-        },
+        json=_build_update_payload(
+            target="https://new-url.org",
+            title="New title",
+            year=2026,
+            original_metadata="<new>raw</new>",
+        ),
     )
     
     assert response.status_code == 200
     body = response.json()
     assert body["state"] == ARKState.DRAFT
     assert body["target"] == "https://new-url.org"
-    assert body["metadata_format"] == "json"
-    assert body["metadata_cid"] is not None
+    assert body.get("metadata_schema") == "dublin_core"
+    assert body.get("level1_cid") is None
+    assert body.get("level2_cid") is None
+
+    test_db.refresh(db_ark)
+    db_meta = test_db.query(ARKMetadata).filter_by(ark_record_id=db_ark.id).first()
+    assert db_meta.level1_json["title"] == "New title"
+    assert db_meta.original_content == "<new>raw</new>"
+    assert db_meta.level1_cid is None
+    assert db_meta.original_cid is None
 
 
 def test_update_ark_published_transitions_to_update(client, test_db, mock_orchestrator):
@@ -209,29 +250,35 @@ def test_update_ark_published_transitions_to_update(client, test_db, mock_orches
         name=name,
         authority_id="test-uuid",
         target="https://published.example/original",
-        metadata_cid="cid-original",
-        metadata_format="json",
     )
     test_db.commit()
 
     response = client.put(
         f"/api/v1/arks/ark:12345/{name}",
-        json={
-            "authority_id": "test-uuid",
-            "target": "https://published.example/new",
-            "metadata": json.dumps({"title": "Updated Title"}),
-            "metadata_format": "json",
-        },
+        json=_build_update_payload(
+            target="https://published.example/new",
+            title="Updated Title",
+            year=2025,
+            original_metadata="<updated>raw</updated>",
+        ),
     )
 
     assert response.status_code == 200
     data = response.json()
     assert data["state"] == ARKState.UPDATE
     assert data["target"] == "https://published.example/new"
-    assert data["metadata_cid"] is not None
+    assert data.get("metadata_cid") is None
+    assert data["metadata_schema"] == "dublin_core"
+    assert data.get("level1_cid") is None
+    assert data.get("level2_cid") is None
 
     test_db.refresh(db_ark)
     assert db_ark.state == ARKState.UPDATE
+    db_meta = test_db.query(ARKMetadata).filter_by(ark_record_id=db_ark.id).first()
+    assert db_meta is not None
+    assert db_meta.level1_json["title"] == "Updated Title"
+    assert db_meta.level1_cid is None
+    assert db_meta.original_cid is None
 
 
 def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock_orchestrator):
@@ -250,12 +297,12 @@ def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock
 
     response = client.put(
         f"/api/v1/arks/ark:12345/{imported_name}",
-        json={
-            "authority_id": "test-uuid",
-            "target": "https://chain.example/new",
-            "metadata": json.dumps({"title": "Imported then updated"}),
-            "metadata_format": "json",
-        },
+        json=_build_update_payload(
+            target="https://chain.example/new",
+            title="Imported then updated",
+            year=2022,
+            original_metadata="<imported>raw</imported>",
+        ),
     )
 
     assert response.status_code == 200
@@ -263,12 +310,16 @@ def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock
     assert data["ark"] == f"ark:12345/{imported_name}"
     assert data["state"] == ARKState.UPDATE
     assert data["target"] == "https://chain.example/new"
-    assert data["metadata_cid"] is not None
+    assert data["metadata_cid"] == "cid-chain"
+    assert data["metadata_schema"] == "dublin_core"
 
     db_ark = test_db.query(ARKRecord).filter_by(naan="12345", name=imported_name).first()
     assert db_ark is not None
     assert db_ark.state == ARKState.UPDATE
     assert db_ark.authority_id == "test-uuid"
+    db_meta = test_db.query(ARKMetadata).filter_by(ark_record_id=db_ark.id).first()
+    assert db_meta is not None
+    assert db_meta.level1_json["title"] == "Imported then updated"
 
 
 def test_update_to_published_requires_draft_state(test_db):
@@ -285,7 +336,7 @@ def test_update_to_published_requires_draft_state(test_db):
     test_db.commit()
 
     with pytest.raises(ValueError, match=r"one of \[D, U\]"):
-        repo.update_to_published(f"ark:12345/{name}", "cid-test")
+        repo.update_to_published(f"ark:12345/{name}")
 
 
 def test_tombstone_transition_is_idempotent(test_db):
@@ -391,7 +442,7 @@ def test_get_ark_from_db(client, test_db, mock_orchestrator):
     """Test getting ARK that only exists in DB (RESERVED/DRAFT)."""
     mock_orchestrator.is_authorized_for_naan.return_value = True
     
-    # Create ARK in DB
+    # Create ARK in DB with level1 alternate identifiers
     from app.repositories import ARKRepository
     ark_repo = ARKRepository(test_db)
     name = _expected_name("12345", 77)
@@ -399,7 +450,20 @@ def test_get_ark_from_db(client, test_db, mock_orchestrator):
         naan="12345",
         name=name,
         authority_id="test-uuid",
-        alternate_identifiers=[{"schema": "doi", "value": "10.1234/test"}],
+    )
+    test_db.flush()
+    db_ark.state = ARKState.DRAFT
+    ark_repo.create_or_update_metadata(
+        ark_record_id=db_ark.id,
+        level1_json={
+            "title": "Resource with DOI",
+            "authors": ["Test Author"],
+            "year": 2024,
+            "alternate_identifiers": [{"schema": "doi", "value": "10.1234/test"}],
+            "original_metadata": {"schema": "dublin_core", "cid": None},
+        },
+        original_content="<raw>metadata</raw>",
+        original_schema="dublin_core",
     )
     test_db.commit()
     
@@ -409,7 +473,7 @@ def test_get_ark_from_db(client, test_db, mock_orchestrator):
     assert response.status_code == 200
     data = response.json()
     assert data["ark"] == f"ark:12345/{name}"
-    assert data["state"] == ARKState.RESERVED
+    assert data["state"] == ARKState.DRAFT
     assert data["alternate_identifiers"][0]["schema"] == "doi"
 
 

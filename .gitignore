@@ -13,3 +13,4 @@ htmlcov/
 .DS_Store
 metadata_storage/*
 minter.db
+.local-stack/*

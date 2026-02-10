@@ -2,6 +2,10 @@
 
 This folder contains a complete end-to-end notebook plus feature-focused notebooks.
 
+Contract note:
+- `alternate_identifiers` / `alternate_urls` are part of `level1_metadata` in `PUT /api/v1/arks/{ark}`.
+- Reserve endpoints (`POST /arks`, `POST /arks/batch`) no longer send/persist alternate identifiers separately.
+
 ## Notebook Index
 
 - `minter_api_test.ipynb`
@@ -14,19 +18,19 @@ This folder contains a complete end-to-end notebook plus feature-focused noteboo
   - Single reserve/get lifecycle, malformed ARK checks, unauthorized reserve checks, checkdigit mutation behavior.
 
 - `minter_03_update_metadata_formats.ipynb`
-  - `RESERVED -> DRAFT`, `DRAFT -> DRAFT` overwrite, validation errors, JSON and XML metadata paths.
+  - `RESERVED -> DRAFT`, `DRAFT -> DRAFT` overwrite, validation errors, and two-level metadata payloads (`level1_metadata` + `original_metadata`).
 
 - `minter_04_tombstone_missing.ipynb`
-  - Tombstone lifecycle (`DRAFT -> TOMBSTONE`), delete idempotency, blocked updates on tombstoned ARKs, missing-record update/delete behavior.
+  - Tombstone lifecycle (`DRAFT -> TOMBSTONE`), delete idempotency, blocked updates on tombstoned ARKs, missing-record update/delete behavior with two-level payloads.
 
 - `minter_05_batch_concurrency.ipynb`
   - Batch reserve success/failure paths and parallel reserve uniqueness checks.
 
 - `minter_06_worker_publish_update.ipynb`
-  - Worker-driven transitions (`DRAFT -> PUBLISHED`, `PUBLISHED -> UPDATE -> PUBLISHED`).
+  - Worker-driven transitions (`DRAFT -> PUBLISHED`, `PUBLISHED -> UPDATE -> PUBLISHED`) including L2->L1 CID chaining.
 
 - `minter_07_chain_import_optional.ipynb`
-  - Optional local import path for pre-existing on-chain ARKs (`EXISTING_CHAIN_ARK`).
+  - Optional local import path for pre-existing on-chain ARKs (`EXISTING_CHAIN_ARK`) followed by UPDATE with two-level metadata.
 
 ## Shared Environment Variables
 

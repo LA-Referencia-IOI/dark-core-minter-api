@@ -8,7 +8,7 @@ Active implementation with separated runtime architecture:
 - Publisher worker process (`app.main_worker`)
 - Full local ARK lifecycle persistence in `ark_records`
 - Deterministic sequential minting per namespace in `noid_counters`
-- Pluggable metadata persistence (`filesystem` or `store_api` via `dark-store-api`)
+- Two-level metadata pipeline (L1 validated JSON + L2 original content) with pluggable worker storage backend (`filesystem` or `store_api`)
 
 ## 1. Process Architecture
 
@@ -50,8 +50,7 @@ Relevant fields:
 - `naan`, `name`
 - `state` (`R`, `D`, `U`, `P`, `T`)
 - `authority_id`
-- `target`, `metadata_cid`, `metadata_format`
-- `alternate_identifiers`
+- `target`, `metadata_cid` (final L1 CID)
 - `created_at`, `updated_at`, `tombstoned_at`
 - `client_item_id`
 - publish tracking:
@@ -59,6 +58,17 @@ Relevant fields:
   - `publish_last_error`
   - `publish_last_attempt_at`
   - `publish_permanently_failed`
+
+### Metadata table: `ark_metadata`
+
+Relevant fields:
+
+- `ark_record_id` (1:1 FK to `ark_records`)
+- `level1_json` (validated Level-1 JSON payload)
+- `level1_cid` (assigned by worker after storage)
+- `original_content` (raw Level-2 content)
+- `original_schema` (client-provided schema label, e.g. `dublin_core`, `oai_dc`)
+- `original_cid` (assigned by worker after storage)
 
 ### Modeling decisions
 
@@ -181,14 +191,21 @@ Behavior details for `PUT /api/v1/arks/{ark}`:
   - `NOT_RUNNING` (exit code 1)
 - Periodic heartbeat persisted in DB with status and counters
 
-## 7. Metadata Storage and Formats
+## 7. Metadata Storage (Two-Level)
 
-- `metadata` is received as raw string
-- `metadata_format` supports `json` and `xml`
-- DB stores `metadata_cid` + `metadata_format` regardless of backend
-- `filesystem` backend stores local files using MD5-based CIDs
-- `store_api` backend stores/retrieves metadata through `dark-store-api` (`/v1/store`, `/v1/retrieve/{cid}`)
-- If metadata storage fails, `PUT /api/v1/arks/{ark}` is rejected and ARK state is not transitioned
+- API receives:
+  - `level1_metadata` (minimal extracted metadata JSON),
+  - `original_metadata` (raw record),
+  - `metadata_schema` (schema label for L2).
+- `alternate_identifiers` / `alternate_urls` are part of `level1_metadata` and are persisted only in `ark_metadata.level1_json`.
+- API validates L1 against `Level1Metadata` and stores both levels in `ark_metadata`.
+- Worker performs storage/publish pipeline:
+  1. Store L2 (`original_content`) -> `original_cid`.
+  2. Inject `original_cid` into L1 JSON (`original_metadata.cid`).
+  3. Store L1 JSON -> `level1_cid`.
+  4. Persist both CIDs and publish on-chain using `level1_cid`.
+- `ark_records.metadata_cid` tracks the final L1 CID used on-chain.
+- `filesystem` and `store_api` backends are used by worker during the publish phase.
 
 ## 8. Relevant Configuration
 
@@ -249,7 +266,7 @@ Main suites:
 - `tests/test_auth_cache.py`
 - `tests/test_middleware.py`
 
-Recent full regression result: `99 passed`.
+Recent full regression result: `107 passed`.
 
 ## 11. Migrations
 
@@ -280,4 +297,4 @@ Recent full regression result: `99 passed`.
 
 ---
 
-**Overall status:** Operational implementation with full API/worker separation and robust PostgreSQL concurrency controls (row locks + CAS + advisory lock).
+**Overall status:** Operational implementation with full API/worker separation, two-level metadata pipeline, and robust PostgreSQL concurrency controls (row locks + CAS + advisory lock).

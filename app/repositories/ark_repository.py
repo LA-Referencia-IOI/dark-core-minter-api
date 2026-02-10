@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from app.database.models import ARKRecord
+from app.database.models import ARKRecord, ARKMetadata
 from app.models.states import ARKState
 
 
@@ -71,7 +71,6 @@ class ARKRepository:
         naan: str,
         name: str,
         authority_id: str,
-        alternate_identifiers: Optional[list] = None,
         client_item_id: Optional[str] = None,
     ) -> ARKRecord:
         """
@@ -81,7 +80,6 @@ class ARKRepository:
             naan: Name Assigning Authority Number
             name: ARK name/suffix
             authority_id: Authority UUID that owns this ARK
-            alternate_identifiers: Optional list of alternate identifiers
             client_item_id: Optional client tracking ID
         
         Returns:
@@ -90,24 +88,11 @@ class ARKRepository:
         Note:
             Does NOT commit. Caller must commit the transaction.
         """
-        # Serialize alternate identifiers if they are Pydantic models
-        if alternate_identifiers:
-            serialized_ids = []
-            for item in alternate_identifiers:
-                if hasattr(item, "model_dump"):
-                    serialized_ids.append(item.model_dump())
-                elif hasattr(item, "dict"):
-                    serialized_ids.append(item.dict())
-                else:
-                    serialized_ids.append(item)
-            alternate_identifiers = serialized_ids
-
         db_ark = ARKRecord(
             naan=naan,
             name=name,
             state=ARKState.RESERVED.value,
             authority_id=authority_id,
-            alternate_identifiers=alternate_identifiers,
             client_item_id=client_item_id,
         )
         self.db.add(db_ark)
@@ -119,37 +104,27 @@ class ARKRepository:
         name: str,
         authority_id: str,
         target: Optional[str] = None,
-        metadata_cid: Optional[str] = None,
-        metadata_format: Optional[str] = None,
-        alternate_identifiers: Optional[list] = None,
     ) -> ARKRecord:
         """
         Create a local record for an ARK that already exists on-chain.
 
         Initial local state is PUBLISHED.
         """
-        if alternate_identifiers:
-            serialized_ids = []
-            for item in alternate_identifiers:
-                if hasattr(item, "model_dump"):
-                    serialized_ids.append(item.model_dump())
-                elif hasattr(item, "dict"):
-                    serialized_ids.append(item.dict())
-                else:
-                    serialized_ids.append(item)
-            alternate_identifiers = serialized_ids
-
         db_ark = ARKRecord(
             naan=naan,
             name=name,
             state=ARKState.PUBLISHED.value,
             authority_id=authority_id,
             target=target,
-            metadata_cid=metadata_cid,
-            metadata_format=metadata_format,
-            alternate_identifiers=alternate_identifiers,
         )
         self.db.add(db_ark)
+        self.db.flush()  # We need the ID for metadata creation
+
+        # If metadata is provided, create the ARKMetadata record
+        # Note: In import scenarios, we might only have CIDs or partial data
+        # For now, we only create ARKMetadata if we have content, which isn't passed here yet.
+        # Future TODO: Allow importing full metadata content.
+        
         return db_ark
     
     def get_by_ark(self, ark: str) -> Optional[ARKRecord]:
@@ -210,19 +185,13 @@ class ARKRepository:
         self,
         ark: str,
         target: str,
-        metadata_cid: str,
-        metadata_format: str,
-        alternate_identifiers: Optional[list] = None,
     ) -> ARKRecord:
         """
-        Update ARK to DRAFT state with stored metadata CID.
+        Update ARK to DRAFT state.
         
         Args:
             ark: Full ARK identifier
             target: Target URL
-            metadata_cid: CID of stored metadata content
-            metadata_format: Format of metadata ("json", "xml", etc.)
-            alternate_identifiers: Optional alternate identifiers
         
         Returns:
             Updated ARKRecord
@@ -232,7 +201,7 @@ class ARKRepository:
         
         Note:
             Does NOT commit. Caller must commit the transaction.
-            Metadata content is stored externally via MetadataStorage before calling this.
+            Metadata content should be stored in ARKMetadata separately.
         """
         try:
             naan, name = parse_ark(ark)
@@ -242,23 +211,7 @@ class ARKRepository:
         # Validate required fields
         if not target:
             raise ValueError("Target URL is required")
-        if not metadata_cid:
-            raise ValueError("Metadata CID is required")
-        if not metadata_format:
-            raise ValueError("Metadata format is required")
         
-        # Serialize alternate identifiers if they are Pydantic models
-        if alternate_identifiers:
-            serialized_ids = []
-            for item in alternate_identifiers:
-                if hasattr(item, "model_dump"):
-                    serialized_ids.append(item.model_dump())
-                elif hasattr(item, "dict"):
-                    serialized_ids.append(item.dict())
-                else:
-                    serialized_ids.append(item)
-            alternate_identifiers = serialized_ids
-
         now = _utc_now()
         result = self.db.execute(
             update(ARKRecord)
@@ -270,9 +223,6 @@ class ARKRepository:
             .values(
                 state=ARKState.DRAFT.value,
                 target=target,
-                metadata_cid=metadata_cid,
-                metadata_format=metadata_format,
-                alternate_identifiers=alternate_identifiers,
                 updated_at=now,
             )
         )
@@ -288,13 +238,59 @@ class ARKRepository:
             raise ValueError(f"ARK not found: {ark}")
         return db_ark
 
+    def create_or_update_metadata(
+        self,
+        ark_record_id: int,
+        level1_json: dict,
+        original_content: str,
+        original_schema: str,
+    ) -> ARKMetadata:
+        """
+        Create or update the two-level metadata record for an ARK.
+        """
+        metadata = self.db.query(ARKMetadata).filter_by(ark_record_id=ark_record_id).first()
+        
+        if metadata:
+            metadata.level1_json = level1_json
+            metadata.original_content = original_content
+            metadata.original_schema = original_schema
+            # CIDs are reset on update because content changed (worker will re-publish)
+            metadata.level1_cid = None
+            metadata.original_cid = None
+            metadata.updated_at = _utc_now()
+        else:
+            metadata = ARKMetadata(
+                ark_record_id=ark_record_id,
+                level1_json=level1_json,
+                original_content=original_content,
+                original_schema=original_schema,
+            )
+            self.db.add(metadata)
+        
+        return metadata
+
+    def get_metadata_by_ark_id(self, ark_record_id: int) -> Optional[ARKMetadata]:
+        return self.db.query(ARKMetadata).filter_by(ark_record_id=ark_record_id).first()
+
+    def update_metadata_cids(
+        self,
+        ark_record_id: int,
+        level1_cid: str,
+        level2_cid: str,
+    ) -> None:
+        """Update CIDs after worker processing."""
+        metadata = self.get_metadata_by_ark_id(ark_record_id)
+        if not metadata:
+            raise ValueError(f"Metadata not found for ARK ID {ark_record_id}")
+        
+        metadata.level1_cid = level1_cid
+        metadata.original_cid = level2_cid
+        metadata.updated_at = _utc_now()
+
     def update_draft_content(
         self,
         ark: str,
         target: str,
-        metadata_cid: str,
-        metadata_format: str,
-        alternate_identifiers: Optional[list] = None,
     ) -> ARKRecord:
         """
         Update an ARK already in DRAFT without changing state.
@@ -306,21 +302,6 @@ class ARKRepository:
 
         if not target:
             raise ValueError("Target URL is required")
-        if not metadata_cid:
-            raise ValueError("Metadata CID is required")
-        if not metadata_format:
-            raise ValueError("Metadata format is required")
-
-        if alternate_identifiers:
-            serialized_ids = []
-            for item in alternate_identifiers:
-                if hasattr(item, "model_dump"):
-                    serialized_ids.append(item.model_dump())
-                elif hasattr(item, "dict"):
-                    serialized_ids.append(item.dict())
-                else:
-                    serialized_ids.append(item)
-            alternate_identifiers = serialized_ids
 
         now = _utc_now()
         result = self.db.execute(
@@ -332,9 +313,6 @@ class ARKRepository:
             )
             .values(
                 target=target,
-                metadata_cid=metadata_cid,
-                metadata_format=metadata_format,
-                alternate_identifiers=alternate_identifiers,
                 updated_at=now,
             )
         )
@@ -354,9 +332,6 @@ class ARKRepository:
         self,
         ark: str,
         target: str,
-        metadata_cid: str,
-        metadata_format: str,
-        alternate_identifiers: Optional[list] = None,
     ) -> ARKRecord:
         """
         Transition ARK to UPDATE state with pending metadata changes.
@@ -370,21 +345,6 @@ class ARKRepository:
 
         if not target:
             raise ValueError("Target URL is required")
-        if not metadata_cid:
-            raise ValueError("Metadata CID is required")
-        if not metadata_format:
-            raise ValueError("Metadata format is required")
-
-        if alternate_identifiers:
-            serialized_ids = []
-            for item in alternate_identifiers:
-                if hasattr(item, "model_dump"):
-                    serialized_ids.append(item.model_dump())
-                elif hasattr(item, "dict"):
-                    serialized_ids.append(item.dict())
-                else:
-                    serialized_ids.append(item)
-            alternate_identifiers = serialized_ids
 
         now = _utc_now()
         result = self.db.execute(
@@ -397,9 +357,6 @@ class ARKRepository:
             .values(
                 state=ARKState.UPDATE.value,
                 target=target,
-                metadata_cid=metadata_cid,
-                metadata_format=metadata_format,
-                alternate_identifiers=alternate_identifiers,
                 updated_at=now,
             )
         )
@@ -474,7 +431,6 @@ class ARKRepository:
     def update_to_published(
         self,
         ark: str,
-        metadata_cid: str,
         expected_states: Optional[Tuple[str, ...]] = None,
     ) -> ARKRecord:
         """
@@ -482,7 +438,6 @@ class ARKRepository:
         
         Args:
             ark: Full ARK identifier
-            metadata_cid: IPFS CID of metadata
         
         Returns:
             Updated ARKRecord
@@ -511,7 +466,6 @@ class ARKRepository:
             )
             .values(
                 state=ARKState.PUBLISHED.value,
-                metadata_cid=metadata_cid,
                 updated_at=now,
             )
         )

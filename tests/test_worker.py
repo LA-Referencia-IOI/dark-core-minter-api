@@ -1,97 +1,91 @@
 """
-Tests for ARK publisher worker.
+Integration-style tests for ARK publisher worker with a real test DB session.
 """
 
 import json
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, Mock, PropertyMock, patch
-
-import pytest
+from unittest.mock import Mock, patch
 
 from dark_orchestrator.exceptions import AuthorityError
 
-from app.workers.publisher import ARKPublisher
-from app.database.models import ARKRecord
+from app.database.models import ARKMetadata, ARKRecord
 from app.models.states import ARKState
 from app.storage.exceptions import StorageError
+from app.workers.publisher import ARKPublisher
 
 
 class MockMetadataStorage:
-    """Mock metadata storage for testing."""
-    
-    def __init__(self, should_fail=False):
+    """Mock metadata storage backend for worker tests."""
+
+    def __init__(self, should_fail: bool = False):
         self.should_fail = should_fail
         self.stored = {}
-    
+
     def store_metadata(self, content, format):
         if self.should_fail:
             raise StorageError("Mock storage error")
         cid = f"mock_cid_{len(self.stored)}"
         self.stored[cid] = (content, format)
         return cid
-    
+
     def get_metadata(self, cid):
         return self.stored.get(cid, (None, None))
-    
+
     def health_check(self):
         return not self.should_fail
 
 
-class MockARKRepository:
-    """Mock ARK repository for unit testing."""
-    
-    def __init__(self):
-        self.arks = {}
-        self.call_count = 0
-    
-    def get_drafts_pending_publish(self, limit, max_retries, backoff_base):
-        """Return DRAFT ARKs that should be published."""
-        return list(self.arks.values())[:limit]
-    
-    def get_by_ark(self, ark):
-        """Get ARK by identifier."""
-        return self.arks.get(ark)
-    
-    def mark_publish_succeeded(self, ark, metadata_cid):
-        """Mark ARK as published."""
-        if ark in self.arks:
-            self.arks[ark]['state'] = ARKState.PUBLISHED
-            self.arks[ark]['metadata_cid'] = metadata_cid
-    
-    def mark_publish_failed(self, ark, error_message, is_permanent=False):
-        """Mark ARK publication as failed."""
-        if ark in self.arks:
-            self.arks[ark]['publish_retry_count'] = self.arks[ark].get('publish_retry_count', 0) + 1
-            self.arks[ark]['publish_last_error'] = error_message
-            self.arks[ark]['publish_permanently_failed'] = 1 if is_permanent else 0
+def _level1_payload(title: str = "Test Title", year: int = 2024, schema: str = "dublin_core") -> dict:
+    return {
+        "title": title,
+        "authors": ["Test Author"],
+        "year": year,
+        "original_metadata": {"schema": schema, "cid": None},
+    }
+
+
+def _create_ark_with_metadata(
+    db_session,
+    *,
+    name: str,
+    state: ARKState = ARKState.DRAFT,
+    target: str = "https://example.com",
+    publish_retry_count: int = 0,
+    publish_last_attempt_at=None,
+):
+    ark_record = ARKRecord(
+        naan="12345",
+        name=name,
+        state=state,
+        authority_id="auth-uuid-123",
+        target=target,
+        publish_retry_count=publish_retry_count,
+        publish_last_attempt_at=publish_last_attempt_at,
+    )
+    db_session.add(ark_record)
+    db_session.flush()
+
+    metadata_record = ARKMetadata(
+        ark_record_id=ark_record.id,
+        level1_json=_level1_payload(title=f"Title {name}"),
+        original_content=f"<raw>{name}</raw>",
+        original_schema="dublin_core",
+    )
+    db_session.add(metadata_record)
+    db_session.commit()
+    return ark_record, metadata_record
 
 
 class TestARKPublisher:
-    """Test suite for ARK publisher worker."""
-    
+    """Test suite for ARKPublisher."""
+
     def test_publish_single_ark_success(self, db_session):
-        """Test successful ARK publication."""
-        # Create a DRAFT ARK (metadata already stored)
-        ark_record = ARKRecord(
-            naan="12345",
-            name="test",
-            state=ARKState.DRAFT,
-            authority_id="auth-uuid-123",
-            target="https://example.com",
-            metadata_cid="pre_stored_cid",  # Already stored by API
-            metadata_format="json",
-        )
-        db_session.add(ark_record)
-        db_session.commit()
-        
-        # Mock orchestrator
+        ark_record, metadata_record = _create_ark_with_metadata(db_session, name="test")
+
         mock_orchestrator = Mock()
         mock_orchestrator.create_ark = Mock()
-        
-        # Mock storage (not used for DRAFT since metadata_cid exists)
         mock_storage = MockMetadataStorage()
-        
-        # Create publisher
+
         publisher = ARKPublisher(
             orchestrator=mock_orchestrator,
             metadata_storage=mock_storage,
@@ -99,304 +93,202 @@ class TestARKPublisher:
             max_retries=5,
             backoff_base=2.0,
         )
-        
-        # Mock SessionLocal to return our test session
-        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
-            
-            # Publish
             success = publisher.publish_single_ark("ark:12345/test")
-        
-        # Verify success
+
         assert success is True
-        
-        # Verify orchestrator was called
+        db_session.refresh(ark_record)
+        db_session.refresh(metadata_record)
+
+        assert ark_record.state == ARKState.PUBLISHED
+        assert metadata_record.level1_cid is not None
+        assert metadata_record.original_cid is not None
+
         mock_orchestrator.create_ark.assert_called_once_with(
             uuid="auth-uuid-123",
             naan="12345",
             name="test",
             url="https://example.com",
-            cid="pre_stored_cid",
+            cid=metadata_record.level1_cid,
         )
-        
-        # Verify ARK state updated to PUBLISHED
-        db_session.refresh(ark_record)
-        assert ark_record.state == ARKState.PUBLISHED
-        assert ark_record.metadata_cid == "pre_stored_cid"
+
+        stored_l1_content, stored_l1_format = mock_storage.get_metadata(metadata_record.level1_cid)
+        parsed_l1 = json.loads(stored_l1_content)
+        assert stored_l1_format == "json"
+        assert parsed_l1["original_metadata"]["cid"] == metadata_record.original_cid
         assert publisher.stats["total_succeeded"] == 1
 
     def test_publish_single_ark_update_success(self, db_session):
-        """Test successful on-chain update when local state is UPDATE."""
-        ark_record = ARKRecord(
-            naan="12345",
+        ark_record, metadata_record = _create_ark_with_metadata(
+            db_session,
             name="test-update",
             state=ARKState.UPDATE,
-            authority_id="auth-uuid-123",
             target="https://example.com/updated",
-            metadata_cid="updated_cid",
-            metadata_format="json",
         )
-        db_session.add(ark_record)
-        db_session.commit()
 
         mock_orchestrator = Mock()
         mock_orchestrator.update_ark = Mock()
         mock_orchestrator.create_ark = Mock()
-
-        mock_storage = MockMetadataStorage()
         publisher = ARKPublisher(
             orchestrator=mock_orchestrator,
-            metadata_storage=mock_storage,
+            metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
 
-        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
             success = publisher.publish_single_ark("ark:12345/test-update")
 
         assert success is True
+        db_session.refresh(ark_record)
+        db_session.refresh(metadata_record)
+
+        assert ark_record.state == ARKState.PUBLISHED
         mock_orchestrator.update_ark.assert_called_once_with(
             uuid="auth-uuid-123",
             naan="12345",
             name="test-update",
             url="https://example.com/updated",
-            cid="updated_cid",
+            cid=metadata_record.level1_cid,
         )
         mock_orchestrator.create_ark.assert_not_called()
 
-        db_session.refresh(ark_record)
-        assert ark_record.state == ARKState.PUBLISHED
-    
-    def test_publish_single_ark_no_metadata_cid(self, db_session):
-        """Test ARK publication fails gracefully when metadata_cid is missing."""
-        # Create a DRAFT ARK without metadata_cid (shouldn't happen in normal flow)
+    def test_publish_single_ark_missing_metadata_record(self, db_session):
         ark_record = ARKRecord(
             naan="12345",
-            name="test",
+            name="test-no-meta",
             state=ARKState.DRAFT,
             authority_id="auth-uuid-123",
             target="https://example.com",
-            metadata_cid=None,  # Missing
-            metadata_format="json",
         )
         db_session.add(ark_record)
         db_session.commit()
-        
-        # Mock orchestrator
-        mock_orchestrator = Mock()
-        
-        # Mock storage
-        mock_storage = MockMetadataStorage()
-        
-        # Create publisher
+
         publisher = ARKPublisher(
-            orchestrator=mock_orchestrator,
-            metadata_storage=mock_storage,
+            orchestrator=Mock(),
+            metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
-        
-        # Mock SessionLocal
-        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
-            
-            # Publish
-            success = publisher.publish_single_ark("ark:12345/test")
-        
-        # Verify failure
+            success = publisher.publish_single_ark("ark:12345/test-no-meta")
+
         assert success is False
-        
-        # Verify ARK still in DRAFT state
-        db_session.refresh(ark_record)
-        assert ark_record.state == ARKState.DRAFT
-    
-    def test_publish_single_ark_authority_error(self, db_session):
-        """Test ARK publication with authority error (permanent failure)."""
-        # Create a DRAFT ARK
-        ark_record = ARKRecord(
-            naan="12345",
-            name="test",
-            state=ARKState.DRAFT,
-            authority_id="auth-uuid-123",
-            target="https://example.com",
-            metadata_cid="pre_stored_cid",
-            metadata_format="json",
-        )
-        db_session.add(ark_record)
-        db_session.commit()
-        
-        # Mock orchestrator that raises AuthorityError
-        mock_orchestrator = Mock()
-        mock_orchestrator.create_ark = Mock(side_effect=AuthorityError("Unauthorized"))
-        
-        # Mock storage
-        mock_storage = MockMetadataStorage()
-        
-        # Create publisher
-        publisher = ARKPublisher(
-            orchestrator=mock_orchestrator,
-            metadata_storage=mock_storage,
-            batch_size=10,
-            max_retries=5,
-            backoff_base=2.0,
-        )
-        
-        # Mock SessionLocal
-        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
-            mock_session_local.return_value = db_session
-            
-            # Publish
-            success = publisher.publish_single_ark("ark:12345/test")
-        
-        # Verify failure
-        assert success is False
-        
-        # Verify ARK marked as permanently failed
         db_session.refresh(ark_record)
         assert ark_record.state == ARKState.DRAFT
         assert ark_record.publish_retry_count == 1
-        assert "Authority error (permanent)" in ark_record.publish_last_error
+        assert "No metadata record found in DB" in ark_record.publish_last_error
         assert ark_record.publish_permanently_failed == 1
-        assert publisher.stats["total_permanent_failures"] == 1
-    
-    def test_publish_single_ark_max_retries_exceeded(self, db_session):
-        """Test ARK publication with max retries exceeded."""
-        # Create a DRAFT ARK with retries near max
-        ark_record = ARKRecord(
-            naan="12345",
-            name="test",
-            state=ARKState.DRAFT,
-            authority_id="auth-uuid-123",
-            target="https://example.com",
-            metadata_cid="pre_stored_cid",
-            metadata_format="json",
-            publish_retry_count=4,  # One before max
-        )
-        db_session.add(ark_record)
-        db_session.commit()
-        
-        # Mock orchestrator that raises generic error
+
+    def test_publish_single_ark_authority_error(self, db_session):
+        ark_record, _ = _create_ark_with_metadata(db_session, name="test-auth-error")
+
         mock_orchestrator = Mock()
-        mock_orchestrator.create_ark = Mock(side_effect=Exception("Network error"))
-        
-        # Mock storage
-        mock_storage = MockMetadataStorage()
-        
-        # Create publisher with max_retries=5
+        mock_orchestrator.create_ark = Mock(side_effect=AuthorityError("Unauthorized"))
+
         publisher = ARKPublisher(
             orchestrator=mock_orchestrator,
-            metadata_storage=mock_storage,
+            metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
-        
-        # Mock SessionLocal
-        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
-            
-            # Publish
-            success = publisher.publish_single_ark("ark:12345/test")
-        
-        # Verify failure
+            success = publisher.publish_single_ark("ark:12345/test-auth-error")
+
         assert success is False
-        
-        # Verify ARK marked as permanently failed after reaching max retries
         db_session.refresh(ark_record)
-        assert ark_record.state == ARKState.DRAFT
+        assert ark_record.publish_retry_count == 1
+        assert ark_record.publish_permanently_failed == 1
+        assert "Authority error (permanent)" in ark_record.publish_last_error
+        assert publisher.stats["total_permanent_failures"] == 1
+
+    def test_publish_single_ark_max_retries_exceeded(self, db_session):
+        ark_record, _ = _create_ark_with_metadata(
+            db_session,
+            name="test-max-retries",
+            publish_retry_count=4,
+        )
+
+        mock_orchestrator = Mock()
+        mock_orchestrator.create_ark = Mock(side_effect=Exception("Network error"))
+
+        publisher = ARKPublisher(
+            orchestrator=mock_orchestrator,
+            metadata_storage=MockMetadataStorage(),
+            batch_size=10,
+            max_retries=5,
+            backoff_base=2.0,
+        )
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            success = publisher.publish_single_ark("ark:12345/test-max-retries")
+
+        assert success is False
+        db_session.refresh(ark_record)
         assert ark_record.publish_retry_count == 5
         assert ark_record.publish_permanently_failed == 1
         assert publisher.stats["total_permanent_failures"] == 1
-    
+
     def test_run_publish_cycle_processes_batch(self, db_session):
-        """Test publish cycle processes multiple ARKs."""
-        # Create multiple DRAFT ARKs
+        ark_records = []
         for i in range(3):
-            ark_record = ARKRecord(
-                naan="12345",
-                name=f"test{i}",
-                state=ARKState.DRAFT,
-                authority_id="auth-uuid-123",
-                target=f"https://example.com/{i}",
-                metadata_cid=f"cid_{i}",
-                metadata_format="json",
-            )
-            db_session.add(ark_record)
-        db_session.commit()
-        
-        # Mock orchestrator
+            ark_record, _ = _create_ark_with_metadata(db_session, name=f"cycle-{i}")
+            ark_records.append(ark_record)
+
         mock_orchestrator = Mock()
         mock_orchestrator.create_ark = Mock()
-        
-        # Mock storage
-        mock_storage = MockMetadataStorage()
-        
-        # Create publisher
         publisher = ARKPublisher(
             orchestrator=mock_orchestrator,
-            metadata_storage=mock_storage,
+            metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
-        
-        # Mock SessionLocal
-        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
-            
-            # Run cycle
             publisher.run_publish_cycle()
-        
-        # Verify all ARKs processed
+
         assert publisher.stats["total_processed"] == 3
         assert publisher.stats["total_succeeded"] == 3
-        assert publisher.stats["last_run_at"] is not None
-        assert publisher.stats["last_run_duration"] is not None
-    
+        for ark_record in ark_records:
+            db_session.refresh(ark_record)
+            assert ark_record.state == ARKState.PUBLISHED
+
     def test_run_publish_cycle_respects_backoff(self, db_session):
-        """Test publish cycle respects exponential backoff."""
-        # Create ARK with recent failure
         recent_failure = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30)
-        ark_record = ARKRecord(
-            naan="12345",
-            name="test",
-            state=ARKState.DRAFT,
-            authority_id="auth-uuid-123",
-            target="https://example.com",
-            metadata_cid="pre_stored_cid",
-            metadata_format="json",
+        _create_ark_with_metadata(
+            db_session,
+            name="backoff",
             publish_retry_count=2,
             publish_last_attempt_at=recent_failure,
         )
-        db_session.add(ark_record)
-        db_session.commit()
-        
-        # Mock orchestrator
+
         mock_orchestrator = Mock()
-        
-        # Mock storage
-        mock_storage = MockMetadataStorage()
-        
-        # Create publisher with backoff_base=2.0
-        # With retry_count=2, backoff should be 2^2 * 60 = 240 seconds
-        # Since only 30 seconds have passed, it should not be processed
+        mock_orchestrator.create_ark = Mock()
+
         publisher = ARKPublisher(
             orchestrator=mock_orchestrator,
-            metadata_storage=mock_storage,
+            metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
-        
-        # Mock SessionLocal
-        with patch('app.workers.publisher.SessionLocal') as mock_session_local:
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
-            
-            # Run cycle
             publisher.run_publish_cycle()
-        
-        # Verify ARK was NOT processed (due to backoff)
+
         assert publisher.stats["total_processed"] == 0
+        mock_orchestrator.create_ark.assert_not_called()

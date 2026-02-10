@@ -24,9 +24,23 @@ class ARKResponse(BaseModel):
     ark: str = Field(..., description="Full ARK identifier")
     state: ARKState = Field(..., description="Current lifecycle state")
     target: Optional[str] = Field(None, description="Target URL")
-    metadata_cid: Optional[str] = Field(None, description="CID of metadata (if stored)")
-    metadata_format: Optional[str] = Field(None, description="Format of metadata (json, xml, etc.)")
-    alternate_identifiers: Optional[list] = Field(None, description="External identifiers")
+    metadata_cid: Optional[str] = Field(
+        None,
+        description="CID published on-chain for Level-1 metadata",
+    )
+    
+    # New fields for two-level metadata
+    metadata_schema: Optional[str] = Field(None, description="Original metadata schema")
+    level1_cid: Optional[str] = Field(None, description="CID of Level 1 metadata")
+    level2_cid: Optional[str] = Field(None, description="CID of Level 2 (original) metadata")
+    
+    # Deprecated fields
+    metadata_format: Optional[str] = Field(None, description="Deprecated. Use metadata_schema.", deprecated=True)
+
+    alternate_identifiers: Optional[list] = Field(
+        None,
+        description="External identifiers from level1_metadata.alternate_identifiers",
+    )
     client_item_id: Optional[str] = Field(None, description="Client correlation ID")
     
     # Timestamps could be added here if we track them in DB/Orchestrator

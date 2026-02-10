@@ -5,17 +5,15 @@ Implements the ARK lifecycle: reserved -> draft -> published -> tombstone.
 """
 
 import logging
-from typing import List
-from fastapi import APIRouter, Depends, HTTPException, Path, Body
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Path
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from dark_orchestrator import DARKOrchestrator
-from dark_orchestrator.exceptions import ARKError, AuthorityError
 
 from app.dependencies import get_orchestrator, get_db, get_metadata_storage
 from app.storage.base import MetadataStorage
-from app.storage.exceptions import StorageError
 from app.middleware.auth import require_mtls
 from app.utils.noid import mint_ark_id, validate_name_checkdigit
 from app.utils.auth_cache import check_authorization_cached
@@ -30,6 +28,7 @@ from app.models.responses import (
     ARKResponse,
     ARKBatchResponse,
 )
+from app.metadata.schemas import Level1Metadata
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -53,6 +52,14 @@ def _validate_ark_checkdigit_if_enabled(naan: str, name: str) -> None:
         validate_name_checkdigit(naan, name)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid ARK checkdigit: {exc}") from exc
+
+
+def _extract_alternate_identifiers(level1_json: Optional[dict]) -> Optional[list]:
+    """Return alternate identifiers from Level-1 metadata payload."""
+    if not isinstance(level1_json, dict):
+        return None
+    alternate_identifiers = level1_json.get("alternate_identifiers")
+    return alternate_identifiers or None
 
 
 @router.post(
@@ -112,7 +119,6 @@ async def reserve_ark(
                     naan=request.naan,
                     name=name,
                     authority_id=request.authority_id,
-                    alternate_identifiers=request.alternate_identifiers,
                     client_item_id=None,
                 )
                 db.flush()
@@ -126,8 +132,6 @@ async def reserve_ark(
                 ark=db_ark.ark,
                 state=db_ark.state,
                 target=db_ark.target,
-                metadata_cid=db_ark.metadata_cid,
-                alternate_identifiers=db_ark.alternate_identifiers,
             )
 
         except IntegrityError as e:
@@ -211,7 +215,6 @@ async def batch_reserve_ark(
                         naan=request.naan,
                         name=name,
                         authority_id=request.authority_id,
-                        alternate_identifiers=item.alternate_identifiers,
                         client_item_id=item.client_item_id,
                     )
                     db.flush()
@@ -221,8 +224,6 @@ async def batch_reserve_ark(
                         ark=db_ark.ark,
                         state=db_ark.state,
                         target=db_ark.target,
-                        metadata_cid=db_ark.metadata_cid,
-                        alternate_identifiers=db_ark.alternate_identifiers,
                         client_item_id=db_ark.client_item_id,
                     )
                 )
@@ -294,6 +295,13 @@ async def get_ark(
     db_ark = ark_repo.get_by_ark(ark)
     
     if db_ark:
+        db_metadata = ark_repo.get_metadata_by_ark_id(db_ark.id)
+        metadata_cid = db_metadata.level1_cid if db_metadata else None
+        metadata_schema = db_metadata.original_schema if db_metadata else None
+        alternate_identifiers = _extract_alternate_identifiers(
+            db_metadata.level1_json if db_metadata else None
+        )
+
         # Found in database
         if db_ark.state in [ARKState.RESERVED, ARKState.DRAFT]:
             # Return from DB directly (not yet on blockchain)
@@ -301,9 +309,10 @@ async def get_ark(
                 ark=db_ark.ark,
                 state=db_ark.state,
                 target=db_ark.target,
-                metadata_cid=db_ark.metadata_cid,
-                metadata_format=db_ark.metadata_format,
-                alternate_identifiers=db_ark.alternate_identifiers,
+                metadata_cid=metadata_cid,
+                metadata_schema=metadata_schema,
+                metadata_format=metadata_schema,
+                alternate_identifiers=alternate_identifiers,
             )
         elif db_ark.state == ARKState.PUBLISHED:
             # Combine DB metadata with blockchain data
@@ -314,8 +323,9 @@ async def get_ark(
                     state=ARKState.PUBLISHED,
                     target=info.url,  # From blockchain
                     metadata_cid=info.cid,  # From blockchain
-                    metadata_format=db_ark.metadata_format,  # From DB
-                    alternate_identifiers=db_ark.alternate_identifiers,  # From DB
+                    metadata_schema=metadata_schema,  # From DB
+                    metadata_format=metadata_schema,  # Deprecated, for compatibility
+                    alternate_identifiers=alternate_identifiers,  # From L1 metadata
                 )
             except Exception as e:
                 # Blockchain query failed, return DB data
@@ -324,9 +334,10 @@ async def get_ark(
                     ark=db_ark.ark,
                     state=db_ark.state,
                     target=db_ark.target,
-                    metadata_cid=db_ark.metadata_cid,
-                    metadata_format=db_ark.metadata_format,
-                    alternate_identifiers=db_ark.alternate_identifiers,
+                    metadata_cid=metadata_cid,
+                    metadata_schema=metadata_schema,
+                    metadata_format=metadata_schema,
+                    alternate_identifiers=alternate_identifiers,
                 )
         elif db_ark.state == ARKState.TOMBSTONE:
             # Tombstoned
@@ -334,9 +345,10 @@ async def get_ark(
                 ark=db_ark.ark,
                 state=db_ark.state,
                 target=db_ark.target,
-                metadata_cid=db_ark.metadata_cid,
-                metadata_format=db_ark.metadata_format,
-                alternate_identifiers=db_ark.alternate_identifiers,
+                metadata_cid=metadata_cid,
+                metadata_schema=metadata_schema,
+                metadata_format=metadata_schema,
+                alternate_identifiers=alternate_identifiers,
             )
     
     # 2. Fallback: Query blockchain (ARK might have been created outside this API)
@@ -385,6 +397,7 @@ async def update_ark_metadata(
     # 1. Get ARK from database
     ark_repo = ARKRepository(db)
     db_ark = ark_repo.get_by_ark(ark)
+    known_chain_cid: Optional[str] = None
 
     # 2. If local record is missing, import from blockchain as PUBLISHED.
     if not db_ark:
@@ -393,6 +406,7 @@ async def update_ark_metadata(
 
         try:
             chain_info = orchestrator.get_ark(naan, name)
+            known_chain_cid = getattr(chain_info, "cid", None)
         except Exception as e:
             logger.error(f"Failed to fetch ARK from blockchain for local import {ark}: {e}")
             raise HTTPException(status_code=502, detail="Failed to read ARK from blockchain")
@@ -404,9 +418,6 @@ async def update_ark_metadata(
                     name=name,
                     authority_id=request.authority_id,
                     target=getattr(chain_info, "url", None),
-                    metadata_cid=getattr(chain_info, "cid", None),
-                    metadata_format=None,
-                    alternate_identifiers=None,
                 )
                 db.flush()
         except IntegrityError:
@@ -427,61 +438,89 @@ async def update_ark_metadata(
             detail=f"Authority {request.authority_id} does not own this ARK"
         )
     
-    # 5. Store metadata content and get CID
+    # 5. Validate Level 1 Metadata Schema
+    # The request.level1_metadata is a dict; we validate it against the Pydantic model.
     try:
-        metadata_cid = storage.store_metadata(request.metadata, request.metadata_format)
-        logger.info(f"Stored metadata for {ark}, CID: {metadata_cid}")
-    except StorageError as e:
-        logger.error(f"Metadata storage failed for {ark}: {e}")
-        raise HTTPException(status_code=500, detail=f"Metadata storage failed: {e}")
+        # Auto-fill system fields that the client shouldn't strictly need to provide
+        l1_data = request.level1_metadata.copy()
+        
+        # Ensure ark matches the URL path
+        l1_data["ark"] = ark
+        
+        # Set original_metadata reference (CID is null until worker processes it)
+        l1_data["original_metadata"] = {
+            "schema": request.metadata_schema,
+            "cid": None
+        }
+        
+        # Validate
+        l1_model = Level1Metadata(**l1_data)
+        
+    except Exception as e:
+        logger.error(f"Level 1 metadata validation failed: {e}")
+        raise HTTPException(
+            status_code=422,
+            detail=f"Level 1 metadata validation failed: {e}"
+        )
+
+    # 6. Store metadata in DB (Level 1 + Level 2)
+    # We do NOT store to IPFS here. The worker will do that.
+    level1_json = l1_model.model_dump(mode="json", by_alias=True)
+    try:
+        db_metadata = ark_repo.create_or_update_metadata(
+            ark_record_id=db_ark.id,
+            level1_json=level1_json,
+            original_content=request.original_metadata,
+            original_schema=request.metadata_schema,
+        )
+    except Exception as e:
+        logger.error(f"Failed to store metadata in DB for {ark}: {e}")
+        raise HTTPException(status_code=500, detail="Database error storing metadata")
     
-    # 6. Apply state-aware transition/update.
+    # 7. Apply state-aware transition/update.
+    # Note: We no longer pass metadata_cid/format to these methods.
     try:
         if db_ark.state == ARKState.RESERVED:
             # New local ARK: pending create_ark.
             db_ark = ark_repo.update_to_draft(
                 ark=ark,
                 target=request.target,
-                metadata_cid=metadata_cid,
-                metadata_format=request.metadata_format,
-                alternate_identifiers=request.alternate_identifiers,
             )
         elif db_ark.state == ARKState.DRAFT:
             # Idempotent overwrite of pending create_ark payload.
             db_ark = ark_repo.update_draft_content(
                 ark=ark,
                 target=request.target,
-                metadata_cid=metadata_cid,
-                metadata_format=request.metadata_format,
-                alternate_identifiers=request.alternate_identifiers,
             )
         else:
             # Existing on-chain ARK: queue update_ark via worker.
             db_ark = ark_repo.update_to_update(
                 ark=ark,
                 target=request.target,
-                metadata_cid=metadata_cid,
-                metadata_format=request.metadata_format,
-                alternate_identifiers=request.alternate_identifiers,
             )
 
         db.commit()
         db.refresh(db_ark)
+        db.refresh(db_metadata)
         
-        logger.info(f"ARK {ark} updated to state {db_ark.state} (format: {request.metadata_format})")
+        logger.info(f"ARK {ark} updated to state {db_ark.state} (schema: {request.metadata_schema})")
         
         return ARKResponse(
             ark=db_ark.ark,
             state=db_ark.state,
             target=db_ark.target,
-            metadata_cid=db_ark.metadata_cid,
-            metadata_format=db_ark.metadata_format,
-            alternate_identifiers=db_ark.alternate_identifiers,
+            metadata_cid=db_metadata.level1_cid or known_chain_cid,
+            # Return new two-level metadata fields
+            metadata_schema=db_metadata.original_schema,
+            level1_cid=db_metadata.level1_cid,
+            level2_cid=db_metadata.original_cid,
+            alternate_identifiers=_extract_alternate_identifiers(level1_json),
+            client_item_id=db_ark.client_item_id,
         )
-    
+            
     except ValueError as e:
         db.rollback()
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         db.rollback()
         logger.error(f"Error updating ARK {ark}: {e}")

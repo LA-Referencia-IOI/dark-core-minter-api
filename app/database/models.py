@@ -15,6 +15,8 @@ from sqlalchemy import (
     Index,
     JSON,
     UniqueConstraint,
+    ForeignKey,
+
 )
 from sqlalchemy.sql import func
 from sqlalchemy.orm import declarative_base
@@ -51,9 +53,7 @@ class ARKRecord(Base):
     
     # ARK data
     target = Column(Text, nullable=True)
-    metadata_cid = Column(String(100), nullable=True)
-    metadata_format = Column(String(20), nullable=True)  # "json", "xml", etc.
-    alternate_identifiers = Column(JSON, nullable=True)
+    # metadata_format removed in favor of ARKMetadata.original_schema
     
     # Timestamps
     created_at = Column(DateTime, server_default=func.now(), nullable=False, index=True)
@@ -135,3 +135,33 @@ class WorkerRuntimeStatus(Base):
             f"<WorkerRuntimeStatus(worker={self.worker_name}, status={self.status}, "
             f"heartbeat={self.last_heartbeat_at})>"
         )
+
+
+class ARKMetadata(Base):
+    """
+    Two-level metadata storage for ARKs.
+    
+    Level 1: Minimal extracted metadata (JSON)
+    Level 2: Original metadata content (XML/JSON/Text)
+    """
+    
+    __tablename__ = "ark_metadata"
+    
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ark_record_id = Column(Integer, ForeignKey("ark_records.id"), nullable=False, unique=True, index=True)
+    
+    # Level 1 — minimal metadata (validated JSON from client)
+    level1_json = Column(JSON, nullable=False)
+    level1_cid = Column(String(100), nullable=True)   # Set by worker after IPFS store
+    
+    # Level 2 — original metadata (opaque content from client)
+    original_content = Column(Text, nullable=False)
+    original_schema = Column(String(50), nullable=False)  # "dublin_core", etc.
+    original_cid = Column(String(100), nullable=True)     # Set by worker after IPFS store
+    
+    # Timestamps
+    created_at = Column(DateTime, server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
+
+    def __repr__(self):
+        return f"<ARKMetadata(id={self.id}, ark_record_id={self.ark_record_id}, schema={self.original_schema})>"

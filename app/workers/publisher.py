@@ -101,17 +101,61 @@ class ARKPublisher:
                 logger.warning(f"ARK {ark_id} not in publishable state: {ark_record.state}")
                 return False
             
-            # Metadata is already stored; CID should be in DB
-            cid = ark_record.metadata_cid
-            if not cid:
-                error_msg = "No metadata CID found - metadata must be stored first"
+            # Step 1: Handle Two-Level Metadata Storage
+            # We need to ensure both L1 and L2 are stored in IPFS and CIDs are linked.
+            
+            # Fetch metadata record
+            metadata_record = repo.get_metadata_by_ark_id(ark_record.id)
+            if not metadata_record:
+                error_msg = "No metadata record found in DB"
                 logger.error(f"{error_msg} for ARK {ark_id}")
                 repo.mark_publish_failed(ark_id, error_msg, is_permanent=True)
                 db.commit()
                 self.stats["total_permanent_failures"] += 1
                 return False
             
-            logger.info(f"Using existing metadata CID for {ark_id}: {cid}")
+            # Use existing CIDs if available (retry logic) or store new ones
+            l1_cid = metadata_record.level1_cid
+            l2_cid = metadata_record.original_cid
+            
+            try:
+                # Store Level 2 (Original) if missing
+                if not l2_cid:
+                    l2_cid = self.metadata_storage.store_metadata(
+                        content=metadata_record.original_content,
+                        format=metadata_record.original_schema
+                    )
+                    logger.info(f"Stored Level 2 metadata for {ark_id}: {l2_cid}")
+
+                # Store Level 1 (JSON) if missing
+                if not l1_cid:
+                    # Inject L2 CID into L1 JSON
+                    l1_json = metadata_record.level1_json.copy()
+                    l1_json["original_metadata"]["cid"] = l2_cid
+                    
+                    # Store L1
+                    import json
+                    l1_content = json.dumps(l1_json)
+                    l1_cid = self.metadata_storage.store_metadata(
+                        content=l1_content,
+                        format="json"
+                    )
+                    logger.info(f"Stored Level 1 metadata for {ark_id}: {l1_cid}")
+                
+                # Update DB with CIDs
+                repo.update_metadata_cids(ark_record.id, l1_cid, l2_cid)
+                
+            except StorageError as e:
+                # Storage errors are retriable
+                error_msg = f"Metadata storage failed: {e}"
+                logger.error(f"{error_msg} for ARK {ark_id}")
+                repo.mark_publish_failed(ark_id, error_msg, is_permanent=False)
+                db.commit()
+                self._add_recent_error(ark_id, error_msg)
+                return False
+
+            cid = l1_cid
+            logger.info(f"Ready to publish {ark_id} with L1 CID: {cid}")
             
             # Step 2: Publish to blockchain
             try:
@@ -179,7 +223,7 @@ class ARKPublisher:
             
             # Step 3: Update DB to PUBLISHED
             try:
-                repo.update_to_published(ark_id, cid)
+                repo.update_to_published(ark_id)
                 db.commit()
             except ValueError as e:
                 db.rollback()

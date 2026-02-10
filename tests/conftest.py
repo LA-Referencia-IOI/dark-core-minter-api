@@ -30,12 +30,10 @@ if not os.getenv("DARK_CONTRACT_ADDRESS"):
 if not os.getenv("DARK_ADMIN_PRIVATE_KEY"):
     os.environ["DARK_ADMIN_PRIVATE_KEY"] = "0x0000000000000000000000000000000000000000000000000000000000000003"
 
-# PostgreSQL-only tests. Override DATABASE_URL for test runtime.
-_db_password = os.getenv("DB_PASSWORD", "dark_password")
-_test_db_url = os.getenv(
-    "TEST_DATABASE_URL",
-    f"postgresql://dark:{_db_password}@localhost:5432/minter_test",
-)
+# Default to local SQLite for fast/offline test execution.
+# You can still force PostgreSQL by setting TEST_DATABASE_URL explicitly.
+_default_sqlite_path = (Path(__file__).parent / ".test_minter.sqlite").resolve()
+_test_db_url = os.getenv("TEST_DATABASE_URL", f"sqlite:///{_default_sqlite_path}")
 os.environ["DATABASE_URL"] = _test_db_url
 
 from fastapi.testclient import TestClient
@@ -62,11 +60,12 @@ def mock_orchestrator():
 
 @pytest.fixture
 def test_db_engine():
-    """Create PostgreSQL test database engine for tests."""
-    engine = create_engine(
-        _test_db_url,
-        pool_pre_ping=True,
-    )
+    """Create test database engine for tests."""
+    engine_kwargs = {"pool_pre_ping": True}
+    if _test_db_url.startswith("sqlite"):
+        engine_kwargs["connect_args"] = {"check_same_thread": False}
+
+    engine = create_engine(_test_db_url, **engine_kwargs)
     # Isolated schema per test function.
     Base.metadata.drop_all(bind=engine)
     Base.metadata.create_all(bind=engine)
