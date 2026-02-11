@@ -73,7 +73,7 @@ With this setup, `PUT /api/v1/arks/{ark}` stores Level-1/Level-2 metadata in Pos
 | `/api/v1/arks` | POST | Reserve new ARK ID |
 | `/api/v1/arks/batch` | POST | Batch reserve ARK IDs (requires `client_item_id` for correlation) |
 | `/api/v1/arks/{ark}` | GET | Get ARK details |
-| `/api/v1/arks/{ark}` | PUT | Update two-level metadata (`level1_metadata` + `original_metadata`) & transition to DRAFT/UPDATE |
+| `/api/v1/arks/{ark}` | PUT | Update two-level metadata (`minimal_metadata` + `original_metadata`) & transition to DRAFT/UPDATE |
 | `/api/v1/arks/{ark}` | DELETE | Tombstone/Deactivate ARK |
 | `/api/v1/authority/{uuid}` | GET | Get authority info |
 | `/api/v1/authority/{uuid}/naans` | GET | List authority NAANs |
@@ -362,8 +362,8 @@ The Minter API manages ARKs through the following states:
 
 2. **DRAFT**: Metadata staged, ready for publication
    - Transition via `PUT /api/v1/arks/{ark}`
-   - Requires `target`, `level1_metadata` (validated JSON), `original_metadata` (raw content), and `metadata_schema`
-   - `alternate_identifiers` and `alternate_urls` must be inside `level1_metadata` (not as top-level request fields)
+   - Requires `target`, `minimal_metadata` (validated JSON), `original_metadata` (raw content), and `metadata_schema`
+   - `alternate_identifiers` and `alternate_urls` must be inside `minimal_metadata` (not as top-level request fields)
    - If `target` is missing/empty, the request is rejected and state remains `RESERVED` (no DRAFT transition)
    - Metadata is stored in DB first (`ark_metadata`); CIDs are assigned later by worker
    - Authorization validated before transition
@@ -407,7 +407,7 @@ The publisher worker runs as a separate process (`dark-core-worker`) and publish
 
 The service uses two-level metadata:
 
-- **L1 (`level1_metadata`)**: validated JSON document used as canonical publish payload.
+- **L1 (`minimal_metadata`)**: validated JSON document used as canonical publish payload.
 - **L2 (`original_metadata`)**: original raw record provided by client (XML/JSON/text).
 - Alternate IDs/URLs are persisted in `ark_metadata.level1_json`, not in `ark_records`.
 

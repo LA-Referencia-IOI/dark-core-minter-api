@@ -8,11 +8,11 @@ This document summarizes the changes made to implement the two-level ARK metadat
 - **Level 1 Schema:** Created `app/metadata/schemas.py` with `Level1Metadata` Pydantic model. Validates the client-provided JSON.
 - **Database Models:** 
   - Added `ARKMetadata` table (`app/database/models.py`) to store both L1 JSON and L2 raw content.
-  - Updated `ARKRecord` to store the final L1 CID (`metadata_cid`) and removed the deprecated `metadata_format`.
+  - Removed `metadata_cid`/metadata payload duplication from `ARKRecord`; metadata CIDs and payload now live in `ARKMetadata`.
 - **API Models:**
-  - Updated `UpdateARKMetadataRequest` (`app/models/requests.py`) to accept `level1_metadata` (dict) and `original_metadata` (string).
-  - Removed top-level `alternate_identifiers`/`alternate_urls`; these now live only inside `level1_metadata`.
-  - Updated `ARKResponse` (`app/models/responses.py`) to include `level1_cid`, `level2_cid`, and `metadata_schema`.
+  - Updated `UpdateARKMetadataRequest` (`app/models/requests.py`) to accept `minimal_metadata` (dict) and `original_metadata` (string).
+  - Removed top-level `alternate_identifiers`/`alternate_urls`; these now live only inside `minimal_metadata`.
+  - Updated `ARKResponse` (`app/models/responses.py`) to include `metadata_schema`, full `minimal_metadata` (Level-1), `level1_cid`, and `level2_cid` (without deprecated `metadata_format`).
 
 ### 2. Logic Implementation
 - **API Endpoint:** Updated `update_ark_metadata` in `app/api/arks.py`.
@@ -31,7 +31,7 @@ This document summarizes the changes made to implement the two-level ARK metadat
   - Step 6: Publishes to blockchain using `level1_cid`.
 
 ### 3. Testing
-- Updated endpoint tests to match the new API contract (`level1_metadata` + `original_metadata`).
+- Updated endpoint tests to match the new API contract (`minimal_metadata` + `original_metadata`).
 - Updated persistence tests for two-level metadata behavior (DB storage, state transitions, metadata CID reset/rebuild semantics).
 - Reworked worker tests (`tests/test_worker.py` and `tests/test_worker_unit.py`) to validate:
   - required `ARKMetadata` presence,
@@ -39,7 +39,7 @@ This document summarizes the changes made to implement the two-level ARK metadat
   - L2 CID injection into L1 before publish,
   - DB updates for `level1_cid` / `level2_cid`,
   - publish and retry/permanent-failure flows for both DRAFT and UPDATE states.
-- Fixed `GET /api/v1/arks/{ark}` metadata response compatibility after removing `ARKRecord.metadata_format`.
+- Updated `GET /api/v1/arks/{ark}` to return full `minimal_metadata` and `metadata_schema` (without deprecated `metadata_format`).
 - Test runner now defaults to local SQLite in `tests/conftest.py` (override with `TEST_DATABASE_URL` for PostgreSQL).
 - Documentation and operational assets synced to new contract:
   - `README.md`, `IMPLEMENTATION_SUMMARY.md`, `minter-architecture.md`, `docs/api.rst`,

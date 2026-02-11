@@ -54,12 +54,11 @@ def _validate_ark_checkdigit_if_enabled(naan: str, name: str) -> None:
         raise HTTPException(status_code=400, detail=f"Invalid ARK checkdigit: {exc}") from exc
 
 
-def _extract_alternate_identifiers(level1_json: Optional[dict]) -> Optional[list]:
-    """Return alternate identifiers from Level-1 metadata payload."""
+def _extract_minimal_metadata(level1_json: Optional[dict]) -> Optional[dict]:
+    """Return validated minimal (Level-1) metadata payload when available."""
     if not isinstance(level1_json, dict):
         return None
-    alternate_identifiers = level1_json.get("alternate_identifiers")
-    return alternate_identifiers or None
+    return level1_json
 
 
 @router.post(
@@ -298,7 +297,7 @@ async def get_ark(
         db_metadata = ark_repo.get_metadata_by_ark_id(db_ark.id)
         metadata_cid = db_metadata.level1_cid if db_metadata else None
         metadata_schema = db_metadata.original_schema if db_metadata else None
-        alternate_identifiers = _extract_alternate_identifiers(
+        minimal_metadata = _extract_minimal_metadata(
             db_metadata.level1_json if db_metadata else None
         )
 
@@ -311,8 +310,7 @@ async def get_ark(
                 target=db_ark.target,
                 metadata_cid=metadata_cid,
                 metadata_schema=metadata_schema,
-                metadata_format=metadata_schema,
-                alternate_identifiers=alternate_identifiers,
+                minimal_metadata=minimal_metadata,
             )
         elif db_ark.state == ARKState.PUBLISHED:
             # Combine DB metadata with blockchain data
@@ -324,8 +322,7 @@ async def get_ark(
                     target=info.url,  # From blockchain
                     metadata_cid=info.cid,  # From blockchain
                     metadata_schema=metadata_schema,  # From DB
-                    metadata_format=metadata_schema,  # Deprecated, for compatibility
-                    alternate_identifiers=alternate_identifiers,  # From L1 metadata
+                    minimal_metadata=minimal_metadata,
                 )
             except Exception as e:
                 # Blockchain query failed, return DB data
@@ -336,8 +333,7 @@ async def get_ark(
                     target=db_ark.target,
                     metadata_cid=metadata_cid,
                     metadata_schema=metadata_schema,
-                    metadata_format=metadata_schema,
-                    alternate_identifiers=alternate_identifiers,
+                    minimal_metadata=minimal_metadata,
                 )
         elif db_ark.state == ARKState.TOMBSTONE:
             # Tombstoned
@@ -347,8 +343,7 @@ async def get_ark(
                 target=db_ark.target,
                 metadata_cid=metadata_cid,
                 metadata_schema=metadata_schema,
-                metadata_format=metadata_schema,
-                alternate_identifiers=alternate_identifiers,
+                minimal_metadata=minimal_metadata,
             )
     
     # 2. Fallback: Query blockchain (ARK might have been created outside this API)
@@ -438,11 +433,11 @@ async def update_ark_metadata(
             detail=f"Authority {request.authority_id} does not own this ARK"
         )
     
-    # 5. Validate Level 1 Metadata Schema
-    # The request.level1_metadata is a dict; we validate it against the Pydantic model.
+    # 5. Validate minimal metadata schema (Level 1)
+    # request.minimal_metadata is a dict validated against Level1Metadata.
     try:
         # Auto-fill system fields that the client shouldn't strictly need to provide
-        l1_data = request.level1_metadata.copy()
+        l1_data = request.minimal_metadata.copy()
         
         # Ensure ark matches the URL path
         l1_data["ark"] = ark
@@ -512,9 +507,9 @@ async def update_ark_metadata(
             metadata_cid=db_metadata.level1_cid or known_chain_cid,
             # Return new two-level metadata fields
             metadata_schema=db_metadata.original_schema,
+            minimal_metadata=level1_json,
             level1_cid=db_metadata.level1_cid,
             level2_cid=db_metadata.original_cid,
-            alternate_identifiers=_extract_alternate_identifiers(level1_json),
             client_item_id=db_ark.client_item_id,
         )
             

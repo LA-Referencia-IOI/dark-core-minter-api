@@ -31,7 +31,7 @@ def _build_update_payload(
     return {
         "authority_id": authority_id,
         "target": target,
-        "level1_metadata": {
+        "minimal_metadata": {
             "title": title,
             "authors": ["Test Author"],
             "year": year,
@@ -474,7 +474,8 @@ def test_get_ark_from_db(client, test_db, mock_orchestrator):
     data = response.json()
     assert data["ark"] == f"ark:12345/{name}"
     assert data["state"] == ARKState.DRAFT
-    assert data["alternate_identifiers"][0]["schema"] == "doi"
+    assert "metadata_format" not in data
+    assert data["minimal_metadata"]["alternate_identifiers"][0]["schema"] == "doi"
 
 
 def test_tombstone_ark(client, test_db, mock_orchestrator):

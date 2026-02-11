@@ -194,17 +194,17 @@ Behavior details for `PUT /api/v1/arks/{ark}`:
 ## 7. Metadata Storage (Two-Level)
 
 - API receives:
-  - `level1_metadata` (minimal extracted metadata JSON),
+  - `minimal_metadata` (minimal extracted metadata JSON),
   - `original_metadata` (raw record),
   - `metadata_schema` (schema label for L2).
-- `alternate_identifiers` / `alternate_urls` are part of `level1_metadata` and are persisted only in `ark_metadata.level1_json`.
+- `alternate_identifiers` / `alternate_urls` are part of `minimal_metadata` and are persisted only in `ark_metadata.level1_json`.
 - API validates L1 against `Level1Metadata` and stores both levels in `ark_metadata`.
 - Worker performs storage/publish pipeline:
   1. Store L2 (`original_content`) -> `original_cid`.
   2. Inject `original_cid` into L1 JSON (`original_metadata.cid`).
   3. Store L1 JSON -> `level1_cid`.
   4. Persist both CIDs and publish on-chain using `level1_cid`.
-- `ark_records.metadata_cid` tracks the final L1 CID used on-chain.
+- `metadata_cid` is sourced from on-chain state (`cid`) and/or `ark_metadata.level1_cid`; it is not duplicated in `ark_records`.
 - `filesystem` and `store_api` backends are used by worker during the publish phase.
 
 ## 8. Relevant Configuration

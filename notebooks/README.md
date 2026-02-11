@@ -3,7 +3,7 @@
 This folder contains a complete end-to-end notebook plus feature-focused notebooks.
 
 Contract note:
-- `alternate_identifiers` / `alternate_urls` are part of `level1_metadata` in `PUT /api/v1/arks/{ark}`.
+- `alternate_identifiers` / `alternate_urls` are part of `minimal_metadata` in `PUT /api/v1/arks/{ark}`.
 - Reserve endpoints (`POST /arks`, `POST /arks/batch`) no longer send/persist alternate identifiers separately.
 
 ## Notebook Index
@@ -18,7 +18,7 @@ Contract note:
   - Single reserve/get lifecycle, malformed ARK checks, unauthorized reserve checks, checkdigit mutation behavior.
 
 - `minter_03_update_metadata_formats.ipynb`
-  - `RESERVED -> DRAFT`, `DRAFT -> DRAFT` overwrite, validation errors, and two-level metadata payloads (`level1_metadata` + `original_metadata`).
+  - `RESERVED -> DRAFT`, `DRAFT -> DRAFT` overwrite, validation errors, and two-level metadata payloads (`minimal_metadata` + `original_metadata`).
 
 - `minter_04_tombstone_missing.ipynb`
   - Tombstone lifecycle (`DRAFT -> TOMBSTONE`), delete idempotency, blocked updates on tombstoned ARKs, missing-record update/delete behavior with two-level payloads.

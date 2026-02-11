@@ -82,10 +82,10 @@ class UpdateARKMetadataRequest(BaseModel):
     authority_id: str = Field(..., description="Authority UUID")
     target: str = Field(..., description="Target URL for resolution")
     
-    # Level 1 — client-provided minimal JSON
-    level1_metadata: dict = Field(
+    # Minimal metadata — client-provided minimal JSON (Level 1)
+    minimal_metadata: dict = Field(
         ...,
-        description="Minimal metadata extracted from original record (validated against Level1Metadata schema)"
+        description="Minimal metadata extracted from original record (validated against Level1Metadata schema)",
     )
     
     # Level 2 — client-provided original metadata
