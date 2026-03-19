@@ -61,7 +61,7 @@ docker compose up -d
 2. Then start minter:
 
 ```bash
-cd /Users/lmatas/source/dark-developer/components/minter
+cd /Users/lmatas/source/dark-developer/components/services/dark-core-minter-api
 docker compose up -d
 ```
 

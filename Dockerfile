@@ -6,16 +6,18 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install dependencies
-COPY minter/requirements.txt /tmp/requirements.txt
+# Build context is expected to be components so dark-core-lib is available.
+# Example:
+# docker build -f services/dark-core-minter-api/Dockerfile -t dark-core-minter-api .
+COPY services/dark-core-minter-api/requirements.txt /tmp/requirements.txt
 COPY core/dark-core-lib /tmp/dark-core-lib
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && pip install --no-cache-dir /tmp/dark-core-lib
 
 # Copy application and alembic
-COPY minter/app/ ./app/
-COPY minter/alembic/ ./alembic/
-COPY minter/alembic.ini .
+COPY services/dark-core-minter-api/app/ ./app/
+COPY services/dark-core-minter-api/alembic/ ./alembic/
+COPY services/dark-core-minter-api/alembic.ini .
 
 # Create non-root user and set ownership
 RUN useradd -m appuser && chown -R appuser:appuser /app

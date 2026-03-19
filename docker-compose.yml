@@ -1,6 +1,6 @@
 x-minter-build: &minter-build
-  context: ..
-  dockerfile: minter/Dockerfile
+  context: ../..
+  dockerfile: services/dark-core-minter-api/Dockerfile
 
 services:
   postgres:
