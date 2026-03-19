@@ -27,9 +27,9 @@ from app.database import init_db, close_db
 from app.database.connection import SessionLocal
 from app.dependencies import (
     init_metadata_storage,
-    init_orchestrator,
+    init_corelib_client,
     shutdown_metadata_storage,
-    shutdown_orchestrator,
+    shutdown_corelib_client,
 )
 from app.repositories import WorkerRuntimeRepository
 from app.workers.publisher import ARKPublisher
@@ -319,14 +319,14 @@ def run_worker() -> None:
             started_at=started_at,
         )
 
-        orchestrator = init_orchestrator()
-        logger.info(f"Connected to blockchain at block {orchestrator.get_block_number()}")
+        corelib_client = init_corelib_client()
+        logger.info(f"Connected to blockchain at block {corelib_client.get_block_number()}")
 
         metadata_storage = init_metadata_storage()
         logger.info("Metadata storage initialized successfully")
 
         publisher = ARKPublisher(
-            orchestrator=orchestrator,
+            corelib_client=corelib_client,
             metadata_storage=metadata_storage,
             batch_size=settings.worker_batch_size,
             max_retries=settings.worker_max_retries,
@@ -405,7 +405,7 @@ def run_worker() -> None:
             started_at=started_at,
             publisher=publisher,
         )
-        shutdown_orchestrator()
+        shutdown_corelib_client()
         shutdown_metadata_storage()
         if advisory_lock is not None:
             advisory_lock.release()

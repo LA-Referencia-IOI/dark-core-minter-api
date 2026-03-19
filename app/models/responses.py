@@ -39,7 +39,7 @@ class ARKResponse(BaseModel):
     level2_cid: Optional[str] = Field(None, description="CID of Level 2 (original) metadata")
     client_item_id: Optional[str] = Field(None, description="Client correlation ID")
     
-    # Timestamps could be added here if we track them in DB/Orchestrator
+    # Timestamps could be added here if we track them in DB/corelib
     
     model_config = ConfigDict(use_enum_values=True)
 

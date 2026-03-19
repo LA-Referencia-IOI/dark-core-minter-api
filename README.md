@@ -1,13 +1,13 @@
 # dARK Core Minter API
 
-**REST API service for the dARK Core Orchestrator**
+**REST API service for dARK minting powered by `dark-core-lib`**
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)](https://fastapi.tiangolo.com/)
 
 ## Overview
 
-The Core Minter API exposes the dARK Core Orchestrator functionality via HTTP/JSON endpoints. It handles the full lifecycle of ARK identifiers:
+The Core Minter API exposes dARK minting and lifecycle functionality via HTTP/JSON endpoints. It handles the full lifecycle of ARK identifiers:
 - **Reserve**: Generate IDs locally using deterministic DB counters + NOID checkdigit.
 - **Publish/Update**: Persist metadata and publish create/update on blockchain (`draft|update` -> `published`).
 - **Resolve**: Retrieve current state and metadata.
@@ -22,11 +22,12 @@ source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
-pip install -e ../dark-core-orchestrator
+pip install -e ../core/dark-core-lib
 
 # Configure
 cp .env.example .env
-# Edit .env with your blockchain settings
+# Or, if installed from the root installer, use the generated .env.integration
+# The app prefers .env.integration automatically when it exists.
 
 # Run API with Uvicorn (development)
 uvicorn app.main:app --reload
@@ -43,6 +44,31 @@ dark-core-worker
 # Check worker process status
 dark-core-worker-status
 ```
+
+### Docker Integration with `dark-env`
+
+For a clean local integration, keep blockchain and minter in separate compose
+projects and attach the minter services to the external Docker network
+`dark-net` created by `dark-env`.
+
+1. Start blockchain first:
+
+```bash
+cd /Users/lmatas/source/dark-developer/components/blockchain/dark-env
+docker compose up -d
+```
+
+2. Then start minter:
+
+```bash
+cd /Users/lmatas/source/dark-developer/components/minter
+docker compose up -d
+```
+
+In this mode:
+- `minter-api` and `minter-worker` read `./.env.integration`
+- the RPC endpoint is overridden inside Docker to `http://rpc01:8545`
+- notebooks continue to call the API from the host at `http://localhost:8001`
 
 API supports both execution styles:
 - Direct Uvicorn: `uvicorn app.main:app ...`
@@ -110,9 +136,6 @@ Once running, visit:
 
 ### Feature-Focused Notebooks
 
-The original end-to-end notebook is still available at:
-- [`notebooks/minter_api_test.ipynb`](./notebooks/minter_api_test.ipynb)
-
 Feature-specific notebooks:
 - [`notebooks/minter_01_smoke_authority.ipynb`](./notebooks/minter_01_smoke_authority.ipynb): service smoke and authority checks.
 - [`notebooks/minter_02_reserve_validation.ipynb`](./notebooks/minter_02_reserve_validation.ipynb): single reserve, validation, checkdigit behavior.
@@ -138,7 +161,8 @@ nano .env  # or your preferred editor
 
 ### Configuration Reference
 
-All settings are configured via environment variables or a `.env` file.
+All settings are configured via environment variables or an env file. The app
+prefers `.env.integration` when present and falls back to `.env`.
 
 #### 🌐 API Server
 
@@ -377,8 +401,8 @@ The Minter API manages ARKs through the following states:
 4. **PUBLISHED**: Published to blockchain with finalized L1 CID
    - Automated by async worker
    - Worker stores L2 first, injects L2 CID into L1, then stores L1
-   - ARK registered on blockchain via orchestrator
-   - `ark_records.metadata_cid` points to L1 CID
+   - ARK registered on blockchain via `dark-core-lib`
+   - `ark_metadata.level1_cid` points to the published L1 CID
 
 5. **TOMBSTONE**: ARK deactivated
    - Soft delete via `DELETE /api/v1/arks/{ark}`

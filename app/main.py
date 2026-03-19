@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.dependencies import init_orchestrator, shutdown_orchestrator, get_db
+from app.dependencies import init_corelib_client, shutdown_corelib_client, get_corelib_client, get_db
 from app.api.router import api_router
 from app.exceptions.handlers import register_exception_handlers
 
@@ -57,12 +57,12 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize database: {e}")
         raise
     
-    # Initialize orchestrator connection to blockchain
+    # Initialize blockchain client
     try:
-        orchestrator = init_orchestrator()
-        logger.info(f"Connected to blockchain at block {orchestrator.get_block_number()}")
+        corelib_client = init_corelib_client()
+        logger.info(f"Connected to blockchain at block {corelib_client.get_block_number()}")
     except Exception as e:
-        logger.error(f"Failed to initialize orchestrator: {e}")
+        logger.error(f"Failed to initialize dark-core-lib client: {e}")
         raise
     
     # Initialize metadata storage
@@ -81,7 +81,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     logger.info("Shutting down dARK Core API...")
 
-    shutdown_orchestrator()
+    shutdown_corelib_client()
     
     from app.database import close_db
     close_db()
@@ -99,7 +99,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="dARK Core API",
         description=(
-            "REST API service for the dARK Core Orchestrator. "
+            "REST API service for dARK minting and lifecycle operations. "
             "Provides blockchain operations for Minter nodes."
         ),
         version="0.1.0",
@@ -127,7 +127,6 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["Health"])
     async def health_check(db: Session = Depends(get_db)):
         """Health check endpoint for load balancers."""
-        from app.dependencies import get_orchestrator
         from sqlalchemy import text
         from sqlalchemy.exc import SQLAlchemyError
         
@@ -136,9 +135,9 @@ def create_app() -> FastAPI:
         
         # Check blockchain
         try:
-            orchestrator = get_orchestrator()
-            connected = orchestrator.is_connected()
-            block = orchestrator.get_block_number() if connected else None
+            corelib_client = get_corelib_client()
+            connected = corelib_client.is_connected()
+            block = corelib_client.get_block_number() if connected else None
             response["blockchain_connected"] = connected
             response["current_block"] = block
             if not connected:

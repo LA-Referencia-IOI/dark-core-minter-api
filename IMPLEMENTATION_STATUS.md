@@ -59,7 +59,7 @@ This document summarizes the changes made to implement the two-level ARK metadat
 - **IPFS:** The worker logic assumes a functional IPFS node (via `dark-ipfs`).
 - **Blockchain:** The worker publishes to the blockchain.
 - **Action:**
-  1. Start the stack: `docker compose up -d` (including postgres, ipfs, orchestrator mock/node).
+  1. Start the stack: `docker compose up -d` (including postgres, ipfs, corelib mock/node).
   2. Reserve an ARK via API: `POST /api/v1/arks`
   3. Update metadata via API: `PUT /api/v1/arks/{ark}` with L1+L2 payload.
   4. Verify in DB: `ark_metadata` should have content, `ark_records` should be `DRAFT`.

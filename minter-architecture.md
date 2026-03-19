@@ -11,11 +11,11 @@ flowchart LR
     C["API Client"] --> API["API Process (FastAPI)"]
     API --> DB["PostgreSQL"]
     API --> ST["Metadata Storage (filesystem/store_api)"]
-    API --> ORCH["dark-core-orchestrator"]
-    ORCH --> CHAIN["Blockchain (Authority + dARK)"]
+    API --> CORE["dark-core-lib"]
+    CORE --> CHAIN["Blockchain (Authority + dARK)"]
 
     W["Worker Process (APScheduler)"] --> DB
-    W --> ORCH
+    W --> CORE
 
     DB --> HB["worker_runtime_status (heartbeat)"]
     API --> WS["GET /api/v1/worker/status"]
@@ -65,19 +65,18 @@ If `target` is missing or empty, the request is rejected and the ARK stays in `R
 sequenceDiagram
     participant Client as "Client"
     participant API as "arks.py"
-    participant ST as "Metadata Storage"
     participant ARepo as "ARKRepository"
     participant DB as "PostgreSQL"
 
     Client->>API: "PUT /api/v1/arks/{ark}"
     API->>API: "validate target, metadata, format"
-    API->>ST: "store_metadata(content, format)"
-    ST-->>API: "metadata_cid"
-    API->>ARepo: "update_to_draft(ark, target, cid, format)"
-    ARepo->>DB: "UPDATE ... WHERE state='R' (CAS)"
+    API->>ARepo: "create_or_update_metadata(level1, level2)"
+    ARepo->>DB: "UPSERT ark_metadata"
+    API->>ARepo: "update_to_draft / update_draft_content / update_to_update"
+    ARepo->>DB: "UPDATE lifecycle state with CAS"
     DB-->>ARepo: "rowcount"
     API->>DB: "COMMIT"
-    API-->>Client: "200 OK (state=D)"
+    API-->>Client: "200 OK (state=D or U)"
 ```
 
 ## 5. Asynchronous Worker Publish Flow (`DRAFT`/`UPDATE` -> `PUBLISHED`)
@@ -88,7 +87,8 @@ sequenceDiagram
     participant Pub as "ARKPublisher"
     participant ARepo as "ARKRepository"
     participant DB as "PostgreSQL"
-    participant ORCH as "dark-core-orchestrator"
+    participant ST as "Metadata Storage"
+    participant CORE as "dark-core-lib"
     participant CHAIN as "Blockchain"
 
     W->>Pub: "run_publish_cycle()"
@@ -98,11 +98,16 @@ sequenceDiagram
     Pub->>DB: "COMMIT (release row locks)"
 
     loop "for each claimed ARK"
+        Pub->>ST: "store Level-2 metadata"
+        ST-->>Pub: "level2_cid"
+        Pub->>ST: "store Level-1 metadata with embedded level2_cid"
+        ST-->>Pub: "level1_cid"
+        Pub->>ARepo: "update_metadata_cids"
         Pub->>Pub: "if state=DRAFT -> create_ark"
         Pub->>Pub: "if state=UPDATE -> update_ark"
-        Pub->>ORCH: "create_ark / update_ark"
-        ORCH->>CHAIN: "tx create_ark / update_ark"
-        Pub->>ARepo: "update_to_published(ark, cid)"
+        Pub->>CORE: "create_ark / update_ark"
+        CORE->>CHAIN: "tx create_ark / update_ark"
+        Pub->>ARepo: "update_to_published(ark)"
         ARepo->>DB: "UPDATE ... WHERE state in ('D','U') (CAS)"
         Pub->>DB: "COMMIT"
     end
@@ -179,7 +184,6 @@ erDiagram
         string state "R,D,U,P,T"
         string authority_id
         string target
-        string metadata_cid
         int publish_retry_count
         datetime publish_last_attempt_at
         int publish_permanently_failed

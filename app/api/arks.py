@@ -10,9 +10,9 @@ from fastapi import APIRouter, Depends, HTTPException, Path
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from dark_orchestrator import DARKOrchestrator
+from dark_core_lib import DARKCoreClient
 
-from app.dependencies import get_orchestrator, get_db, get_metadata_storage
+from app.dependencies import get_corelib_client, get_db, get_metadata_storage
 from app.storage.base import MetadataStorage
 from app.middleware.auth import require_mtls
 from app.utils.noid import mint_ark_id, validate_name_checkdigit
@@ -72,7 +72,7 @@ def _extract_minimal_metadata(level1_json: Optional[dict]) -> Optional[dict]:
 async def reserve_ark(
     request: ReserveARKRequest,
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> ARKResponse:
     """
@@ -81,7 +81,7 @@ async def reserve_ark(
     Generates a unique ID and persists in database.
     """
     # 1. Validate authorization (with cache)
-    if not check_authorization_cached(orchestrator, request.authority_id, request.naan):
+    if not check_authorization_cached(corelib_client, request.authority_id, request.naan):
         raise HTTPException(
             status_code=403,
             detail=f"Authority {request.authority_id} not authorized for NAAN {request.naan}"
@@ -170,14 +170,14 @@ async def reserve_ark(
 async def batch_reserve_ark(
     request: ReserveBatchRequest,
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> ARKBatchResponse:
     """
     Reserve multiple ARKs with individual error handling.
     """
     # Validate authorization once for the batch (with cache)
-    if not check_authorization_cached(orchestrator, request.authority_id, request.naan):
+    if not check_authorization_cached(corelib_client, request.authority_id, request.naan):
         raise HTTPException(
             status_code=403,
             detail=f"Authority {request.authority_id} not authorized for NAAN {request.naan}"
@@ -275,7 +275,7 @@ async def batch_reserve_ark(
 async def get_ark(
     ark: str = Path(..., description="Full ARK identifier (e.g. ark:/12345/xyz)"),
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> ARKResponse:
     """
@@ -315,7 +315,7 @@ async def get_ark(
         elif db_ark.state == ARKState.PUBLISHED:
             # Combine DB metadata with blockchain data
             try:
-                info = orchestrator.get_ark(naan, name)
+                info = corelib_client.get_ark(naan, name)
                 return ARKResponse(
                     ark=ark,
                     state=ARKState.PUBLISHED,
@@ -347,10 +347,10 @@ async def get_ark(
             )
     
     # 2. Fallback: Query blockchain (ARK might have been created outside this API)
-    if not orchestrator.ark_exists(naan, name):
+    if not corelib_client.ark_exists(naan, name):
         raise HTTPException(status_code=404, detail="ARK not found")
     
-    info = orchestrator.get_ark(naan, name)
+    info = corelib_client.get_ark(naan, name)
     
     return ARKResponse(
         ark=ark,
@@ -371,7 +371,7 @@ async def update_ark_metadata(
     request: UpdateARKMetadataRequest,
     ark: str = Path(..., description="Full ARK identifier"),
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
     storage: MetadataStorage = Depends(get_metadata_storage),
 ) -> ARKResponse:
@@ -396,11 +396,11 @@ async def update_ark_metadata(
 
     # 2. If local record is missing, import from blockchain as PUBLISHED.
     if not db_ark:
-        if not orchestrator.ark_exists(naan, name):
+        if not corelib_client.ark_exists(naan, name):
             raise HTTPException(status_code=404, detail="ARK not found")
 
         try:
-            chain_info = orchestrator.get_ark(naan, name)
+            chain_info = corelib_client.get_ark(naan, name)
             known_chain_cid = getattr(chain_info, "cid", None)
         except Exception as e:
             logger.error(f"Failed to fetch ARK from blockchain for local import {ark}: {e}")
@@ -530,7 +530,7 @@ async def update_ark_metadata(
 async def delete_ark(
     ark: str = Path(..., description="Full ARK identifier"),
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> None:
     """
@@ -563,7 +563,7 @@ async def delete_ark(
         
         logger.info(f"ARK {ark} marked as TOMBSTONE")
         
-        # TODO: Orchestrator needs delete_ark or tombstone_ark method
+        # TODO: dark-core-lib needs delete_ark or tombstone_ark method
         # Currently not supported on-chain.
         logger.warning(f"Tombstone state saved in DB, but not yet propagated to blockchain")
         

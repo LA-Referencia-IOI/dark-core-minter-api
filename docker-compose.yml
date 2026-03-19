@@ -1,3 +1,7 @@
+x-minter-build: &minter-build
+  context: ..
+  dockerfile: minter/Dockerfile
+
 services:
   postgres:
     image: postgres:15-alpine
@@ -15,31 +19,47 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+    networks:
+      - minter-net
 
   minter-api:
-    build: .
+    build: *minter-build
     ports:
       - "8001:8001"
     env_file:
-      - .env
+      - .env.integration
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
+      - DARK_RPC_URL=http://rpc01:8545
     restart: unless-stopped
+    networks:
+      - minter-net
+      - dark-net
 
   minter-worker:
-    build: .
+    build: *minter-build
     command: ["python", "-m", "app.main_worker"]
     env_file:
-      - .env
+      - .env.integration
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
+      - DARK_RPC_URL=http://rpc01:8545
     restart: unless-stopped
+    networks:
+      - minter-net
+      - dark-net
 
 volumes:
   postgres-data:
+
+networks:
+  minter-net:
+  dark-net:
+    external: true
+    name: dark-net

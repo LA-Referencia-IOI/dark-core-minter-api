@@ -1,5 +1,5 @@
 """
 dARK Core API
 
-REST service for the dARK Core Orchestrator.
+REST service for dARK minting through dark-core-lib.
 """

@@ -169,7 +169,7 @@ Behavior details for `PUT /api/v1/arks/{ark}`:
 
 - Claims pending ARKs in `DRAFT`/`UPDATE`
 - Applies exponential backoff for retries
-- Publishes to blockchain via orchestrator
+- Publishes to blockchain via corelib
 - Updates state to `PUBLISHED` or marks publish failures
 
 ### Scheduler

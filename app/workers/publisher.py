@@ -2,7 +2,7 @@
 Async worker for publishing DRAFT ARKs to blockchain.
 
 This worker processes ARKs in DRAFT state, stores their metadata,
-and publishes them to the blockchain via the orchestrator.
+and publishes them to the blockchain via dark-core-lib.
 """
 
 import logging
@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy.orm import Session
-from dark_orchestrator import DARKOrchestrator
-from dark_orchestrator.exceptions import ARKError, AuthorityError
+from dark_core_lib import DARKCoreClient
+from dark_core_lib.exceptions import ARKError, AuthorityError
 
 from app.database.connection import SessionLocal
 from app.repositories.ark_repository import ARKRepository
@@ -39,7 +39,7 @@ class ARKPublisher:
     
     def __init__(
         self,
-        orchestrator: DARKOrchestrator,
+        corelib_client: DARKCoreClient,
         metadata_storage: MetadataStorage,
         batch_size: int = 10,
         max_retries: int = 5,
@@ -49,13 +49,13 @@ class ARKPublisher:
         Initialize ARK publisher worker.
         
         Args:
-            orchestrator: DarkOrchestrator instance for blockchain ops
+            corelib_client: DARKCoreClient instance for blockchain ops
             metadata_storage: Metadata storage backend
             batch_size: Number of ARKs to process per cycle
             max_retries: Maximum retry attempts before permanent failure
             backoff_base: Base for exponential backoff calculation
         """
-        self.orchestrator = orchestrator
+        self.corelib_client = corelib_client
         self.metadata_storage = metadata_storage
         self.batch_size = batch_size
         self.max_retries = max_retries
@@ -164,7 +164,7 @@ class ARKPublisher:
                 naan, name = parse_ark(ark_id)
                 
                 if ark_record.state == ARKState.DRAFT:
-                    self.orchestrator.create_ark(
+                    self.corelib_client.create_ark(
                         uuid=ark_record.authority_id,
                         naan=naan,
                         name=name,
@@ -173,7 +173,7 @@ class ARKPublisher:
                     )
                     operation = "create"
                 else:
-                    self.orchestrator.update_ark(
+                    self.corelib_client.update_ark(
                         uuid=ark_record.authority_id,
                         naan=naan,
                         name=name,

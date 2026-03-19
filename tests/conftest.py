@@ -9,14 +9,20 @@ import pytest
 from unittest.mock import MagicMock, patch
 from dotenv import load_dotenv
 
-# Use lightweight stubs for dark_orchestrator during tests to avoid
+# Use lightweight stubs for dark_core_lib during tests to avoid
 # importing heavy web3 dependency graphs at collection time.
 _STUBS_DIR = Path(__file__).parent / "stubs"
 if _STUBS_DIR.exists():
     sys.path.insert(0, str(_STUBS_DIR))
 
-# Load .env if it exists (prioritize real config for integration tests if desired)
-load_dotenv()
+# Load component env if it exists (prefer deployed integration config).
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_INTEGRATION_ENV = _PROJECT_ROOT / ".env.integration"
+_DEFAULT_ENV = _PROJECT_ROOT / ".env"
+if _INTEGRATION_ENV.exists():
+    load_dotenv(_INTEGRATION_ENV)
+elif _DEFAULT_ENV.exists():
+    load_dotenv(_DEFAULT_ENV)
 
 # Set dummy env vars ONLY if not already set (fallback for CI/clean envs)
 if not os.getenv("DARK_RPC_URL"):
@@ -42,14 +48,14 @@ from sqlalchemy.orm import sessionmaker
 
 from app.main import app
 import app.dependencies as dependencies_module
-from app.dependencies import get_orchestrator, init_orchestrator, get_db
+from app.dependencies import get_corelib_client, init_corelib_client, get_db
 from app.database.models import Base
 
 
-# Mock orchestrator for tests
+# Mock corelib client for tests
 @pytest.fixture
-def mock_orchestrator():
-    """Create a mock DARKOrchestrator."""
+def mock_corelib():
+    """Create a mock DARKCoreClient."""
     mock = MagicMock()
     mock.is_connected.return_value = True
     mock.get_block_number.return_value = 12345
@@ -121,31 +127,31 @@ def override_get_db(test_db):
 
 
 @pytest.fixture
-def client(mock_orchestrator, override_get_db):
+def client(mock_corelib, override_get_db):
     """
     Create a test client with mocked dependencies.
     """
     # Override dependencies
-    app.dependency_overrides[get_orchestrator] = lambda: mock_orchestrator
+    app.dependency_overrides[get_corelib_client] = lambda: mock_corelib
     app.dependency_overrides[get_db] = override_get_db
-    dependencies_module._orchestrator = mock_orchestrator
+    dependencies_module._corelib_client = mock_corelib
     
     # Mock the lifespan initialization to prevent blockchain connection
-    with patch("app.main.init_orchestrator", return_value=mock_orchestrator):
+    with patch("app.main.init_corelib_client", return_value=mock_corelib):
         with patch("app.database.init_db"):  # Skip DB migrations in tests
             with TestClient(app) as test_client:
                 yield test_client
     
     # Clear overrides after test
     app.dependency_overrides.clear()
-    dependencies_module._orchestrator = None
+    dependencies_module._corelib_client = None
 
 
 @pytest.fixture
 def mock_ark_info():
     """Create mock ARK info for tests."""
     from datetime import datetime
-    from dark_orchestrator.ark import ARKInfo
+    from dark_core_lib.models import ARKInfo
     
     return ARKInfo(
         naan="12345",
@@ -161,7 +167,7 @@ def mock_ark_info():
 @pytest.fixture
 def mock_authority_info():
     """Create mock authority info for tests."""
-    from dark_orchestrator.authority import AuthorityInfo
+    from dark_core_lib.models import AuthorityInfo
     
     return AuthorityInfo(
         uuid="test-authority-uuid",

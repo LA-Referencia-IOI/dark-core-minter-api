@@ -5,7 +5,7 @@ Unit tests for ARKPublisher using mocks only (no real DB).
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from dark_orchestrator.exceptions import AuthorityError
+from dark_core_lib.exceptions import AuthorityError
 
 from app.models.states import ARKState
 from app.storage.exceptions import StorageError
@@ -103,12 +103,12 @@ class TestARKPublisherUnit:
         metadata_record = MockMetadataRecord()
         mock_repo = _build_repo(ark_record, metadata_record)
 
-        mock_orchestrator = Mock()
-        mock_orchestrator.create_ark = Mock()
+        mock_corelib = Mock()
+        mock_corelib.create_ark = Mock()
         mock_storage = MockMetadataStorage()
 
         publisher = ARKPublisher(
-            orchestrator=mock_orchestrator,
+            corelib_client=mock_corelib,
             metadata_storage=mock_storage,
             batch_size=10,
             max_retries=5,
@@ -123,7 +123,7 @@ class TestARKPublisherUnit:
         assert success is True
         mock_repo.update_metadata_cids.assert_called_once()
         mock_repo.update_to_published.assert_called_once()
-        mock_orchestrator.create_ark.assert_called_once()
+        mock_corelib.create_ark.assert_called_once()
         assert publisher.stats["total_succeeded"] == 1
 
     def test_publish_single_ark_update_calls_update_ark(self):
@@ -131,12 +131,12 @@ class TestARKPublisherUnit:
         metadata_record = MockMetadataRecord()
         mock_repo = _build_repo(ark_record, metadata_record)
 
-        mock_orchestrator = Mock()
-        mock_orchestrator.update_ark = Mock()
-        mock_orchestrator.create_ark = Mock()
+        mock_corelib = Mock()
+        mock_corelib.update_ark = Mock()
+        mock_corelib.create_ark = Mock()
 
         publisher = ARKPublisher(
-            orchestrator=mock_orchestrator,
+            corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
@@ -149,15 +149,15 @@ class TestARKPublisherUnit:
                 success = publisher.publish_single_ark("ark:12345/update")
 
         assert success is True
-        mock_orchestrator.update_ark.assert_called_once()
-        mock_orchestrator.create_ark.assert_not_called()
+        mock_corelib.update_ark.assert_called_once()
+        mock_corelib.create_ark.assert_not_called()
 
     def test_publish_single_ark_no_metadata_record(self):
         ark_record = MockARKRecord(ark_id=3, naan="12345", name="no-meta", state=ARKState.DRAFT)
         mock_repo = _build_repo(ark_record, metadata_record=None)
 
         publisher = ARKPublisher(
-            orchestrator=Mock(),
+            corelib_client=Mock(),
             metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
@@ -178,11 +178,11 @@ class TestARKPublisherUnit:
         metadata_record = MockMetadataRecord()
         mock_repo = _build_repo(ark_record, metadata_record)
 
-        mock_orchestrator = Mock()
-        mock_orchestrator.create_ark = Mock(side_effect=AuthorityError("Unauthorized"))
+        mock_corelib = Mock()
+        mock_corelib.create_ark = Mock(side_effect=AuthorityError("Unauthorized"))
 
         publisher = ARKPublisher(
-            orchestrator=mock_orchestrator,
+            corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
@@ -210,11 +210,11 @@ class TestARKPublisherUnit:
         metadata_record = MockMetadataRecord()
         mock_repo = _build_repo(ark_record, metadata_record)
 
-        mock_orchestrator = Mock()
-        mock_orchestrator.create_ark = Mock(side_effect=Exception("Network error"))
+        mock_corelib = Mock()
+        mock_corelib.create_ark = Mock(side_effect=Exception("Network error"))
 
         publisher = ARKPublisher(
-            orchestrator=mock_orchestrator,
+            corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
@@ -256,11 +256,11 @@ class TestARKPublisherUnit:
         mock_repo.update_to_published = Mock()
         mock_repo.mark_publish_failed = Mock()
 
-        mock_orchestrator = Mock()
-        mock_orchestrator.create_ark = Mock()
+        mock_corelib = Mock()
+        mock_corelib.create_ark = Mock()
 
         publisher = ARKPublisher(
-            orchestrator=mock_orchestrator,
+            corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,
@@ -284,7 +284,7 @@ class TestARKPublisherUnit:
 
     def test_publisher_statistics(self):
         publisher = ARKPublisher(
-            orchestrator=Mock(),
+            corelib_client=Mock(),
             metadata_storage=MockMetadataStorage(),
             batch_size=10,
             max_retries=5,

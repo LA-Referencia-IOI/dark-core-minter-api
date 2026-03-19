@@ -7,10 +7,9 @@ Provides authority information and authorization checks.
 import logging
 from fastapi import APIRouter, Depends, Path
 
-from dark_orchestrator import DARKOrchestrator
-from dark_orchestrator.exceptions import AuthorityError
+from dark_core_lib import DARKCoreClient
 
-from app.dependencies import get_orchestrator
+from app.dependencies import get_corelib_client
 from app.middleware.auth import require_mtls
 from app.models.responses import (
     AuthorityResponse,
@@ -32,14 +31,14 @@ router = APIRouter()
 async def get_authority(
     uuid: str = Path(..., description="Authority UUID"),
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
 ) -> AuthorityResponse:
     """
     Get authority information by UUID.
     """
     logger.info(f"Getting authority: {uuid}")
     
-    authority = orchestrator.get_authority_by_uuid(uuid)
+    authority = corelib_client.get_authority_by_uuid(uuid)
     
     return AuthorityResponse(
         uuid=authority.uuid,
@@ -58,14 +57,14 @@ async def get_authority(
 async def get_authority_naans(
     uuid: str = Path(..., description="Authority UUID"),
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
 ) -> AuthorityNAANsResponse:
     """
     Get list of authorized NAANs for an authority.
     """
     logger.info(f"Getting NAANs for authority: {uuid}")
     
-    naans = orchestrator.get_authorized_naans(uuid)
+    naans = corelib_client.get_authorized_naans(uuid)
     
     return AuthorityNAANsResponse(
         uuid=uuid,
@@ -83,14 +82,14 @@ async def check_authority_authorization(
     uuid: str = Path(..., description="Authority UUID"),
     naan: str = Path(..., description="NAAN to check"),
     cert_info: dict = Depends(require_mtls),
-    orchestrator: DARKOrchestrator = Depends(get_orchestrator),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
 ) -> AuthorityAuthorizedResponse:
     """
     Check if authority is authorized for a specific NAAN.
     """
     logger.info(f"Checking authorization: {uuid} for NAAN {naan}")
     
-    authorized = orchestrator.is_authorized_for_naan(uuid, naan)
+    authorized = corelib_client.is_authorized_for_naan(uuid, naan)
     
     return AuthorityAuthorizedResponse(
         uuid=uuid,

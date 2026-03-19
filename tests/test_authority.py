@@ -3,10 +3,10 @@ Tests for authority and health endpoints.
 """
 
 
-def test_health_check(client, mock_orchestrator):
+def test_health_check(client, mock_corelib):
     """Test health endpoint returns blockchain status."""
-    mock_orchestrator.is_connected.return_value = True
-    mock_orchestrator.get_block_number.return_value = 12345
+    mock_corelib.is_connected.return_value = True
+    mock_corelib.get_block_number.return_value = 12345
 
     response = client.get("/health")
 
@@ -17,9 +17,9 @@ def test_health_check(client, mock_orchestrator):
     assert data["current_block"] == 12345
 
 
-def test_get_authority_success(client, mock_orchestrator, mock_authority_info):
+def test_get_authority_success(client, mock_corelib, mock_authority_info):
     """Test getting authority information by UUID."""
-    mock_orchestrator.get_authority_by_uuid.return_value = mock_authority_info
+    mock_corelib.get_authority_by_uuid.return_value = mock_authority_info
 
     response = client.get("/api/v1/authority/test-authority-uuid")
 
@@ -31,9 +31,9 @@ def test_get_authority_success(client, mock_orchestrator, mock_authority_info):
     assert data["active"] is True
 
 
-def test_get_authority_naans_success(client, mock_orchestrator):
+def test_get_authority_naans_success(client, mock_corelib):
     """Test getting authorized NAANs for an authority."""
-    mock_orchestrator.get_authorized_naans.return_value = ["12345", "67890"]
+    mock_corelib.get_authorized_naans.return_value = ["12345", "67890"]
 
     response = client.get("/api/v1/authority/test-authority-uuid/naans")
 
@@ -43,9 +43,9 @@ def test_get_authority_naans_success(client, mock_orchestrator):
     assert data["naans"] == ["12345", "67890"]
 
 
-def test_check_authority_authorization_true(client, mock_orchestrator):
+def test_check_authority_authorization_true(client, mock_corelib):
     """Test checking NAAN authorization for an authority."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
 
     response = client.get("/api/v1/authority/test-authority-uuid/authorized/12345")
 

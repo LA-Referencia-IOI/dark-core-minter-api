@@ -1,15 +1,15 @@
 """
 Exception handlers for dARK Core API.
 
-Maps dark_orchestrator exceptions to HTTP responses following the spec.
+Maps dark-core-lib exceptions to HTTP responses following the spec.
 """
 
 import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from dark_orchestrator.exceptions import (
-    DARKError,
+from dark_core_lib.exceptions import (
+    DarkCoreError,
     ConfigurationError,
     AuthorityError,
     ARKError,
@@ -134,10 +134,10 @@ def register_exception_handlers(app: FastAPI) -> None:
             ).model_dump(),
         )
     
-    @app.exception_handler(DARKError)
-    async def dark_error_handler(request: Request, exc: DARKError):
-        """Handle generic DARKError exceptions."""
-        logger.error(f"DARK error: {exc}")
+    @app.exception_handler(DarkCoreError)
+    async def dark_error_handler(request: Request, exc: DarkCoreError):
+        """Handle generic DarkCoreError exceptions."""
+        logger.error(f"dARK core error: {exc}")
         
         return JSONResponse(
             status_code=500,

@@ -5,15 +5,27 @@ Uses pydantic-settings for environment variable loading and validation.
 """
 
 from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _resolve_env_file() -> str:
+    """Prefer local .env.integration over .env for deployed test stacks."""
+    project_root = Path(__file__).resolve().parents[1]
+    integration_env = project_root / ".env.integration"
+    default_env = project_root / ".env"
+
+    if integration_env.exists():
+        return str(integration_env)
+
+    return str(default_env)
 
 
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
     
     model_config = SettingsConfigDict(
-        env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
     )
@@ -62,7 +74,7 @@ class Settings(BaseSettings):
     tls_key_file: Optional[str] = None
     tls_ca_file: Optional[str] = None
     
-    # Blockchain Connection (same vars as dark-orchestrator)
+    # Blockchain connection shared with dark-core-lib
     dark_rpc_url: str = "http://localhost:8545"
     dark_chain_id: int = 1337
     dark_authority_address: str = ""
@@ -109,4 +121,4 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     """Get cached settings instance."""
-    return Settings()
+    return Settings(_env_file=_resolve_env_file())

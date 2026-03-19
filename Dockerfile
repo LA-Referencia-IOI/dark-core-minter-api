@@ -1,15 +1,21 @@
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 WORKDIR /app
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY minter/requirements.txt /tmp/requirements.txt
+COPY core/dark-core-lib /tmp/dark-core-lib
+RUN pip install --no-cache-dir -r /tmp/requirements.txt \
+    && pip install --no-cache-dir /tmp/dark-core-lib
 
 # Copy application and alembic
-COPY app/ ./app/
-COPY alembic/ ./alembic/
-COPY alembic.ini .
+COPY minter/app/ ./app/
+COPY minter/alembic/ ./alembic/
+COPY minter/alembic.ini .
 
 # Create non-root user and set ownership
 RUN useradd -m appuser && chown -R appuser:appuser /app

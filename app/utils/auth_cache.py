@@ -11,7 +11,7 @@ import threading
 from functools import lru_cache
 from typing import Dict, Tuple
 
-from dark_orchestrator import DARKOrchestrator
+from dark_core_lib import DARKCoreClient
 
 from app.config import get_settings
 
@@ -131,7 +131,7 @@ def get_auth_cache() -> AuthorizationCache:
 
 
 def check_authorization_cached(
-    orchestrator: DARKOrchestrator,
+    corelib_client: DARKCoreClient,
     authority_id: str,
     naan: str,
 ) -> bool:
@@ -139,7 +139,7 @@ def check_authorization_cached(
     Check if authority is authorized for NAAN with caching.
     
     Args:
-        orchestrator: DARKOrchestrator instance
+        corelib_client: DARKCoreClient instance
         authority_id: Authority UUID
         naan: NAAN to check
     
@@ -155,7 +155,7 @@ def check_authorization_cached(
     
     # Cache miss, query blockchain
     try:
-        result = orchestrator.is_authorized_for_naan(authority_id, naan)
+        result = corelib_client.is_authorized_for_naan(authority_id, naan)
         cache.set(authority_id, naan, result)
         return result
     except Exception as e:

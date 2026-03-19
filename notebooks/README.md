@@ -47,6 +47,10 @@ All notebooks read the same runtime variables from the first setup cell:
 
 ## Execution Notes
 
+- If the minter was installed from the root installer, it may already have a
+  generated `../.env.integration` with deployed contracts and admin key.
+- The minter service itself prefers `.env.integration` over `.env` when both
+  exist.
 - Most notebooks include the authority bootstrap step; if you already have an authorized authority, set:
   - `REGISTER_AUTHORITY=false`
   - `AUTHORITY_ID=<existing-authorized-uuid>`

@@ -1,86 +1,84 @@
 """
 Dependency injection for FastAPI.
 
-Provides singleton instances of the DARKOrchestrator.
+Provides singleton instances of the dark-core-lib client.
 """
 
 import logging
 from typing import Optional
 
-from dark_orchestrator import DARKOrchestrator
-from dark_orchestrator.config import DARKConfig
-from dark_orchestrator.exceptions import ConfigurationError
+from dark_core_lib import DARKCoreClient, CoreConfig
+from dark_core_lib.exceptions import ConfigurationError
 
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Singleton orchestrator instance
-_orchestrator: Optional[DARKOrchestrator] = None
+# Singleton core client instance
+_corelib_client: Optional[DARKCoreClient] = None
 
 
-def get_orchestrator() -> DARKOrchestrator:
+def get_corelib_client() -> DARKCoreClient:
     """
-    Get the DARKOrchestrator singleton instance.
+    Get the DARKCoreClient singleton instance.
     
     Returns:
-        DARKOrchestrator instance
+        DARKCoreClient instance
         
     Raises:
-        RuntimeError: If orchestrator not initialized
+        RuntimeError: If client not initialized
     """
-    global _orchestrator
-    if _orchestrator is None:
+    global _corelib_client
+    if _corelib_client is None:
         raise RuntimeError(
-            "Orchestrator not initialized. "
-            "Call init_orchestrator() during application startup."
+            "dark-core-lib client not initialized. "
+            "Call init_corelib_client() during application startup."
         )
-    return _orchestrator
+    return _corelib_client
 
 
-def init_orchestrator() -> DARKOrchestrator:
+def init_corelib_client() -> DARKCoreClient:
     """
-    Initialize the DARKOrchestrator singleton.
+    Initialize the DARKCoreClient singleton.
     
     Called during application lifespan startup.
     
     Returns:
-        Initialized DARKOrchestrator
+        Initialized DARKCoreClient
         
     Raises:
         ConfigurationError: If configuration is invalid
     """
-    global _orchestrator
+    global _corelib_client
     
     settings = get_settings()
     settings.validate_blockchain_config()
     
-    logger.info("Initializing DARKOrchestrator...")
+    logger.info("Initializing DARKCoreClient...")
     
-    # Create config for orchestrator
-    config = DARKConfig(
+    config = CoreConfig(
         rpc_url=settings.dark_rpc_url,
         chain_id=settings.dark_chain_id,
-        authority_address=settings.dark_authority_address,
-        dark_address=settings.dark_contract_address,
+        authority_contract_address=settings.dark_authority_address,
+        dark_contract_address=settings.dark_contract_address,
         admin_private_key=settings.dark_admin_private_key,
+        read_only=False,
     )
     
-    _orchestrator = DARKOrchestrator(config)
-    logger.info("DARKOrchestrator initialized successfully")
+    _corelib_client = DARKCoreClient(config)
+    logger.info("DARKCoreClient initialized successfully")
     
-    return _orchestrator
+    return _corelib_client
 
 
-def shutdown_orchestrator() -> None:
+def shutdown_corelib_client() -> None:
     """
-    Cleanup orchestrator on shutdown.
+    Cleanup client on shutdown.
     """
-    global _orchestrator
-    if _orchestrator is not None:
-        logger.info("Shutting down DARKOrchestrator")
-        _orchestrator = None
-
+    global _corelib_client
+    if _corelib_client is not None:
+        logger.info("Shutting down DARKCoreClient")
+        _corelib_client = None
 
 def get_db():
     """

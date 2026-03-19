@@ -7,10 +7,10 @@ from unittest.mock import MagicMock
 from app.models.states import ARKState
 
 
-def test_reserve_ark(client, mock_orchestrator):
+def test_reserve_ark(client, mock_corelib):
     """Test reserving a single ARK."""
     # Mock checks
-    mock_orchestrator.ark_exists.return_value = False
+    mock_corelib.ark_exists.return_value = False
     
     response = client.post(
         "/api/v1/arks",
@@ -58,7 +58,7 @@ def test_batch_reserve(client):
     assert data["results"][1].get("minimal_metadata") is None
 
 
-def test_update_metadata_publish(client, mock_orchestrator):
+def test_update_metadata_publish(client, mock_corelib):
     """Test updating metadata transitions ARK to DRAFT."""
     reserve_response = client.post(
         "/api/v1/arks",
@@ -101,7 +101,7 @@ def test_update_metadata_publish(client, mock_orchestrator):
     assert data["minimal_metadata"]["alternate_identifiers"][0]["value"] == "10.1234/new"
     
     # Publication to chain is handled by the background worker, not this endpoint.
-    mock_orchestrator.create_ark.assert_not_called()
+    mock_corelib.create_ark.assert_not_called()
 
 
 def test_update_rejects_legacy_level1_metadata_field(client):
@@ -179,7 +179,7 @@ def test_update_rejects_top_level_alternate_identifiers(client):
     assert response.status_code == 422
 
 
-def test_delete_tombstone(client, mock_orchestrator):
+def test_delete_tombstone(client, mock_corelib):
     """Test delete (tombstone)."""
     reserve_response = client.post(
         "/api/v1/arks",
@@ -196,7 +196,7 @@ def test_delete_tombstone(client, mock_orchestrator):
     assert response.status_code == 200  # Returns null/void
 
 
-def test_update_metadata_xml_format(client, mock_orchestrator):
+def test_update_metadata_xml_format(client, mock_corelib):
     """Test updating metadata with XML format."""
     reserve_response = client.post(
         "/api/v1/arks",

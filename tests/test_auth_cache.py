@@ -268,8 +268,8 @@ class TestCheckAuthorizationCached:
     """Tests for check_authorization_cached function."""
     
     @pytest.fixture
-    def mock_orchestrator(self):
-        """Create a mock orchestrator."""
+    def mock_corelib(self):
+        """Create a mock corelib_client."""
         mock = MagicMock()
         mock.is_authorized_for_naan.return_value = True
         return mock
@@ -282,7 +282,7 @@ class TestCheckAuthorizationCached:
         yield
         cache_module._auth_cache = None
     
-    def test_cache_miss_queries_blockchain(self, mock_orchestrator):
+    def test_cache_miss_queries_blockchain(self, mock_corelib):
         """Test that cache miss queries the blockchain."""
         with patch('app.utils.auth_cache.get_settings') as mock_settings:
             mock_settings.return_value = MagicMock(
@@ -291,13 +291,13 @@ class TestCheckAuthorizationCached:
             )
             
             result = check_authorization_cached(
-                mock_orchestrator, "auth_1", "12345"
+                mock_corelib, "auth_1", "12345"
             )
             
             assert result is True
-            mock_orchestrator.is_authorized_for_naan.assert_called_once_with("auth_1", "12345")
+            mock_corelib.is_authorized_for_naan.assert_called_once_with("auth_1", "12345")
     
-    def test_cache_hit_skips_blockchain(self, mock_orchestrator):
+    def test_cache_hit_skips_blockchain(self, mock_corelib):
         """Test that cache hit doesn't query blockchain."""
         with patch('app.utils.auth_cache.get_settings') as mock_settings:
             mock_settings.return_value = MagicMock(
@@ -306,18 +306,18 @@ class TestCheckAuthorizationCached:
             )
             
             # First call - cache miss
-            check_authorization_cached(mock_orchestrator, "auth_1", "12345")
+            check_authorization_cached(mock_corelib, "auth_1", "12345")
             
             # Second call - should be cached
-            result = check_authorization_cached(mock_orchestrator, "auth_1", "12345")
+            result = check_authorization_cached(mock_corelib, "auth_1", "12345")
             
             assert result is True
             # Should only be called once (first time)
-            assert mock_orchestrator.is_authorized_for_naan.call_count == 1
+            assert mock_corelib.is_authorized_for_naan.call_count == 1
     
-    def test_blockchain_error_returns_false(self, mock_orchestrator):
+    def test_blockchain_error_returns_false(self, mock_corelib):
         """Test that blockchain errors return False (not cached)."""
-        mock_orchestrator.is_authorized_for_naan.side_effect = Exception("Connection error")
+        mock_corelib.is_authorized_for_naan.side_effect = Exception("Connection error")
         
         with patch('app.utils.auth_cache.get_settings') as mock_settings:
             mock_settings.return_value = MagicMock(
@@ -325,13 +325,13 @@ class TestCheckAuthorizationCached:
                 auth_cache_maxsize=1000
             )
             
-            result = check_authorization_cached(mock_orchestrator, "auth_1", "12345")
+            result = check_authorization_cached(mock_corelib, "auth_1", "12345")
             
             assert result is False
     
-    def test_negative_result_is_cached(self, mock_orchestrator):
+    def test_negative_result_is_cached(self, mock_corelib):
         """Test that negative authorization results are cached."""
-        mock_orchestrator.is_authorized_for_naan.return_value = False
+        mock_corelib.is_authorized_for_naan.return_value = False
         
         with patch('app.utils.auth_cache.get_settings') as mock_settings:
             mock_settings.return_value = MagicMock(
@@ -340,11 +340,11 @@ class TestCheckAuthorizationCached:
             )
             
             # First call
-            result1 = check_authorization_cached(mock_orchestrator, "auth_1", "12345")
+            result1 = check_authorization_cached(mock_corelib, "auth_1", "12345")
             
             # Second call - should be cached
-            result2 = check_authorization_cached(mock_orchestrator, "auth_1", "12345")
+            result2 = check_authorization_cached(mock_corelib, "auth_1", "12345")
             
             assert result1 is False
             assert result2 is False
-            assert mock_orchestrator.is_authorized_for_naan.call_count == 1
+            assert mock_corelib.is_authorized_for_naan.call_count == 1

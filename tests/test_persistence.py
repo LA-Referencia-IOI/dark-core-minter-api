@@ -41,10 +41,10 @@ def _build_update_payload(
     }
 
 
-def test_reserve_ark_persists_to_db(client, test_db, mock_orchestrator):
+def test_reserve_ark_persists_to_db(client, test_db, mock_corelib):
     """Test that reserving an ARK persists to database."""
     # Ensure authorization passes
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     
     response = client.post(
         "/api/v1/arks",
@@ -69,9 +69,9 @@ def test_reserve_ark_persists_to_db(client, test_db, mock_orchestrator):
     assert db_ark.naan == "12345"
 
 
-def test_reserve_ark_uses_counter_sequence(client, mock_orchestrator):
+def test_reserve_ark_uses_counter_sequence(client, mock_corelib):
     """Reserved ARKs should use deterministic sequence values per namespace."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     first = client.post(
         "/api/v1/arks",
         json={"authority_id": "test-uuid", "naan": "12345"},
@@ -94,9 +94,9 @@ def test_reserve_ark_uses_counter_sequence(client, mock_orchestrator):
     assert second_name == expected_second
 
 
-def test_reserve_ark_skips_collided_counter_value(client, test_db, mock_orchestrator):
+def test_reserve_ark_skips_collided_counter_value(client, test_db, mock_corelib):
     """If a generated name already exists, reservation should advance to next counter."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     first_name = _expected_name("12345", 0)
 
     from app.repositories import ARKRepository
@@ -119,10 +119,10 @@ def test_reserve_ark_skips_collided_counter_value(client, test_db, mock_orchestr
     assert name == expected
 
 
-def test_reserve_ark_unauthorized_naan(client, mock_orchestrator):
+def test_reserve_ark_unauthorized_naan(client, mock_corelib):
     """Test that unauthorized NAAN is rejected."""
     # Simulate authorization failure
-    mock_orchestrator.is_authorized_for_naan.return_value = False
+    mock_corelib.is_authorized_for_naan.return_value = False
     
     response = client.post(
         "/api/v1/arks",
@@ -136,9 +136,9 @@ def test_reserve_ark_unauthorized_naan(client, mock_orchestrator):
     assert "not authorized" in response.json()["detail"].lower()
 
 
-def test_update_ark_to_draft(client, test_db, mock_orchestrator):
+def test_update_ark_to_draft(client, test_db, mock_corelib):
     """Test updating ARK from RESERVED to DRAFT."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     
     # 1. Reserve an ARK
     reserve_response = client.post(
@@ -180,9 +180,9 @@ def test_update_ark_to_draft(client, test_db, mock_orchestrator):
     assert db_meta.original_cid is None
 
 
-def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_orchestrator):
+def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_corelib):
     """Updating an ARK already in DRAFT should overwrite pending payload."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     
     # Create a DRAFT ARK directly in DB
     from app.repositories import ARKRepository
@@ -239,7 +239,7 @@ def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_orchestrat
     assert db_meta.original_cid is None
 
 
-def test_update_ark_published_transitions_to_update(client, test_db, mock_orchestrator):
+def test_update_ark_published_transitions_to_update(client, test_db, mock_corelib):
     """Updating a local PUBLISHED ARK should transition it to UPDATE."""
     from app.repositories import ARKRepository
 
@@ -281,13 +281,13 @@ def test_update_ark_published_transitions_to_update(client, test_db, mock_orches
     assert db_meta.original_cid is None
 
 
-def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock_orchestrator):
+def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock_corelib):
     """If ARK is missing in DB but exists on-chain, API imports and queues UPDATE."""
     from types import SimpleNamespace
 
     imported_name = _expected_name("12345", 700)
-    mock_orchestrator.ark_exists.return_value = True
-    mock_orchestrator.get_ark.return_value = SimpleNamespace(
+    mock_corelib.ark_exists.return_value = True
+    mock_corelib.get_ark.return_value = SimpleNamespace(
         naan="12345",
         name=imported_name,
         url="https://chain.example/original",
@@ -361,9 +361,9 @@ def test_tombstone_transition_is_idempotent(test_db):
     assert second.state == ARKState.TOMBSTONE
 
 
-def test_batch_partial_failure(client, test_db, mock_orchestrator):
+def test_batch_partial_failure(client, test_db, mock_corelib):
     """Test batch reservation with some failures."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     
     # Create a conflict by pre-creating an ARK
     from app.repositories import ARKRepository
@@ -400,9 +400,9 @@ def test_batch_partial_failure(client, test_db, mock_orchestrator):
         assert result["ark"].startswith("ark:12345/")
 
 
-def test_batch_partial_failure_preserves_previous_successes(client, test_db, mock_orchestrator):
+def test_batch_partial_failure_preserves_previous_successes(client, test_db, mock_corelib):
     """A failed batch item must not rollback previously successful items."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
 
     with patch(
         "app.api.arks.mint_ark_id",
@@ -438,9 +438,9 @@ def test_batch_partial_failure_preserves_previous_successes(client, test_db, moc
     assert persisted_arks == returned_arks
 
 
-def test_get_ark_from_db(client, test_db, mock_orchestrator):
+def test_get_ark_from_db(client, test_db, mock_corelib):
     """Test getting ARK that only exists in DB (RESERVED/DRAFT)."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     
     # Create ARK in DB with level1 alternate identifiers
     from app.repositories import ARKRepository
@@ -478,9 +478,9 @@ def test_get_ark_from_db(client, test_db, mock_orchestrator):
     assert data["minimal_metadata"]["alternate_identifiers"][0]["schema"] == "doi"
 
 
-def test_tombstone_ark(client, test_db, mock_orchestrator):
+def test_tombstone_ark(client, test_db, mock_corelib):
     """Test tombstoning an ARK."""
-    mock_orchestrator.is_authorized_for_naan.return_value = True
+    mock_corelib.is_authorized_for_naan.return_value = True
     
     # Create ARK
     from app.repositories import ARKRepository
