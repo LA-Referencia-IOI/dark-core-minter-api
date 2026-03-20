@@ -7,6 +7,7 @@ Uses pydantic-settings for environment variable loading and validation.
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,8 +32,14 @@ class Settings(BaseSettings):
     )
     
     # API Server
-    minter_api_host: str = "0.0.0.0"
-    minter_api_port: int = 8001
+    minter_api_host: str = Field(
+        default="0.0.0.0",
+        validation_alias=AliasChoices("MINTER_API_HOST", "CORE_API_HOST"),
+    )
+    minter_api_port: int = Field(
+        default=8001,
+        validation_alias=AliasChoices("MINTER_API_PORT", "CORE_API_PORT"),
+    )
     
     # Batch processing
     batch_size_limit: int = 100

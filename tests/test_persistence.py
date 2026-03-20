@@ -2,6 +2,7 @@
 Additional tests for ARK persistence and error handling.
 """
 
+from types import SimpleNamespace
 import pytest
 from unittest.mock import patch
 from app.models.states import ARKState
@@ -134,6 +135,36 @@ def test_reserve_ark_unauthorized_naan(client, mock_corelib):
     
     assert response.status_code == 403
     assert "not authorized" in response.json()["detail"].lower()
+
+
+def test_reserve_rejects_mismatched_authority_header(client):
+    """Mutating requests must authenticate as the same authority they declare."""
+    response = client.post(
+        "/api/v1/arks",
+        headers={"X-Authority-Id": "other-uuid"},
+        json={
+            "authority_id": "test-uuid",
+            "naan": "12345",
+        },
+    )
+
+    assert response.status_code == 403
+    assert "does not match" in response.json()["detail"].lower()
+
+
+def test_reserve_requires_authority_header_when_mtls_disabled(client):
+    """Local/dev mode must not allow anonymous mutating requests."""
+    response = client.post(
+        "/api/v1/arks",
+        headers={"X-Authority-Id": " "},
+        json={
+            "authority_id": "test-uuid",
+            "naan": "12345",
+        },
+    )
+
+    assert response.status_code == 401
+    assert "authority identity required" in response.json()["detail"].lower()
 
 
 def test_update_ark_to_draft(client, test_db, mock_corelib):
@@ -283,8 +314,6 @@ def test_update_ark_published_transitions_to_update(client, test_db, mock_coreli
 
 def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock_corelib):
     """If ARK is missing in DB but exists on-chain, API imports and queues UPDATE."""
-    from types import SimpleNamespace
-
     imported_name = _expected_name("12345", 700)
     mock_corelib.ark_exists.return_value = True
     mock_corelib.get_ark.return_value = SimpleNamespace(
@@ -293,6 +322,12 @@ def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock
         url="https://chain.example/original",
         cid="cid-chain",
         owner="0xabc",
+    )
+    mock_corelib.get_authority_by_uuid.return_value = SimpleNamespace(
+        uuid="test-uuid",
+        wallet_address="0xabc",
+        naans=["12345"],
+        active=True,
     )
 
     response = client.put(
@@ -320,6 +355,38 @@ def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock
     db_meta = test_db.query(ARKMetadata).filter_by(ark_record_id=db_ark.id).first()
     assert db_meta is not None
     assert db_meta.level1_json["title"] == "Imported then updated"
+
+
+def test_update_import_rejects_non_owner(client, mock_corelib):
+    """Import-on-update must verify the requested authority owns the on-chain ARK."""
+    imported_name = _expected_name("12345", 701)
+    mock_corelib.ark_exists.return_value = True
+    mock_corelib.get_ark.return_value = SimpleNamespace(
+        naan="12345",
+        name=imported_name,
+        url="https://chain.example/original",
+        cid="cid-chain",
+        owner="0xabc",
+    )
+    mock_corelib.get_authority_by_uuid.return_value = SimpleNamespace(
+        uuid="test-uuid",
+        wallet_address="0xdef",
+        naans=["12345"],
+        active=True,
+    )
+
+    response = client.put(
+        f"/api/v1/arks/ark:12345/{imported_name}",
+        json=_build_update_payload(
+            target="https://chain.example/new",
+            title="Unauthorized import",
+            year=2022,
+            original_metadata="<imported>raw</imported>",
+        ),
+    )
+
+    assert response.status_code == 403
+    assert "does not own on-chain ark" in response.json()["detail"].lower()
 
 
 def test_update_to_published_requires_draft_state(test_db):
@@ -502,6 +569,28 @@ def test_tombstone_ark(client, test_db, mock_corelib):
     test_db.refresh(db_ark)
     assert db_ark.state == ARKState.TOMBSTONE
     assert db_ark.tombstoned_at is not None
+
+
+def test_tombstone_rejects_non_owner(client, test_db):
+    """DELETE must enforce ARK ownership."""
+    from app.repositories import ARKRepository
+
+    ark_repo = ARKRepository(test_db)
+    name = _expected_name("12345", 89)
+    ark_repo.create_reserved(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+    )
+    test_db.commit()
+
+    response = client.delete(
+        f"/api/v1/arks/ark:12345/{name}",
+        headers={"X-Authority-Id": "other-uuid"},
+    )
+
+    assert response.status_code == 403
+    assert "does not match" in response.json()["detail"].lower()
 
 
 def test_get_ark_rejects_invalid_checkdigit_when_enabled(client):

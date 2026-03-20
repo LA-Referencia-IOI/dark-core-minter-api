@@ -5,16 +5,57 @@ Validates client certificates when mTLS is enabled.
 """
 
 import logging
+import re
 import ssl
-from typing import Optional, Callable
-from functools import wraps
+from typing import Optional
 
 from fastapi import Request, HTTPException, Depends
-from fastapi.security import HTTPBasic
 
 from app.config import get_settings, Settings
 
 logger = logging.getLogger(__name__)
+
+AUTHORITY_ID_HEADER_CANDIDATES = (
+    "X-Authority-Id",
+    "X-Authority-UUID",
+)
+
+
+def _clean_authority_id(value: Optional[str]) -> Optional[str]:
+    """Normalize authority-id values extracted from headers or cert metadata."""
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _extract_authority_id_from_dn(dn: Optional[str]) -> Optional[str]:
+    """Best-effort extraction of authority identity from certificate subject DN."""
+    if not dn:
+        return None
+
+    for pattern in (
+        r"(?:^|,)\s*UID\s*=\s*([^,]+)",
+        r"(?:^|,)\s*SERIALNUMBER\s*=\s*([^,]+)",
+        r"(?:^|,)\s*CN\s*=\s*([^,]+)",
+    ):
+        match = re.search(pattern, dn, flags=re.IGNORECASE)
+        if match:
+            return _clean_authority_id(match.group(1))
+    return None
+
+
+def extract_authority_id(request: Request, cert_info: Optional[dict] = None) -> Optional[str]:
+    """Extract authority identity from trusted headers or certificate metadata."""
+    for header_name in AUTHORITY_ID_HEADER_CANDIDATES:
+        authority_id = _clean_authority_id(request.headers.get(header_name))
+        if authority_id:
+            return authority_id
+
+    if cert_info:
+        return _extract_authority_id_from_dn(cert_info.get("dn"))
+
+    return None
 
 
 class MTLSAuthenticator:
@@ -132,6 +173,65 @@ async def require_mtls(
             ...
     """
     return await authenticator(request)
+
+
+async def require_authority_identity(
+    request: Request,
+    authenticator: MTLSAuthenticator = Depends(get_mtls_authenticator),
+) -> dict:
+    """
+    Resolve an authenticated authority identity for mutating endpoints.
+
+    Behavior:
+    - When mTLS is enabled: require a valid client certificate and extract the
+      authority ID from trusted headers or the certificate DN.
+    - When mTLS is disabled: require an explicit authority header so requests
+      are not anonymous in local/dev mode.
+    """
+    cert_info = await authenticator(request)
+    authority_id = extract_authority_id(request, cert_info)
+
+    if authority_id:
+        return {
+            "authority_id": authority_id,
+            "auth_mode": "mtls" if authenticator.enabled else "header",
+            "cert": cert_info,
+        }
+
+    if authenticator.enabled:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Authority identity required. Provide a trusted authority header "
+                "or include it in the certificate subject."
+            ),
+        )
+
+    header_names = ", ".join(AUTHORITY_ID_HEADER_CANDIDATES)
+    raise HTTPException(
+        status_code=401,
+        detail=f"Authority identity required. Set one of: {header_names}",
+    )
+
+
+def enforce_authority_match(identity: dict, authority_id: str) -> str:
+    """Ensure the authenticated authority matches the authority declared in the request."""
+    requested = _clean_authority_id(authority_id)
+    authenticated = _clean_authority_id(identity.get("authority_id") if identity else None)
+
+    if not authenticated:
+        raise HTTPException(status_code=401, detail="Missing authenticated authority identity")
+
+    if requested != authenticated:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Authenticated authority '{authenticated}' does not match "
+                f"requested authority '{requested}'"
+            ),
+        )
+
+    return authenticated
 
 
 def create_ssl_context(settings: Settings) -> Optional[ssl.SSLContext]:

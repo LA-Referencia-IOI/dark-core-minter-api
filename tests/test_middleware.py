@@ -7,7 +7,14 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from app.middleware.auth import MTLSAuthenticator, get_mtls_authenticator, require_mtls
+from app.middleware.auth import (
+    MTLSAuthenticator,
+    enforce_authority_match,
+    extract_authority_id,
+    get_mtls_authenticator,
+    require_authority_identity,
+    require_mtls,
+)
 
 
 class TestMTLSAuthenticator:
@@ -194,6 +201,81 @@ class TestRequireMTLS:
         
         # The authenticator should have been called
         mock_authenticator.assert_called_once_with(mock_request)
+
+
+class TestAuthorityIdentityHelpers:
+    """Tests for authority identity extraction and matching helpers."""
+
+    def test_extract_authority_id_from_header(self):
+        request = MagicMock()
+        request.headers = {"X-Authority-Id": "test-uuid"}
+
+        assert extract_authority_id(request) == "test-uuid"
+
+    def test_extract_authority_id_from_dn(self):
+        request = MagicMock()
+        request.headers = {}
+        cert_info = {"dn": "CN=test-client,UID=test-uuid,O=Test Org"}
+
+        assert extract_authority_id(request, cert_info) == "test-uuid"
+
+    def test_enforce_authority_match_success(self):
+        identity = {"authority_id": "test-uuid"}
+
+        assert enforce_authority_match(identity, "test-uuid") == "test-uuid"
+
+    def test_enforce_authority_match_failure(self):
+        identity = {"authority_id": "other-uuid"}
+
+        with pytest.raises(HTTPException) as exc_info:
+            enforce_authority_match(identity, "test-uuid")
+
+        assert exc_info.value.status_code == 403
+
+
+class TestRequireAuthorityIdentity:
+    """Tests for the mutating-endpoint identity dependency."""
+
+    @pytest.mark.asyncio
+    async def test_disabled_requires_header(self):
+        request = MagicMock()
+        request.headers = {"X-Authority-Id": "test-uuid"}
+        authenticator = MagicMock()
+        authenticator.enabled = False
+        authenticator.return_value = AsyncMock(return_value=None)()
+
+        identity = await require_authority_identity(request, authenticator)
+
+        assert identity["authority_id"] == "test-uuid"
+        assert identity["auth_mode"] == "header"
+
+    @pytest.mark.asyncio
+    async def test_disabled_missing_header_raises_401(self):
+        request = MagicMock()
+        request.headers = {}
+        authenticator = MagicMock()
+        authenticator.enabled = False
+        authenticator.return_value = AsyncMock(return_value=None)()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await require_authority_identity(request, authenticator)
+
+        assert exc_info.value.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_enabled_uses_cert_and_dn(self):
+        request = MagicMock()
+        request.headers = {}
+        authenticator = MagicMock()
+        authenticator.enabled = True
+        authenticator.return_value = AsyncMock(
+            return_value={"verified": True, "dn": "CN=test,UID=test-uuid,O=Test Org"}
+        )()
+
+        identity = await require_authority_identity(request, authenticator)
+
+        assert identity["authority_id"] == "test-uuid"
+        assert identity["auth_mode"] == "mtls"
 
 
 class TestMTLSIntegration:

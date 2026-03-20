@@ -26,6 +26,8 @@ services:
     build: *minter-build
     ports:
       - "8001:8001"
+    volumes:
+      - metadata-storage:/app/metadata_storage
     env_file:
       - .env.integration
     depends_on:
@@ -41,7 +43,9 @@ services:
 
   minter-worker:
     build: *minter-build
-    command: ["python", "-m", "app.main_worker"]
+    command: ["worker"]
+    volumes:
+      - metadata-storage:/app/metadata_storage
     env_file:
       - .env.integration
     depends_on:
@@ -57,6 +61,7 @@ services:
 
 volumes:
   postgres-data:
+  metadata-storage:
 
 networks:
   minter-net:

@@ -14,7 +14,11 @@ from dark_core_lib import DARKCoreClient
 
 from app.dependencies import get_corelib_client, get_db, get_metadata_storage
 from app.storage.base import MetadataStorage
-from app.middleware.auth import require_mtls
+from app.middleware.auth import (
+    enforce_authority_match,
+    require_authority_identity,
+    require_mtls,
+)
 from app.utils.noid import mint_ark_id, validate_name_checkdigit
 from app.utils.auth_cache import check_authorization_cached
 from app.models.states import ARKState
@@ -34,6 +38,14 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+def _normalize_wallet(value: Optional[str]) -> Optional[str]:
+    """Normalize wallet addresses for case-insensitive comparison."""
+    if not isinstance(value, str):
+        return None
+    cleaned = value.strip()
+    return cleaned.lower() if cleaned else None
 
 
 def _is_unique_violation(exc: IntegrityError) -> bool:
@@ -71,7 +83,7 @@ def _extract_minimal_metadata(level1_json: Optional[dict]) -> Optional[dict]:
 )
 async def reserve_ark(
     request: ReserveARKRequest,
-    cert_info: dict = Depends(require_mtls),
+    identity: dict = Depends(require_authority_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> ARKResponse:
@@ -80,6 +92,8 @@ async def reserve_ark(
     
     Generates a unique ID and persists in database.
     """
+    enforce_authority_match(identity, request.authority_id)
+
     # 1. Validate authorization (with cache)
     if not check_authorization_cached(corelib_client, request.authority_id, request.naan):
         raise HTTPException(
@@ -169,13 +183,15 @@ async def reserve_ark(
 )
 async def batch_reserve_ark(
     request: ReserveBatchRequest,
-    cert_info: dict = Depends(require_mtls),
+    identity: dict = Depends(require_authority_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> ARKBatchResponse:
     """
     Reserve multiple ARKs with individual error handling.
     """
+    enforce_authority_match(identity, request.authority_id)
+
     # Validate authorization once for the batch (with cache)
     if not check_authorization_cached(corelib_client, request.authority_id, request.naan):
         raise HTTPException(
@@ -370,7 +386,7 @@ async def get_ark(
 async def update_ark_metadata(
     request: UpdateARKMetadataRequest,
     ark: str = Path(..., description="Full ARK identifier"),
-    cert_info: dict = Depends(require_mtls),
+    identity: dict = Depends(require_authority_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
     storage: MetadataStorage = Depends(get_metadata_storage),
@@ -381,6 +397,9 @@ async def update_ark_metadata(
     Stores metadata content immediately via storage backend.
     Does NOT publish to blockchain. That happens in a separate background process.
     """
+    del storage
+    enforce_authority_match(identity, request.authority_id)
+
     # Parse ARK using repository helper
     from app.repositories.ark_repository import parse_ark
     try:
@@ -405,6 +424,28 @@ async def update_ark_metadata(
         except Exception as e:
             logger.error(f"Failed to fetch ARK from blockchain for local import {ark}: {e}")
             raise HTTPException(status_code=502, detail="Failed to read ARK from blockchain")
+
+        try:
+            authority_info = corelib_client.get_authority_by_uuid(request.authority_id)
+        except Exception as e:
+            logger.error(f"Failed to resolve authority {request.authority_id} during import of {ark}: {e}")
+            raise HTTPException(status_code=502, detail="Failed to verify importing authority")
+
+        if not getattr(authority_info, "active", False):
+            raise HTTPException(
+                status_code=403,
+                detail=f"Authority {request.authority_id} is not active",
+            )
+
+        chain_owner = _normalize_wallet(getattr(chain_info, "owner", None))
+        authority_wallet = _normalize_wallet(getattr(authority_info, "wallet_address", None))
+        if not chain_owner or not authority_wallet or chain_owner != authority_wallet:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    f"Authority {request.authority_id} does not own on-chain ARK {ark}"
+                ),
+            )
 
         try:
             with db.begin_nested():
@@ -529,7 +570,7 @@ async def update_ark_metadata(
 )
 async def delete_ark(
     ark: str = Path(..., description="Full ARK identifier"),
-    cert_info: dict = Depends(require_mtls),
+    identity: dict = Depends(require_authority_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> None:
@@ -550,11 +591,9 @@ async def delete_ark(
     
     if not db_ark:
         raise HTTPException(status_code=404, detail="ARK not found")
-    
-    # Validate ownership (extract from cert_info)
-    # Note: cert_info comes from mTLS middleware, contains certificate subject info
-    # For now, we'll allow any authenticated user to tombstone (adjust as needed)
-    # TODO: Extract authority_id from cert and validate ownership
+
+    authenticated_authority = enforce_authority_match(identity, db_ark.authority_id)
+    logger.info(f"Authenticated authority {authenticated_authority} requested tombstone for {ark}")
     
     # Update to TOMBSTONE state
     try:

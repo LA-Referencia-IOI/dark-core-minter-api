@@ -140,6 +140,7 @@ def client(mock_corelib, override_get_db):
     with patch("app.main.init_corelib_client", return_value=mock_corelib):
         with patch("app.database.init_db"):  # Skip DB migrations in tests
             with TestClient(app) as test_client:
+                test_client.headers.update({"X-Authority-Id": "test-uuid"})
                 yield test_client
     
     # Clear overrides after test

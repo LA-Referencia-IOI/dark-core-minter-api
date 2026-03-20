@@ -1,574 +1,631 @@
 # dARK Core Minter API
 
-**REST API service for dARK minting powered by `dark-core-lib`**
+REST API and background worker for ARK reservation, metadata staging, and on-chain publication using `dark-core-lib`.
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)](https://fastapi.tiangolo.com/)
 
 ## Overview
 
-The Core Minter API exposes dARK minting and lifecycle functionality via HTTP/JSON endpoints. It handles the full lifecycle of ARK identifiers:
-- **Reserve**: Generate IDs locally using deterministic DB counters + NOID checkdigit.
-- **Publish/Update**: Persist metadata and publish create/update on blockchain (`draft|update` -> `published`).
-- **Resolve**: Retrieve current state and metadata.
-- **Tombstone**: Deactivate identifiers.
+`dark-core-minter-api` is the service responsible for the minting lifecycle of ARKs in the dARK stack. It does not publish directly on every write request. Instead, it splits the lifecycle into two phases:
 
-## Quick Start
+1. synchronous API work
+   - reserve deterministic ARKs locally
+   - validate and store metadata in PostgreSQL
+   - move ARKs into `DRAFT` or `UPDATE`
+2. asynchronous worker work
+   - persist Level-2 and Level-1 metadata to the configured storage backend
+   - publish `create_ark` or `update_ark` on-chain through `dark-core-lib`
+   - finalize the ARK as `PUBLISHED`
 
-```bash
-# Create virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
+This separation gives us better resilience, simpler retries, and a cleaner operational model.
 
-# Install dependencies
-pip install -r requirements.txt
-pip install -e ../core/dark-core-lib
+## Documentation Map
 
-# Configure
-cp .env.example .env
-# Or, if installed from the root installer, use the generated .env.integration
-# The app prefers .env.integration automatically when it exists.
+Use the docs in this order, depending on what you need:
 
-# Run API with Uvicorn (development)
-uvicorn app.main:app --reload
+- [README.md](./README.md)
+  - operational overview, lifecycle, deployment, config, notebooks
+- [minter-architecture.md](./minter-architecture.md)
+  - technical implementation details, module map, concurrency model, worker internals
+- [notebooks/README.md](./notebooks/README.md)
+  - notebook index, expected environment variables, execution notes
+- [noid.md](./noid.md)
+  - detailed NOID generation rules and rationale
 
-# Run API with Uvicorn (production, multiple API workers)
-uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 4
+## Runtime Architecture
 
-# Run API via CLI entrypoint (equivalent entrypoint)
-dark-core-api
+If you want the implementation-oriented view behind this diagram, continue with [minter-architecture.md](./minter-architecture.md).
 
-# Run worker (singleton, separate process)
-dark-core-worker
+```mermaid
+flowchart LR
+    C["Client or Notebook"] --> API["Minter API (FastAPI)"]
+    API --> DB["PostgreSQL"]
+    API --> CORE["dark-core-lib"]
+    CORE --> CHAIN["Blockchain RPC + Contracts"]
 
-# Check worker process status
-dark-core-worker-status
+    W["Standalone Worker"] --> DB
+    W --> STORE["Metadata Storage\nfilesystem or dark-store-api"]
+    W --> CORE
+
+    DB --> HB["worker_runtime_status"]
+    API --> WS["GET /api/v1/worker/status"]
+    WS --> HB
 ```
 
-### Docker Integration with `dark-env`
+## Main Responsibilities
 
-For a clean local integration, keep blockchain and minter in separate compose
-projects and attach the minter services to the external Docker network
-`dark-net` created by `dark-env`.
+- API process
+  - reserves ARKs deterministically
+  - validates authority and NAAN authorization
+  - validates Level-1 metadata
+  - stores Level-1 and Level-2 metadata in PostgreSQL
+  - exposes health and worker status
+- Worker process
+  - claims `DRAFT` and `UPDATE` records in batches
+  - persists metadata to the configured storage backend
+  - publishes create/update transactions through `dark-core-lib`
+  - handles retries, backoff, and permanent failures
+- PostgreSQL
+  - source of truth for local lifecycle state
+  - stores reserved IDs, metadata, retry status, and worker heartbeat
+- Metadata storage backend
+  - stores raw Level-2 content and the publishable Level-1 JSON
+- Blockchain
+  - final public state for ARK registration and updates
 
-1. Start blockchain first:
+## End-to-End Flow
 
-```bash
-cd /Users/lmatas/source/dark-developer/components/blockchain/dark-env
-docker compose up -d
+```mermaid
+sequenceDiagram
+    participant Client as "Client"
+    participant API as "Minter API"
+    participant DB as "PostgreSQL"
+    participant Worker as "Worker"
+    participant Store as "Metadata Storage"
+    participant Core as "dark-core-lib"
+    participant Chain as "Blockchain"
+
+    Client->>API: POST /api/v1/arks
+    API->>DB: reserve ARK locally (state=RESERVED)
+    API-->>Client: 201 ark:NAAN/name
+
+    Client->>API: PUT /api/v1/arks/{ark}
+    API->>DB: store L1 + L2, move to DRAFT/UPDATE
+    API-->>Client: 200 pending publication
+
+    Worker->>DB: claim pending ARKs
+    Worker->>Store: store Level-2 metadata
+    Worker->>Store: store Level-1 metadata with embedded Level-2 CID
+    Worker->>Core: create_ark or update_ark
+    Core->>Chain: signed transaction
+    Worker->>DB: mark ARK as PUBLISHED
 ```
 
-2. Then start minter:
+## ARK Lifecycle
 
-```bash
-cd /Users/lmatas/source/dark-developer/components/services/dark-core-minter-api
-docker compose up -d
+### State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> RESERVED: POST /api/v1/arks
+    RESERVED --> DRAFT: PUT /api/v1/arks/{ark}
+    DRAFT --> DRAFT: overwrite pending create
+    DRAFT --> PUBLISHED: worker create_ark
+    PUBLISHED --> UPDATE: PUT /api/v1/arks/{ark}
+    UPDATE --> UPDATE: overwrite pending update
+    UPDATE --> PUBLISHED: worker update_ark
+    RESERVED --> TOMBSTONE: DELETE /api/v1/arks/{ark}
+    DRAFT --> TOMBSTONE: DELETE /api/v1/arks/{ark}
+    UPDATE --> TOMBSTONE: DELETE /api/v1/arks/{ark}
+    PUBLISHED --> TOMBSTONE: DELETE /api/v1/arks/{ark}
+    TOMBSTONE --> TOMBSTONE: idempotent delete
 ```
 
-In this mode:
-- `minter-api` and `minter-worker` read `./.env.integration`
-- the RPC endpoint is overridden inside Docker to `http://rpc01:8545`
-- notebooks continue to call the API from the host at `http://localhost:8001`
+### What Each State Means
 
-API supports both execution styles:
-- Direct Uvicorn: `uvicorn app.main:app ...`
-- CLI script: `dark-core-api`
+- `RESERVED`
+  - ARK exists only in the local database.
+  - No blockchain transaction has happened yet.
+- `DRAFT`
+  - metadata is staged locally and waiting for `create_ark` publication.
+- `UPDATE`
+  - ARK already exists on-chain and has a pending metadata update.
+- `PUBLISHED`
+  - the latest Level-1 CID has been published on-chain.
+- `TOMBSTONE`
+  - the ARK is locally deactivated in the minter.
+  - today this is a local lifecycle state, not an on-chain tombstone transaction.
 
-### Using `dark-store-api` as Metadata Backend
+## Detailed Flows
 
-If you want metadata persistence through `dark-store-api`:
+### 1. Reserve
 
-```bash
-# 1) Run dark-store-api
-cd /Users/lmatas/source/dark/dark-store-api
-uvicorn app.main:app --host 0.0.0.0 --port 8002
+A reserve call generates a deterministic name using a namespace counter and NOID encoding.
 
-# 2) Configure minter storage backend
-cd /Users/lmatas/source/dark/dark-core-minter-api
-export METADATA_STORAGE_TYPE=store_api
-export METADATA_STORE_API_URL=http://localhost:8002
-export METADATA_STORE_API_TIMEOUT_SECONDS=10.0
+```mermaid
+sequenceDiagram
+    participant Client as "Client"
+    participant API as "POST /api/v1/arks"
+    participant Auth as "Authorization Cache + Core"
+    participant Counter as "NoidCounterRepository"
+    participant DB as "PostgreSQL"
+
+    Client->>API: reserve(authority_id, naan)
+    API->>Auth: is authority authorized for NAAN?
+    Auth-->>API: yes/no
+    API->>Counter: allocate next counter for namespace
+    Counter->>DB: UPDATE ... RETURNING next_value
+    DB-->>Counter: counter
+    API->>API: mint ark:NAAN/name
+    API->>DB: INSERT ark_records(state=RESERVED)
+    API-->>Client: 201 Created
 ```
 
-With this setup, `PUT /api/v1/arks/{ark}` stores Level-1/Level-2 metadata in PostgreSQL (`ark_metadata`), and the worker persists both payloads to the configured storage backend (`filesystem` or `dark-store-api`) before publishing.
+Important points:
+- ARKs are reserved locally first.
+- The namespace key is `NAAN + shoulder`.
+- The name format is `{shoulder}{generated_part}{checkdigit}`.
+- A uniqueness collision is retried with a new counter value.
 
-## API Endpoints
+### 2. Update Metadata
+
+`PUT /api/v1/arks/{ark}` does not publish immediately. It stores metadata locally and prepares the record for the worker.
+
+```mermaid
+sequenceDiagram
+    participant Client as "Client"
+    participant API as "PUT /api/v1/arks/{ark}"
+    participant DB as "PostgreSQL"
+    participant Chain as "Blockchain"
+
+    Client->>API: target + minimal_metadata + original_metadata
+    API->>API: validate ARK + checkdigit + authority ownership
+    alt ARK exists locally
+        API->>DB: update metadata and state
+    else ARK missing locally
+        API->>Chain: check if ARK exists on-chain
+        API->>DB: import local record if owner matches authority
+        API->>DB: move to UPDATE
+    end
+    API-->>Client: 200 pending worker publication
+```
+
+Important points:
+- `minimal_metadata` is the validated Level-1 JSON payload.
+- `original_metadata` is the raw Level-2 payload.
+- For `RESERVED -> DRAFT`, the `target` URL is required.
+- If an ARK exists on-chain but not locally, the minter can import it into the local DB before staging an update.
+- The import path now validates that the blockchain owner matches the authority making the request.
+
+### 3. Async Publish
+
+The worker is the only component that writes metadata to the backend and publishes blockchain transactions.
+
+```mermaid
+sequenceDiagram
+    participant Worker as "ARKPublisher"
+    participant Repo as "ARKRepository"
+    participant DB as "PostgreSQL"
+    participant Store as "Metadata Storage"
+    participant Core as "dark-core-lib"
+    participant Chain as "Blockchain"
+
+    Worker->>Repo: get_drafts_pending_publish(limit)
+    Repo->>DB: SELECT ... FOR UPDATE SKIP LOCKED
+    Repo->>DB: mark publish_last_attempt_at
+    Worker->>DB: commit claim
+
+    loop each claimed ARK
+        Worker->>Store: store Level-2 content
+        Store-->>Worker: level2_cid
+        Worker->>Store: store Level-1 JSON with level2_cid embedded
+        Store-->>Worker: level1_cid
+        Worker->>Repo: persist CIDs in DB
+        alt state is DRAFT
+            Worker->>Core: create_ark(..., cid=level1_cid)
+        else state is UPDATE
+            Worker->>Core: update_ark(..., cid=level1_cid)
+        end
+        Core->>Chain: signed tx
+        Worker->>Repo: update_to_published
+        Worker->>DB: commit
+    end
+```
+
+Important points:
+- storage and blockchain publication happen in the worker, not in the request thread.
+- Level-2 is stored first.
+- Level-1 is then re-serialized with the embedded Level-2 CID.
+- the blockchain stores the Level-1 CID as the canonical pointer.
+
+### 4. Tombstone
+
+`DELETE /api/v1/arks/{ark}` performs a local tombstone transition.
+
+```mermaid
+flowchart LR
+    A["DELETE /api/v1/arks/{ark}"] --> B["validate authority identity"]
+    B --> C["validate local ownership"]
+    C --> D["set local state to TOMBSTONE"]
+    D --> E["return tombstoned record"]
+```
+
+Important points:
+- the endpoint now validates local ownership before allowing the tombstone.
+- the current behavior is local to the minter database.
+- this is not yet a blockchain-level revocation or deactivation flow.
+
+## Metadata Model
+
+The service manages two levels of metadata.
+
+```mermaid
+flowchart TD
+    L2["Level-2 original_metadata\nXML, JSON, text, raw payload"] --> CID2["stored in backend -> original_cid"]
+    L1["Level-1 minimal_metadata\nvalidated JSON"] --> EMBED["inject original_metadata.cid"]
+    CID2 --> EMBED
+    EMBED --> CID1["stored in backend -> level1_cid"]
+    CID1 --> CHAIN["published on-chain"]
+```
+
+- Level-1
+  - validated JSON
+  - canonical publish payload
+  - includes the pointer to Level-2
+- Level-2
+  - original raw payload as submitted by the client
+  - can be XML, JSON, or other supported text content
+- PostgreSQL stores both payloads before publication.
+- The storage backend stores the immutable content addressed versions.
+
+## Worker Model and Concurrency
+
+### Singleton Strategy
+
+```mermaid
+flowchart TD
+    S["worker start"] --> P["pidfile guard"]
+    P --> L["PostgreSQL advisory lock"]
+    L -->|lock acquired| R["scheduler loop"]
+    L -->|lock denied| X["abort startup"]
+    R --> H["persist heartbeat in worker_runtime_status"]
+    H --> API["/api/v1/worker/status"]
+```
+
+The worker uses two protections:
+- local pidfile guard
+- PostgreSQL advisory lock derived from `WORKER_RUNTIME_NAME`
+
+### Publish Concurrency Strategy
+
+```mermaid
+flowchart LR
+    A["Reserve counter"] --> B["atomic counter allocation"]
+    C["Pending publish claim"] --> D["FOR UPDATE SKIP LOCKED"]
+    E["Finalize publish"] --> F["CAS transition to PUBLISHED"]
+    G["Retry tracking"] --> H["DB-backed retry count + backoff"]
+```
+
+This gives us:
+- deterministic reservation without duplicate names in normal PostgreSQL deployment
+- worker-safe claim of pending ARKs
+- compare-and-set style final state transitions
+- retry tracking that survives restarts
+
+## API Surface
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/api/v1/arks` | POST | Reserve new ARK ID |
-| `/api/v1/arks/batch` | POST | Batch reserve ARK IDs (requires `client_item_id` for correlation) |
-| `/api/v1/arks/{ark}` | GET | Get ARK details |
-| `/api/v1/arks/{ark}` | PUT | Update two-level metadata (`minimal_metadata` + `original_metadata`) & transition to DRAFT/UPDATE |
-| `/api/v1/arks/{ark}` | DELETE | Tombstone/Deactivate ARK |
-| `/api/v1/authority/{uuid}` | GET | Get authority info |
-| `/api/v1/authority/{uuid}/naans` | GET | List authority NAANs |
-| `/api/v1/authority/{uuid}/authorized/{naan}` | GET | Check authority NAAN authorization |
-| `/api/v1/worker/status` | GET | Standalone worker status via DB heartbeat |
-| `/health` | GET | Health check (DB, blockchain, storage) |
+| `/api/v1/arks` | `POST` | Reserve one ARK |
+| `/api/v1/arks/batch` | `POST` | Reserve multiple ARKs |
+| `/api/v1/arks/{ark}` | `GET` | Resolve ARK state and metadata |
+| `/api/v1/arks/{ark}` | `PUT` | Stage metadata and move to `DRAFT` or `UPDATE` |
+| `/api/v1/arks/{ark}` | `DELETE` | Tombstone an ARK locally |
+| `/api/v1/authority/{uuid}` | `GET` | Fetch authority details |
+| `/api/v1/authority/{uuid}/naans` | `GET` | List authorized NAANs |
+| `/api/v1/authority/{uuid}/authorized/{naan}` | `GET` | Check NAAN authorization |
+| `/api/v1/worker/status` | `GET` | Read worker heartbeat and counters |
+| `/health` | `GET` | Check database, blockchain, and storage wiring |
 
-When `MINTER_NOID_CHECKDIGIT=true`, API operations that receive an ARK (`GET/PUT/DELETE`) validate the trailing checkdigit. IDs without valid checkdigit return `400`.
+## Authentication and Authorization
+
+### Current Behavior
+
+- Mutating endpoints
+  - `POST /api/v1/arks`
+  - `POST /api/v1/arks/batch`
+  - `PUT /api/v1/arks/{ark}`
+  - `DELETE /api/v1/arks/{ark}`
+- When `MTLS_ENABLED=false`
+  - the caller must send `X-Authority-Id` or `X-Authority-UUID`
+  - that identity must match the `authority_id` in the request body when applicable
+- When `MTLS_ENABLED=true`
+  - the request must pass the mTLS gate
+  - the service also resolves authority identity from trusted request data
+- Authorization checks are performed against `dark-core-lib` and cached locally for NAAN authorization decisions.
+
+### Important Operational Note
+
+The current codebase supports local developer mode with header-based authority identity when mTLS is disabled. That is useful for notebooks and local stacks, but production deployments should put the service behind a trusted TLS terminator or enforce stronger identity guarantees.
 
 ## NOID Scheme
 
 Current policy:
-
-- Alphabet: `0-9bcdfghjkmnpqrstvwxz` (base29).
-- Namespace counter key: `"{NAAN}:{SHOULDER}"`.
-- Generated-part length: fixed `7`.
-- Checkdigit: enabled by default (`MINTER_NOID_CHECKDIGIT=true`).
-- Name format: `{shoulder}{counter_part}{checkdigit}`.
+- alphabet: `0-9bcdfghjkmnpqrstvwxz` (base29)
+- generated-part length: `7`
+- checkdigit: enabled by default
+- namespace key: `"{NAAN}:{SHOULDER}"`
 
 Capacity per namespace:
+- `29^7 = 17,249,876,309` generated identifiers
 
-- Formula: `29^7`.
-- Result: `17,249,876,309` IDs per namespace.
-- Checkdigit does not reduce this capacity because it is appended.
+Detailed algorithm notes: [noid.md](./noid.md)
 
-Detailed spec and implementation notes: [`noid.md`](./noid.md)
+## Data Model Summary
 
-## Documentation
+```mermaid
+erDiagram
+    ARK_RECORDS {
+        int id PK
+        string naan
+        string name
+        string state "R,D,U,P,T"
+        string authority_id
+        string target
+        int publish_retry_count
+        datetime publish_last_attempt_at
+        boolean publish_permanently_failed
+    }
 
-Once running, visit:
-- Swagger UI: `http://localhost:8001/docs`
-- ReDoc: `http://localhost:8001/redoc`
-- Full architecture (Mermaid): [`minter-architecture.md`](./minter-architecture.md)
+    ARK_METADATA {
+        int id PK
+        int ark_record_id FK
+        json level1_json
+        string level1_cid
+        text original_content
+        string original_schema
+        string original_cid
+    }
 
-### Feature-Focused Notebooks
+    NOID_COUNTERS {
+        string namespace_key PK
+        bigint next_value
+    }
 
-Feature-specific notebooks:
-- [`notebooks/minter_01_smoke_authority.ipynb`](./notebooks/minter_01_smoke_authority.ipynb): service smoke and authority checks.
-- [`notebooks/minter_02_reserve_validation.ipynb`](./notebooks/minter_02_reserve_validation.ipynb): single reserve, validation, checkdigit behavior.
-- [`notebooks/minter_03_update_metadata_formats.ipynb`](./notebooks/minter_03_update_metadata_formats.ipynb): two-level metadata update to `DRAFT`, overwrite scenarios, and validation checks.
-- [`notebooks/minter_04_tombstone_missing.ipynb`](./notebooks/minter_04_tombstone_missing.ipynb): tombstone lifecycle and missing-record operations.
-- [`notebooks/minter_05_batch_concurrency.ipynb`](./notebooks/minter_05_batch_concurrency.ipynb): batch reserve and concurrent reserve uniqueness.
-- [`notebooks/minter_06_worker_publish_update.ipynb`](./notebooks/minter_06_worker_publish_update.ipynb): worker-driven publish/update flow.
-- [`notebooks/minter_07_chain_import_optional.ipynb`](./notebooks/minter_07_chain_import_optional.ipynb): optional on-chain import path (`EXISTING_CHAIN_ARK`).
+    WORKER_RUNTIME_STATUS {
+        string worker_name PK
+        string status
+        datetime last_heartbeat_at
+        int total_processed
+        int total_succeeded
+        int total_failed
+    }
+```
 
-See [`notebooks/README.md`](./notebooks/README.md) for execution notes and environment variables.
+## Quick Start
 
-## Configuration Guide
-
-### Quick Setup
+### Inside `dark-developer`
 
 ```bash
-# Copy the example configuration
-cp .env.example .env
-
-# Edit with your settings
-nano .env  # or your preferred editor
+cd /Users/lmatas/source/dark-developer
+source venv/bin/activate
+pip install -r components/services/dark-core-minter-api/requirements.txt
+pip install -e components/core/dark-core-lib
+pip install -e components/services/dark-core-minter-api
 ```
 
-### Configuration Reference
+### Standalone Local Development
 
-All settings are configured via environment variables or an env file. The app
-prefers `.env.integration` when present and falls back to `.env`.
-
-#### 🌐 API Server
-
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `CORE_API_HOST` | Host address to bind | `0.0.0.0` | No |
-| `CORE_API_PORT` | Port number | `8001` | No |
-| `BATCH_SIZE_LIMIT` | Max items per batch request | `100` | No |
-
-#### ⛓️ Blockchain Connection
-
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `DARK_RPC_URL` | Blockchain RPC endpoint | `http://localhost:8545` | **Yes** |
-| `DARK_CHAIN_ID` | Chain ID | `1337` | **Yes** |
-| `DARK_AUTHORITY_ADDRESS` | Authority contract address | - | **Yes** |
-| `DARK_CONTRACT_ADDRESS` | dARK contract address | - | **Yes** |
-| `DARK_ADMIN_PRIVATE_KEY` | Admin private key for signing | - | **Yes** |
-
-#### 🏷️ Minter Identity
-
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `MINTER_SHOULDER` | Unique prefix for ARK generation (e.g., `x`, `s1`, `test`) | `""` | No |
-| `MINTER_NOID_LENGTH` | Generated-part length for NOID counter (operated as fixed) | `7` | No |
-| `MINTER_NOID_CHECKDIGIT` | Append and enforce trailing NOID checkdigit | `true` | No |
-
-> **Note**: The shoulder helps identify ARKs from this minter instance. Use different shoulders for different environments (dev, staging, prod).
-> **Note**: Current policy uses fixed generated-part length `7`.
-
-#### 🗄️ Database
-
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `DATABASE_URL` | Database connection string | `postgresql://dark:dark_password@localhost:5432/minter` | No |
-| `DATABASE_ECHO` | Enable SQL query logging | `false` | No |
-| `DATABASE_POOL_SIZE` | Connection pool size | `5` | No |
-| `DATABASE_MAX_OVERFLOW` | Max overflow connections | `10` | No |
-
-**Recommended (PostgreSQL):**
-```env
-DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter
-DATABASE_POOL_SIZE=10
-DATABASE_MAX_OVERFLOW=20
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e ../dark-core-lib
 ```
 
-#### ⚡ Authorization Cache
+### Run API and Worker Manually
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `AUTH_CACHE_TTL` | Cache time-to-live in seconds | `60` | No |
-| `AUTH_CACHE_MAXSIZE` | Maximum cache entries | `1000` | No |
+```bash
+# API
+uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 
-> **Note**: The cache is thread-safe and reduces blockchain queries for NAAN authorization checks.
+# Worker
+python -m app.main_worker run
 
-#### 🔄 Async Worker
+# Worker status helper
+dark-core-worker-status
+```
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `WORKER_ENABLED` | Enable standalone worker process | `true` | No |
-| `WORKER_INTERVAL_SECONDS` | Cycle interval | `60` | No |
-| `WORKER_BATCH_SIZE` | ARKs per cycle | `10` | No |
-| `WORKER_MAX_RETRIES` | Max retries before failure | `5` | No |
-| `WORKER_RETRY_BACKOFF_BASE` | Exponential backoff base (seconds) | `2.0` | No |
-| `WORKER_RUNTIME_NAME` | Worker identity for heartbeat row | `ark-publisher` | No |
-| `WORKER_HEARTBEAT_INTERVAL_SECONDS` | Heartbeat write interval | `10` | No |
-| `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` | Stale threshold used by API status | `180` | No |
+## Docker Deployment in the Monorepo
 
-#### 📦 Metadata Storage
+The recommended local stack uses separate compose projects:
+- blockchain in `components/blockchain/dark-env`
+- minter in `components/services/dark-core-minter-api`
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `METADATA_STORAGE_TYPE` | Backend type: `filesystem` or `store_api` | `filesystem` | No |
-| `METADATA_STORAGE_PATH` | Path for filesystem storage | `./metadata_storage` | No |
-| `METADATA_STORE_API_URL` | Base URL for `dark-store-api` backend | `http://localhost:8002` | No |
-| `METADATA_STORE_API_TIMEOUT_SECONDS` | HTTP timeout for storage calls | `10.0` | No |
+```mermaid
+flowchart LR
+    ENV["dark-env compose"] --> NET["dark-net"]
+    MINTER["minter compose"] --> NET
+    MINTER --> PG["postgres"]
+    MINTER --> API["minter-api"]
+    MINTER --> W["minter-worker"]
+```
 
-#### 🔐 Security (mTLS)
+### Start Order
 
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `MTLS_ENABLED` | Enable mutual TLS authentication | `false` | No |
-| `TLS_CERT_FILE` | Server certificate path | - | If mTLS enabled |
-| `TLS_KEY_FILE` | Server private key path | - | If mTLS enabled |
-| `TLS_CA_FILE` | CA certificate for client validation | - | If mTLS enabled |
+```bash
+cd /Users/lmatas/source/dark-developer/components/blockchain/dark-env
+docker compose up -d
 
-### Example Configurations
+cd /Users/lmatas/source/dark-developer/components/services/dark-core-minter-api
+docker compose up -d --build
+```
 
-#### Development Environment
+### Docker Notes
+
+- `minter-api` and `minter-worker` join the external `dark-net` network.
+- inside Docker, `DARK_RPC_URL` is overridden to `http://rpc01:8545`.
+- PostgreSQL runs as a sibling service in the same compose project.
+- `minter-api` and `minter-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage`.
+- `.env.integration` is preferred automatically when present.
+
+## Metadata Backends
+
+### Filesystem
+
+Use this for local development and simple integration tests.
 
 ```env
-# .env for local development
-CORE_API_HOST=127.0.0.1
-CORE_API_PORT=8001
-
-# Local blockchain (Ganache/Hardhat)
-DARK_RPC_URL=http://localhost:8545
-DARK_CHAIN_ID=1337
-DARK_AUTHORITY_ADDRESS=0xYourAuthorityAddress
-DARK_CONTRACT_ADDRESS=0xYourContractAddress
-DARK_ADMIN_PRIVATE_KEY=0xYourPrivateKey
-
-# Development minter
-MINTER_SHOULDER=dev
-MINTER_NOID_LENGTH=7
-MINTER_NOID_CHECKDIGIT=true
-
-# PostgreSQL local
-DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter_dev
-DATABASE_ECHO=true
-
-# Faster worker for testing
-WORKER_ENABLED=true
-WORKER_INTERVAL_SECONDS=10
-WORKER_BATCH_SIZE=5
-
-# Local storage
 METADATA_STORAGE_TYPE=filesystem
-METADATA_STORAGE_PATH=./metadata_dev
-# METADATA_STORE_API_URL=http://localhost:8002
-
-# No mTLS in development
-MTLS_ENABLED=false
+METADATA_STORAGE_PATH=./metadata_storage
 ```
 
-#### Production Environment
+### `dark-store-api`
+
+Use this when you want metadata persistence delegated to a dedicated external service.
 
 ```env
-# .env for production
-CORE_API_HOST=0.0.0.0
-CORE_API_PORT=8001
-
-# Production blockchain
-DARK_RPC_URL=https://your-rpc-endpoint.com
-DARK_CHAIN_ID=12345
-DARK_AUTHORITY_ADDRESS=0xProductionAuthorityAddress
-DARK_CONTRACT_ADDRESS=0xProductionContractAddress
-DARK_ADMIN_PRIVATE_KEY=0xProductionPrivateKey  # Use secrets manager!
-
-# Production minter identity
-MINTER_SHOULDER=prod
-MINTER_NOID_LENGTH=7
-MINTER_NOID_CHECKDIGIT=true
-
-# PostgreSQL
-DATABASE_URL=postgresql://dark_user:secure_password@db.example.com:5432/minter_prod
-DATABASE_POOL_SIZE=20
-DATABASE_MAX_OVERFLOW=30
-
-# Higher cache for production load
-AUTH_CACHE_TTL=120
-AUTH_CACHE_MAXSIZE=5000
-
-# Production worker settings
-WORKER_ENABLED=true
-WORKER_INTERVAL_SECONDS=30
-WORKER_BATCH_SIZE=50
-WORKER_MAX_RETRIES=10
-
-# dark-store-api for production metadata persistence
 METADATA_STORAGE_TYPE=store_api
-METADATA_STORE_API_URL=http://dark-store-api:8002
+METADATA_STORE_API_URL=http://localhost:8002
 METADATA_STORE_API_TIMEOUT_SECONDS=10.0
-
-# Enable mTLS
-MTLS_ENABLED=true
-TLS_CERT_FILE=/etc/certs/server.crt
-TLS_KEY_FILE=/etc/certs/server.key
-TLS_CA_FILE=/etc/certs/ca.crt
 ```
 
-#### Docker Environment
+In that mode:
+- the API still stores Level-1 and Level-2 payloads in PostgreSQL first
+- the worker sends the payloads to `dark-store-api`
+- the returned CIDs are persisted locally and then published on-chain
 
-```env
-# .env for Docker deployment
-CORE_API_HOST=0.0.0.0
-CORE_API_PORT=8001
+## Configuration
 
-DARK_RPC_URL=http://besu:8545
-DARK_CHAIN_ID=1337
-DARK_AUTHORITY_ADDRESS=0xContainerAuthorityAddress
-DARK_CONTRACT_ADDRESS=0xContainerContractAddress
-DARK_ADMIN_PRIVATE_KEY=0xContainerPrivateKey
+The app prefers `.env.integration` over `.env`.
 
-MINTER_SHOULDER=docker
-MINTER_NOID_LENGTH=7
-MINTER_NOID_CHECKDIGIT=true
+### Core Runtime
 
-# PostgreSQL container
-DB_PASSWORD=dark_password
-DATABASE_URL=postgresql://dark:dark_password@postgres:5432/minter
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MINTER_API_HOST` | API bind host | `0.0.0.0` |
+| `MINTER_API_PORT` | API bind port | `8001` |
+| `BATCH_SIZE_LIMIT` | Max items per batch reserve request | `100` |
+| `WORKER_ENABLED` | Enable standalone worker | `true` |
+| `WORKER_INTERVAL_SECONDS` | Publish cycle interval | `60` |
+| `WORKER_BATCH_SIZE` | ARKs per worker cycle | `10` |
+| `WORKER_MAX_RETRIES` | Retry attempts before permanent failure | `5` |
+| `WORKER_RUNTIME_NAME` | Logical worker identity | `ark-publisher` |
 
-# Metadata storage backend
-METADATA_STORAGE_TYPE=store_api
-METADATA_STORE_API_URL=http://store-api:8002
-```
+Backward compatibility aliases still accepted:
+- `CORE_API_HOST`
+- `CORE_API_PORT`
 
-### Validation
+### Blockchain
 
-The application validates configuration on startup:
+| Variable | Description |
+|----------|-------------|
+| `DARK_RPC_URL` | RPC endpoint |
+| `DARK_CHAIN_ID` | Chain id |
+| `DARK_AUTHORITY_ADDRESS` | Authority contract address |
+| `DARK_CONTRACT_ADDRESS` | dARK contract address |
+| `DARK_ADMIN_PRIVATE_KEY` | Admin signer private key |
 
-1. **Blockchain config**: `DARK_AUTHORITY_ADDRESS`, `DARK_CONTRACT_ADDRESS`, `DARK_ADMIN_PRIVATE_KEY` are required
-2. **mTLS config**: If `MTLS_ENABLED=true`, all TLS certificate paths must be set
-3. **Database**: Connection is tested during startup
-
-If validation fails, the application will exit with a descriptive error message.
-
-## Architecture
-
-### ARK Lifecycle
-
-The Minter API manages ARKs through the following states:
-
-1. **RESERVED**: ARK ID generated and reserved locally
-   - Created via `POST /api/v1/arks`
-   - Counter allocation comes from DB table `noid_counters` (namespace = `NAAN + shoulder`)
-   - Generated name uses base29 encoding with trailing checkdigit (default on)
-   - Generated-part length is fixed to `7` (`29^7` per namespace)
-   - No blockchain interaction yet
-   - Can be batch reserved with `POST /api/v1/arks/batch`
-
-2. **DRAFT**: Metadata staged, ready for publication
-   - Transition via `PUT /api/v1/arks/{ark}`
-   - Requires `target`, `minimal_metadata` (validated JSON), `original_metadata` (raw content), and `metadata_schema`
-   - `alternate_identifiers` and `alternate_urls` must be inside `minimal_metadata` (not as top-level request fields)
-   - If `target` is missing/empty, the request is rejected and state remains `RESERVED` (no DRAFT transition)
-   - Metadata is stored in DB first (`ark_metadata`); CIDs are assigned later by worker
-   - Authorization validated before transition
-   - Async worker picks up and executes on-chain `create_ark`
-
-3. **UPDATE**: Existing published ARK pending on-chain update
-   - Triggered by `PUT /api/v1/arks/{ark}` when local state is `PUBLISHED`/`UPDATE`
-   - Also used when ARK is missing in DB but exists on-chain (record is imported first)
-   - Async worker picks up and executes on-chain `update_ark`
-
-4. **PUBLISHED**: Published to blockchain with finalized L1 CID
-   - Automated by async worker
-   - Worker stores L2 first, injects L2 CID into L1, then stores L1
-   - ARK registered on blockchain via `dark-core-lib`
-   - `ark_metadata.level1_cid` points to the published L1 CID
-
-5. **TOMBSTONE**: ARK deactivated
-   - Soft delete via `DELETE /api/v1/arks/{ark}`
-   - Retains historical record
-
-### Async Worker
-
-The publisher worker runs as a separate process (`dark-core-worker`) and publishes pending ARKs (`DRAFT` and `UPDATE`) to the blockchain:
-
-- **Trigger**: Runs on interval (default: every 60 seconds)
-- **Processing**: FIFO order (oldest drafts first)
-- **Batch Size**: Configurable (default: 10 ARKs per cycle)
-- **Error Handling**: 
-  - Independent transactions per ARK (one failure doesn't affect others)
-  - PostgreSQL row claim with `FOR UPDATE SKIP LOCKED` to avoid duplicate processing
-  - State transitions use DB compare-and-set (`UPDATE ... WHERE state=...`) to prevent lost updates
-  - Publish retry counters are incremented atomically in SQL
-  - `DRAFT` records call on-chain `create_ark`; `UPDATE` records call on-chain `update_ark`
-  - Exponential backoff for retriable errors (network, gas, etc.)
-  - Permanent failure for authority errors (unauthorized, invalid NAAN)
-  - Max retries before marking as permanently failed (default: 5)
-- **Deployment**: Run as singleton service/container (separate from API) with PostgreSQL advisory lock (`pg_try_advisory_lock`) plus local pidfile guard
-- **Monitoring**: API reads DB heartbeat at `GET /api/v1/worker/status`
-
-### Metadata Storage
-
-The service uses two-level metadata:
-
-- **L1 (`minimal_metadata`)**: validated JSON document used as canonical publish payload.
-- **L2 (`original_metadata`)**: original raw record provided by client (XML/JSON/text).
-- Alternate IDs/URLs are persisted in `ark_metadata.level1_json`, not in `ark_records`.
-
-Write flow:
-
-1. API validates L1 and stores L1+L2 in `ark_metadata` (DB).
-2. Worker stores L2 to storage backend -> gets `level2_cid`.
-3. Worker injects `level2_cid` into L1 and stores L1 -> gets `level1_cid`.
-4. Worker updates DB and publishes using `level1_cid` (`ark_records.metadata_cid`).
-
-Storage backends:
-
-- **Filesystem** (development): local content-addressed store.
-- **dark-store-api**: external store via `/v1/store`.
-
-Switch backends via `METADATA_STORAGE_TYPE`.
+These values are required for a functional blockchain-connected deployment.
 
 ### Database
 
-- **All environments**: PostgreSQL (`DATABASE_URL`)
-- **Migrations**: Automatic via Alembic on startup
-- **Schema**: Tracks full ARK lifecycle with publish retry tracking
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | PostgreSQL connection string | `postgresql://dark:dark_password@localhost:5432/minter` |
+| `DATABASE_ECHO` | SQL echo logging | `false` |
+| `DATABASE_POOL_SIZE` | Pool size | `5` |
+| `DATABASE_MAX_OVERFLOW` | Overflow connections | `10` |
 
-### Authorization Cache
+### Metadata Storage
 
-The API includes a thread-safe LRU cache for NAAN authorization checks:
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `METADATA_STORAGE_TYPE` | `filesystem` or `store_api` | `filesystem` |
+| `METADATA_STORAGE_PATH` | Local storage path | `./metadata_storage` |
+| `METADATA_STORE_API_URL` | External store base URL | `http://localhost:8002` |
+| `METADATA_STORE_API_TIMEOUT_SECONDS` | Store API timeout | `10.0` |
 
-- **TTL**: 60 seconds (configurable via `AUTH_CACHE_TTL`)
-- **Max Size**: 1000 entries (configurable via `AUTH_CACHE_MAXSIZE`)
-- **Thread-Safety**: Uses `threading.Lock` for safe concurrent access with multiple workers
-- **Benefits**: Reduces blockchain queries and improves latency for batch operations
+### NOID and Identity
 
-## mTLS Configuration
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MINTER_SHOULDER` | Prefix for generated names | `""` |
+| `MINTER_NOID_LENGTH` | Generated-part length | `7` |
+| `MINTER_NOID_CHECKDIGIT` | Append and validate checkdigit | `true` |
+| `AUTH_CACHE_TTL` | NAAN authorization cache TTL | `60` |
+| `AUTH_CACHE_MAXSIZE` | Authorization cache max entries | `1000` |
 
-For production, enable mTLS by setting in `.env`:
+### TLS and mTLS
 
-```env
-MTLS_ENABLED=true
-TLS_CERT_FILE=/path/to/server.crt
-TLS_KEY_FILE=/path/to/server.key
-TLS_CA_FILE=/path/to/ca.crt
-```
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MTLS_ENABLED` | Enable mTLS gate | `false` |
+| `TLS_CERT_FILE` | Server certificate path | - |
+| `TLS_KEY_FILE` | Server private key path | - |
+| `TLS_CA_FILE` | CA certificate path | - |
+
+## Useful URLs
+
+Once the service is running:
+- Swagger UI: `http://localhost:8001/docs`
+- ReDoc: `http://localhost:8001/redoc`
+- Health: `http://localhost:8001/health`
+- Worker status: `http://localhost:8001/api/v1/worker/status`
+
+## Notebooks
+
+The notebooks directory contains both focused notebooks and a simpler consolidated integration notebook.
+
+- [notebooks/minter_api_test.ipynb](./notebooks/minter_api_test.ipynb)
+  - recommended single entry notebook for end-to-end testing
+- [notebooks/minter_01_smoke_authority.ipynb](./notebooks/minter_01_smoke_authority.ipynb)
+- [notebooks/minter_02_reserve_validation.ipynb](./notebooks/minter_02_reserve_validation.ipynb)
+- [notebooks/minter_03_update_metadata_formats.ipynb](./notebooks/minter_03_update_metadata_formats.ipynb)
+- [notebooks/minter_04_tombstone_missing.ipynb](./notebooks/minter_04_tombstone_missing.ipynb)
+- [notebooks/minter_05_batch_concurrency.ipynb](./notebooks/minter_05_batch_concurrency.ipynb)
+- [notebooks/minter_06_worker_publish_update.ipynb](./notebooks/minter_06_worker_publish_update.ipynb)
+- [notebooks/minter_07_chain_import_optional.ipynb](./notebooks/minter_07_chain_import_optional.ipynb)
+
+See [notebooks/README.md](./notebooks/README.md) for execution notes and environment variables.
 
 ## Troubleshooting
 
-### Worker Issues
+### ARKs remain in `DRAFT` or `UPDATE`
 
-**Worker not processing ARKs:**
-1. Check worker is enabled: `WORKER_ENABLED=true`
-2. Verify the standalone worker process/container is running
-3. Run `dark-core-worker-status` (or `python -m app.main_worker status`)
-4. Check API status endpoint: `GET /api/v1/worker/status`
-5. Check logs for errors
-6. Verify ARKs are in DRAFT state (not RESERVED or permanently failed)
-7. If logs show `Worker advisory lock already held`, stop the other worker instance or use a different `WORKER_RUNTIME_NAME`
+Check, in this order:
+1. worker process or container is running
+2. `GET /api/v1/worker/status` shows a fresh heartbeat
+3. blockchain connectivity is healthy
+4. storage backend is reachable and writable
+5. the ARK has not reached permanent failure state
 
-**ARKs stuck in DRAFT:**
-1. Check worker logs for recent errors
-2. Look for authority errors (indicates unauthorized NAAN)
-3. Check if max retries exceeded (ARK marked as permanently failed)
-4. Verify blockchain connectivity in health check
+### Worker refuses to start
 
-**Reset permanently failed ARK:**
-```python
-# Use ARKRepository.reset_publish_tracking(ark) to clear error state
-# Then worker will retry on next cycle
-```
+Likely causes:
+- another worker still holds the PostgreSQL advisory lock
+- a stale pidfile exists
+- the database is unreachable
+- blockchain configuration is incomplete
 
-### Database Migrations
+### Requests are rejected with `401` or `403`
 
-**Apply migrations manually:**
-```bash
-source .venv/bin/activate
-alembic upgrade head
-```
+Check:
+- `X-Authority-Id` or `X-Authority-UUID` is present in local dev mode
+- the header identity matches the request body `authority_id`
+- the authority is authorized for the requested NAAN
+- for updates imported from chain, the authority wallet matches the on-chain owner
 
-**Create new migration:**
-```bash
-alembic revision -m "description"
-```
+### Metadata is not visible where expected
 
-### Health Check
+Remember the split responsibility:
+- API stores payloads in PostgreSQL first
+- worker stores immutable payloads in the configured backend later
+- on filesystem backend, API and worker must share the same storage volume or directory
 
-Check all components:
-```bash
-curl http://localhost:8001/health
-```
+## Related Docs
 
-Response includes:
-- `blockchain_connected`: Blockchain RPC connectivity
-- `database`: Database health
-- `metadata_storage`: Storage backend health
-
-## Testing
-
-For PostgreSQL test runs, use the helper script:
-
-```bash
-./run_tests_postgres.sh
-```
-
-By default, pytest now uses local SQLite test DB (`tests/.test_minter.sqlite`) when `TEST_DATABASE_URL` is not set.
-
-Run all tests explicitly:
-```bash
-python3 -m pytest -q
-```
-
-Run specific test categories:
-```bash
-# Persistence tests
-python3 -m pytest tests/test_persistence.py -q
-
-# Storage tests
-python3 -m pytest tests/test_storage.py -q
-
-# Cache thread-safety tests
-python3 -m pytest tests/test_auth_cache.py -q
-
-# mTLS middleware tests
-python3 -m pytest tests/test_middleware.py -q
-
-# Worker tests
-python3 -m pytest tests/test_worker.py tests/test_worker_unit.py tests/test_main_worker_lock.py -q
-```
-
-### Test Coverage
-
-| Module | Coverage |
-|--------|----------|
-| `storage/filesystem.py` | Store, retrieve, health check, concurrency |
-| `utils/auth_cache.py` | TTL, eviction, thread-safety |
-| `middleware/auth.py` | mTLS enabled/disabled, cert validation |
-| `workers/publisher.py` | Batch processing, retry logic, error handling |
-| `repositories/ark_repository.py` | Full CRUD, state transitions |
-| `main_worker.py` | Worker singleton advisory lock behavior |
-
-## License
-
-GPL-3.0
+- [noid.md](./noid.md)
+- [minter-architecture.md](./minter-architecture.md)
+- [notebooks/README.md](./notebooks/README.md)

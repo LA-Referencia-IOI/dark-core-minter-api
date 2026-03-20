@@ -18,10 +18,12 @@ RUN pip install --no-cache-dir -r /tmp/requirements.txt \
 COPY services/dark-core-minter-api/app/ ./app/
 COPY services/dark-core-minter-api/alembic/ ./alembic/
 COPY services/dark-core-minter-api/alembic.ini .
+COPY services/dark-core-minter-api/docker-entrypoint.sh /usr/local/bin/minter-entrypoint
 
 # Create non-root user and set ownership
-RUN useradd -m appuser && chown -R appuser:appuser /app
-USER appuser
+RUN useradd -m appuser \
+    && chown -R appuser:appuser /app \
+    && chmod +x /usr/local/bin/minter-entrypoint
 
 # Environment
 ENV PYTHONUNBUFFERED=1
@@ -31,5 +33,7 @@ ENV DATABASE_URL=postgresql://dark:dark_password@postgres:5432/minter
 # Expose port
 EXPOSE 8001
 
-# Default command runs API only (worker runs in separate process/service)
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "4"]
+ENTRYPOINT ["minter-entrypoint"]
+
+# Default command runs API only (worker runs in separate process/service).
+CMD ["api"]
