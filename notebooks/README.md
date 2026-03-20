@@ -1,6 +1,6 @@
 # Minter API Test Notebooks
 
-This folder contains a complete end-to-end notebook plus feature-focused notebooks.
+This folder contains one unified notebook for day-to-day validation plus feature-focused notebooks for deeper exploration.
 
 Contract note:
 - `alternate_identifiers` / `alternate_urls` are part of `minimal_metadata` in `PUT /api/v1/arks/{ark}`.
@@ -9,7 +9,8 @@ Contract note:
 ## Notebook Index
 
 - `minter_api_test.ipynb`
-  - Full end-to-end functional flow (original consolidated notebook).
+  - Recommended starting point.
+  - Unified, simpler integration flow covering smoke checks, authority bootstrap, reserve/get, update, batch, tombstone, and optional worker/chain-import sections.
 
 - `minter_01_smoke_authority.ipynb`
   - Service smoke checks (`/health`, `/worker/status`) and authority endpoint checks.
@@ -32,6 +33,9 @@ Contract note:
 - `minter_07_chain_import_optional.ipynb`
   - Optional local import path for pre-existing on-chain ARKs (`EXISTING_CHAIN_ARK`) followed by UPDATE with two-level metadata.
 
+Use `minter_api_test.ipynb` first when you want a single understandable walkthrough.
+Use the numbered notebooks when you need to isolate one behavior or debug a narrower flow.
+
 ## Shared Environment Variables
 
 All notebooks read the same runtime variables from the first setup cell:
@@ -42,6 +46,7 @@ All notebooks read the same runtime variables from the first setup cell:
 - `NAAN` (default: `12345`)
 - `REGISTER_AUTHORITY` (default: `true`)
 - `EXISTING_CHAIN_ARK` (default: empty; used only in `minter_07_chain_import_optional.ipynb`)
+- `UNAUTHORIZED_NAAN` (default: `99999`)
 - `POLL_INTERVAL_SECONDS` (default: `2`)
 - `POLL_TIMEOUT_SECONDS` (default: `90`)
 
