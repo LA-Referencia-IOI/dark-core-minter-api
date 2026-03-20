@@ -34,4 +34,4 @@ pytest==9.0.2
 pytest-asyncio==1.3.0
 
 # Local core library (install in editable mode)
-# pip install -e ../core/dark-core-lib
+# pip install -e ../libraries/dark-core-lib

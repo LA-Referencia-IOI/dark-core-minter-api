@@ -10,7 +10,7 @@ RUN apt-get update \
 # Example:
 # docker build -f services/dark-core-minter-api/Dockerfile -t dark-core-minter-api .
 COPY services/dark-core-minter-api/requirements.txt /tmp/requirements.txt
-COPY core/dark-core-lib /tmp/dark-core-lib
+COPY libraries/dark-core-lib /tmp/dark-core-lib
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && pip install --no-cache-dir /tmp/dark-core-lib
 

@@ -411,7 +411,7 @@ erDiagram
 cd /Users/lmatas/source/dark-developer
 source venv/bin/activate
 pip install -r components/services/dark-core-minter-api/requirements.txt
-pip install -e components/core/dark-core-lib
+pip install -e components/libraries/dark-core-lib
 pip install -e components/services/dark-core-minter-api
 ```
 
