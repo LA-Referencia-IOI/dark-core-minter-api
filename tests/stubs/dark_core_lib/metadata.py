@@ -116,8 +116,6 @@ class StoreApiMetadataStorage(MetadataStorage):
 
     def store_document(self, content: bytes, content_type: str, schema: Optional[str] = None) -> str:
         headers = {"Content-Type": content_type}
-        if schema:
-            headers["X-Metadata-Schema"] = schema
         try:
             response = httpx.post(
                 f"{self.base_url}/v1/store",
@@ -149,8 +147,7 @@ class StoreApiMetadataStorage(MetadataStorage):
             detail = response.json().get("detail", f"HTTP {response.status_code}")
             raise StorageError(f"Store API retrieve failed ({response.status_code}): {detail}")
 
-        content_type = response.headers.get("content-type", "application/octet-stream").split(";", 1)[0].strip()
-        return StoredDocument(content=response.content, content_type=content_type)
+        return StoredDocument(content=response.content, content_type="application/octet-stream")
 
     def health_check(self) -> bool:
         try:
@@ -167,6 +164,7 @@ class StoreApiMetadataStorage(MetadataStorage):
 
 class OriginalMetadataRef(BaseModel):
     schema_: str = Field(..., alias="schema")
+    media_type: str
     cid: Optional[str] = None
 
     model_config = {"populate_by_name": True}
@@ -199,6 +197,18 @@ class MetadataService:
     def store_level2(self, content: bytes, content_type: str, schema: Optional[str] = None) -> str:
         return self.storage.store_document(content=content, content_type=content_type, schema=schema)
 
+    def load_level1(self, level1_cid: str) -> Level1Metadata:
+        document = self.storage.get_document(level1_cid)
+        return Level1Metadata.model_validate_json(document.content)
+
+    def load_level2(self, level1: Level1Metadata) -> StoredDocument:
+        document = self.storage.get_document(level1.original_metadata.cid)
+        return StoredDocument(
+            content=document.content,
+            content_type=level1.original_metadata.media_type,
+            schema=level1.original_metadata.schema_,
+        )
+
     def with_level2_reference(self, level1: dict, level2_cid: str) -> Level1Metadata:
         payload = dict(level1)
         original_metadata = dict(payload.get("original_metadata") or {})
@@ -224,7 +234,7 @@ def get_metadata_storage(storage_type: str = "filesystem", **kwargs) -> Metadata
         return FileSystemMetadataStorage(kwargs.get("storage_path", "./metadata_storage"))
     if normalized == "store_api":
         return StoreApiMetadataStorage(
-            kwargs.get("store_api_url", "http://localhost:8002"),
+            kwargs.get("store_api_url", "http://localhost:8003"),
             timeout_seconds=kwargs.get("timeout_seconds", 10.0),
         )
     raise ValueError(f"Unsupported storage type: {storage_type}")

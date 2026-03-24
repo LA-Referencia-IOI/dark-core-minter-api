@@ -40,7 +40,11 @@ def _level1_payload(title: str = "Test Title", year: int = 2024, schema: str = "
         "title": title,
         "authors": ["Test Author"],
         "year": year,
-        "original_metadata": {"schema": schema, "cid": None},
+        "original_metadata": {
+            "schema": schema,
+            "media_type": "application/xml",
+            "cid": None,
+        },
     }
 
 

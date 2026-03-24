@@ -77,7 +77,11 @@ class MockMetadataRecord:
             "title": "My Resource",
             "authors": ["Doe, Jane"],
             "year": 2024,
-            "original_metadata": {"schema": original_schema, "cid": None},
+            "original_metadata": {
+                "schema": original_schema,
+                "media_type": original_media_type,
+                "cid": None,
+            },
         }
         self.original_content = original_content
         self.original_schema = original_schema

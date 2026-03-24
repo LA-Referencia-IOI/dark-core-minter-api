@@ -231,7 +231,7 @@ WORKER_HEARTBEAT_STALE_AFTER_SECONDS=180
 # Metadata storage backend
 METADATA_STORAGE_TYPE=store_api
 METADATA_STORAGE_PATH=./metadata_storage
-METADATA_STORE_API_URL=http://localhost:8002
+METADATA_STORE_API_URL=http://localhost:8003
 METADATA_STORE_API_TIMEOUT_SECONDS=10.0
 
 # Authorization cache
@@ -268,7 +268,7 @@ Main suites:
 - `tests/test_auth_cache.py`
 - `tests/test_middleware.py`
 
-Recent full regression result: `107 passed`.
+Recent full regression result: `121 passed`.
 
 ## 11. Migrations
 

@@ -65,9 +65,9 @@ class Settings(BaseSettings):
     worker_heartbeat_stale_after_seconds: int = 180
     
     # Metadata Storage Configuration
-    metadata_storage_type: str = "filesystem"  # "filesystem" or "store_api"
+    metadata_storage_type: str = "store_api"  # "filesystem" or "store_api"
     metadata_storage_path: str = "./metadata_storage"  # Path for filesystem storage
-    metadata_store_api_url: str = "http://localhost:8002"
+    metadata_store_api_url: str = "http://localhost:8003"
     metadata_store_api_timeout_seconds: float = 10.0
     
     # Minter Configuration

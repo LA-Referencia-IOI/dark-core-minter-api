@@ -97,7 +97,7 @@ class UpdateARKMetadataRequest(BaseModel):
         ...,
         description="Schema type of the original metadata (dublin_core, datacite, etc.)"
     )
-    metadata_media_type: Optional[str] = Field(
-        None,
-        description="Optional MIME type for the original metadata (application/xml, application/json, etc.)",
+    metadata_media_type: str = Field(
+        ...,
+        description="MIME type for the original metadata (application/xml, application/json, etc.)",
     )

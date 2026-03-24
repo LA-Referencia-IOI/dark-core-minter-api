@@ -87,6 +87,7 @@ def test_update_metadata_publish(client, mock_corelib):
             },
             "original_metadata": "<raw>metadata</raw>",
             "metadata_schema": "dublin_core",
+            "metadata_media_type": "application/xml",
         }
     )
     
@@ -128,6 +129,7 @@ def test_update_rejects_legacy_level1_metadata_field(client):
             },
             "original_metadata": "<raw>legacy</raw>",
             "metadata_schema": "dublin_core",
+            "metadata_media_type": "application/xml",
         },
     )
 
@@ -172,6 +174,7 @@ def test_update_rejects_top_level_alternate_identifiers(client):
             },
             "original_metadata": "<raw>metadata</raw>",
             "metadata_schema": "dublin_core",
+            "metadata_media_type": "application/xml",
             "alternate_identifiers": [{"schema": "doi", "value": "10.1234/new"}],
         },
     )
@@ -222,6 +225,7 @@ def test_update_metadata_xml_format(client, mock_corelib):
             },
             "original_metadata": xml_metadata,
             "metadata_schema": "oai_dc",
+            "metadata_media_type": "application/xml",
         }
     )
     

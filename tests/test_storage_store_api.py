@@ -45,102 +45,103 @@ class TestStoreApiMetadataStorage:
     def test_factory_creates_store_api_backend(self):
         storage = get_metadata_storage(
             "store_api",
-            store_api_url="http://store-api:8002",
+            store_api_url="http://store-api:8003",
             timeout_seconds=1.5,
         )
 
         assert isinstance(storage, StoreApiMetadataStorage)
-        assert storage.base_url == "http://store-api:8002"
+        assert storage.base_url == "http://store-api:8003"
         assert storage.timeout_seconds == 1.5
 
-    def test_store_metadata_returns_cid(self):
-        storage = StoreApiMetadataStorage("http://store-api:8002", timeout_seconds=3.0)
+    def test_store_document_returns_cid(self):
+        storage = StoreApiMetadataStorage("http://store-api:8003", timeout_seconds=3.0)
 
         with patch("dark_core_lib.metadata.httpx.post") as mock_post:
             mock_post.return_value = _response(
                 "POST",
-                "http://store-api:8002/v1/store",
+                "http://store-api:8003/v1/store",
                 200,
-                json_payload={"cid": "bafy-test", "size": 10, "content_type": "application/json"},
+                json_payload={"cid": "bafy-test", "size": 10},
             )
 
-            cid = storage.store_metadata('{"title":"demo"}', "json")
+            cid = storage.store_document(b'{"title":"demo"}', "application/json", schema="datacite")
 
         assert cid == "bafy-test"
         mock_post.assert_called_once()
         call_args = mock_post.call_args
-        assert call_args.args[0] == "http://store-api:8002/v1/store"
+        assert call_args.args[0] == "http://store-api:8003/v1/store"
         assert call_args.kwargs["timeout"] == 3.0
         assert call_args.kwargs["headers"]["Content-Type"] == "application/json"
+        assert "X-Metadata-Schema" not in call_args.kwargs["headers"]
 
-    def test_store_metadata_raises_on_error_status(self):
-        storage = StoreApiMetadataStorage("http://store-api:8002")
+    def test_store_document_raises_on_error_status(self):
+        storage = StoreApiMetadataStorage("http://store-api:8003")
 
         with patch("dark_core_lib.metadata.httpx.post") as mock_post:
             mock_post.return_value = _response(
                 "POST",
-                "http://store-api:8002/v1/store",
+                "http://store-api:8003/v1/store",
                 500,
                 json_payload={"detail": "backend failed"},
             )
 
             with pytest.raises(StorageError, match="Store API store failed"):
-                storage.store_metadata('{"title":"demo"}', "json")
+                storage.store_document(b'{"title":"demo"}', "application/json")
 
-    def test_store_metadata_raises_on_request_error(self):
-        storage = StoreApiMetadataStorage("http://store-api:8002")
+    def test_store_document_raises_on_request_error(self):
+        storage = StoreApiMetadataStorage("http://store-api:8003")
 
         with patch("dark_core_lib.metadata.httpx.post") as mock_post:
             mock_post.side_effect = httpx.RequestError(
                 "network down",
-                request=httpx.Request("POST", "http://store-api:8002/v1/store"),
+                request=httpx.Request("POST", "http://store-api:8003/v1/store"),
             )
 
             with pytest.raises(StorageError, match="Store API request failed"):
-                storage.store_metadata('{"title":"demo"}', "json")
+                storage.store_document(b'{"title":"demo"}', "application/json")
 
-    def test_get_metadata_returns_content_and_format(self):
-        storage = StoreApiMetadataStorage("http://store-api:8002", timeout_seconds=2.0)
+    def test_get_document_returns_raw_content(self):
+        storage = StoreApiMetadataStorage("http://store-api:8003", timeout_seconds=2.0)
 
         with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.return_value = _response(
                 "GET",
-                "http://store-api:8002/v1/retrieve/cid-1",
+                "http://store-api:8003/v1/retrieve/cid-1",
                 200,
                 content="<record>ok</record>",
-                headers={"content-type": "text/xml; charset=utf-8"},
+                headers={"content-type": "application/octet-stream"},
             )
 
-            content, fmt = storage.get_metadata("cid-1")
+            document = storage.get_document("cid-1")
 
-        assert content == "<record>ok</record>"
-        assert fmt == "xml"
+        assert document.content == b"<record>ok</record>"
+        assert document.content_type == "application/octet-stream"
         mock_get.assert_called_once_with(
-            "http://store-api:8002/v1/retrieve/cid-1",
+            "http://store-api:8003/v1/retrieve/cid-1",
             timeout=2.0,
         )
 
-    def test_get_metadata_not_found(self):
-        storage = StoreApiMetadataStorage("http://store-api:8002")
+    def test_get_document_not_found(self):
+        storage = StoreApiMetadataStorage("http://store-api:8003")
 
         with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.return_value = _response(
                 "GET",
-                "http://store-api:8002/v1/retrieve/missing",
+                "http://store-api:8003/v1/retrieve/missing",
                 404,
                 json_payload={"detail": "not found"},
             )
 
             with pytest.raises(MetadataNotFoundError):
-                storage.get_metadata("missing")
+                storage.get_document("missing")
 
     def test_health_check_returns_true_when_backend_healthy(self):
-        storage = StoreApiMetadataStorage("http://store-api:8002")
+        storage = StoreApiMetadataStorage("http://store-api:8003")
 
         with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.return_value = _response(
                 "GET",
-                "http://store-api:8002/health",
+                "http://store-api:8003/health",
                 200,
                 json_payload={"status": "healthy", "backend_healthy": True},
             )
@@ -148,12 +149,12 @@ class TestStoreApiMetadataStorage:
             assert storage.health_check() is True
 
     def test_health_check_returns_false_on_request_error(self):
-        storage = StoreApiMetadataStorage("http://store-api:8002")
+        storage = StoreApiMetadataStorage("http://store-api:8003")
 
         with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.side_effect = httpx.RequestError(
                 "connection refused",
-                request=httpx.Request("GET", "http://store-api:8002/health"),
+                request=httpx.Request("GET", "http://store-api:8003/health"),
             )
 
             assert storage.health_check() is False

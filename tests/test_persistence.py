@@ -27,6 +27,7 @@ def _build_update_payload(
     year: int = 2024,
     metadata_schema: str = "dublin_core",
     original_metadata: str = "<raw>metadata</raw>",
+    metadata_media_type: str = "application/xml",
 ) -> dict:
     """Build a valid two-level metadata update payload."""
     return {
@@ -39,6 +40,7 @@ def _build_update_payload(
         },
         "original_metadata": original_metadata,
         "metadata_schema": metadata_schema,
+        "metadata_media_type": metadata_media_type,
     }
 
 
@@ -206,6 +208,7 @@ def test_update_ark_to_draft(client, test_db, mock_corelib):
     assert db_meta is not None
     assert db_meta.original_schema == "dublin_core"
     assert db_meta.level1_json["title"] == "Test Resource"
+    assert db_meta.level1_json["original_metadata"]["media_type"] == "application/xml"
     assert db_meta.level1_json["original_metadata"]["cid"] is None
     assert db_meta.level1_cid is None
     assert db_meta.original_cid is None
@@ -234,7 +237,11 @@ def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_corelib):
             "title": "Old title",
             "authors": ["Old Author"],
             "year": 2021,
-            "original_metadata": {"schema": "dublin_core", "cid": None},
+            "original_metadata": {
+                "schema": "dublin_core",
+                "media_type": "application/xml",
+                "cid": None,
+            },
         },
         original_content="<old>raw</old>",
         original_schema="dublin_core",
@@ -527,7 +534,11 @@ def test_get_ark_from_db(client, test_db, mock_corelib):
             "authors": ["Test Author"],
             "year": 2024,
             "alternate_identifiers": [{"schema": "doi", "value": "10.1234/test"}],
-            "original_metadata": {"schema": "dublin_core", "cid": None},
+            "original_metadata": {
+                "schema": "dublin_core",
+                "media_type": "application/xml",
+                "cid": None,
+            },
         },
         original_content="<raw>metadata</raw>",
         original_schema="dublin_core",

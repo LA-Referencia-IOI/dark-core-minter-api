@@ -97,7 +97,7 @@ sequenceDiagram
 
     Worker->>DB: claim pending ARKs
     Worker->>Store: store Level-2 metadata
-    Worker->>Store: store Level-1 metadata with embedded Level-2 CID
+    Worker->>Store: store Level-1 metadata with embedded L2 reference
     Worker->>Core: create_ark or update_ark
     Core->>Chain: signed transaction
     Worker->>DB: mark ARK as PUBLISHED
@@ -220,7 +220,7 @@ sequenceDiagram
     loop each claimed ARK
         Worker->>Store: store Level-2 content
         Store-->>Worker: level2_cid
-        Worker->>Store: store Level-1 JSON with level2_cid embedded
+        Worker->>Store: store Level-1 JSON with schema + media_type + level2_cid
         Store-->>Worker: level1_cid
         Worker->>Repo: persist CIDs in DB
         alt state is DRAFT
@@ -237,7 +237,7 @@ sequenceDiagram
 Important points:
 - storage and blockchain publication happen in the worker, not in the request thread.
 - Level-2 is stored first.
-- Level-1 is then re-serialized with the embedded Level-2 CID.
+- Level-1 is then re-serialized with the embedded Level-2 reference: `schema`, `media_type`, and `cid`.
 - the blockchain stores the Level-1 CID as the canonical pointer.
 - the shared implementation of this pipeline now lives in `dark_core_lib.metadata.MetadataService`.
 
@@ -265,7 +265,7 @@ The service manages two levels of metadata.
 ```mermaid
 flowchart TD
     L2["Level-2 original_metadata\nXML, JSON, text, raw payload"] --> CID2["stored in backend -> original_cid"]
-    L1["Level-1 minimal_metadata\nvalidated JSON"] --> EMBED["inject original_metadata.cid"]
+    L1["Level-1 minimal_metadata\nvalidated JSON"] --> EMBED["inject original_metadata.{schema, media_type, cid}"]
     CID2 --> EMBED
     EMBED --> CID1["stored in backend -> level1_cid"]
     CID1 --> CHAIN["published on-chain"]
@@ -478,7 +478,7 @@ docker compose up -d --build
 
 ### Filesystem
 
-Use this for local development and simple integration tests.
+Use this only for local development and simple fallback scenarios.
 
 ```env
 METADATA_STORAGE_TYPE=filesystem
@@ -491,15 +491,16 @@ Use this when you want metadata persistence delegated to a dedicated external se
 
 ```env
 METADATA_STORAGE_TYPE=store_api
-METADATA_STORE_API_URL=http://localhost:8002
+METADATA_STORE_API_URL=http://localhost:8003
 METADATA_STORE_API_TIMEOUT_SECONDS=10.0
 ```
 
 In that mode:
 - the API still stores Level-1 and Level-2 payloads in PostgreSQL first
-- the worker sends the payloads to `dark-store-api`
+- the worker sends raw Level-2 bytes and Level-1 JSON to `dark-store-api`
 - the returned CIDs are persisted locally and then published on-chain
 - the resolver must point at the same `dark-store-api` instance to resolve `?info` and `?metadata`
+- `L1.original_metadata` carries the Level-2 `schema`, `media_type`, and internal `cid`
 
 ## Configuration
 
@@ -547,9 +548,9 @@ These values are required for a functional blockchain-connected deployment.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `METADATA_STORAGE_TYPE` | `filesystem` or `store_api` | `filesystem` |
+| `METADATA_STORAGE_TYPE` | `filesystem` or `store_api` | `store_api` |
 | `METADATA_STORAGE_PATH` | Local storage path | `./metadata_storage` |
-| `METADATA_STORE_API_URL` | External store base URL | `http://localhost:8002` |
+| `METADATA_STORE_API_URL` | External store base URL | `http://localhost:8003` |
 | `METADATA_STORE_API_TIMEOUT_SECONDS` | Store API timeout | `10.0` |
 
 ### NOID and Identity

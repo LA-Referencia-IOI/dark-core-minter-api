@@ -4,7 +4,6 @@ ARK Native REST Endpoints.
 Implements the ARK lifecycle: reserved -> draft -> published -> tombstone.
 """
 
-import json
 import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Path
@@ -71,31 +70,6 @@ def _extract_minimal_metadata(level1_json: Optional[dict]) -> Optional[dict]:
     if not isinstance(level1_json, dict):
         return None
     return level1_json
-
-
-def _infer_original_media_type(
-    content: str,
-    explicit_media_type: Optional[str],
-    metadata_schema: str,
-) -> str:
-    """Infer the media type for the original metadata payload."""
-    if explicit_media_type and explicit_media_type.strip():
-        return explicit_media_type.split(";", 1)[0].strip().lower()
-
-    stripped = content.lstrip()
-    if stripped.startswith("<"):
-        return "application/xml"
-
-    try:
-        json.loads(content)
-        return "application/json"
-    except Exception:
-        pass
-
-    if metadata_schema in {"dublin_core", "jats", "openaire4", "oai_dc"}:
-        return "application/xml"
-
-    return "text/plain"
 
 
 @router.post(
@@ -364,6 +338,9 @@ async def get_ark(
                     metadata_cid=info.cid,  # From blockchain
                     metadata_schema=metadata_schema,  # From DB
                     minimal_metadata=minimal_metadata,
+                    level1_cid=db_metadata.level1_cid if db_metadata else None,
+                    level2_cid=db_metadata.original_cid if db_metadata else None,
+                    client_item_id=db_ark.client_item_id,
                 )
             except Exception as e:
                 # Blockchain query failed, return DB data
@@ -375,6 +352,9 @@ async def get_ark(
                     metadata_cid=metadata_cid,
                     metadata_schema=metadata_schema,
                     minimal_metadata=minimal_metadata,
+                    level1_cid=db_metadata.level1_cid if db_metadata else None,
+                    level2_cid=db_metadata.original_cid if db_metadata else None,
+                    client_item_id=db_ark.client_item_id,
                 )
         elif db_ark.state == ARKState.TOMBSTONE:
             # Tombstoned
@@ -511,6 +491,7 @@ async def update_ark_metadata(
         # Set original_metadata reference (CID is null until worker processes it)
         l1_data["original_metadata"] = {
             "schema": request.metadata_schema,
+            "media_type": request.metadata_media_type.split(";", 1)[0].strip().lower(),
             "cid": None
         }
         
@@ -528,11 +509,7 @@ async def update_ark_metadata(
     # We do NOT store to IPFS here. The worker will do that.
     level1_json = l1_model.model_dump(mode="json", by_alias=True)
     try:
-        original_media_type = _infer_original_media_type(
-            request.original_metadata,
-            request.metadata_media_type,
-            request.metadata_schema,
-        )
+        original_media_type = request.metadata_media_type.split(";", 1)[0].strip().lower()
         db_metadata = ark_repo.create_or_update_metadata(
             ark_record_id=db_ark.id,
             level1_json=level1_json,
