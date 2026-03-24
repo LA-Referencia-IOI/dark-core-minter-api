@@ -7,17 +7,16 @@ and publishes them to the blockchain via dark-core-lib.
 
 import logging
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 
 from sqlalchemy.orm import Session
 from dark_core_lib import DARKCoreClient
 from dark_core_lib.exceptions import ARKError, AuthorityError
+from dark_core_lib.metadata import MetadataService, MetadataStorage, StorageError
 
 from app.database.connection import SessionLocal
 from app.repositories.ark_repository import ARKRepository
 from app.models.states import ARKState
-from app.storage.base import MetadataStorage
-from app.storage.exceptions import StorageError
 
 
 logger = logging.getLogger(__name__)
@@ -57,6 +56,7 @@ class ARKPublisher:
         """
         self.corelib_client = corelib_client
         self.metadata_storage = metadata_storage
+        self.metadata_service = MetadataService(metadata_storage)
         self.batch_size = batch_size
         self.max_retries = max_retries
         self.backoff_base = backoff_base
@@ -121,24 +121,21 @@ class ARKPublisher:
             try:
                 # Store Level 2 (Original) if missing
                 if not l2_cid:
-                    l2_cid = self.metadata_storage.store_metadata(
-                        content=metadata_record.original_content,
-                        format=metadata_record.original_schema
+                    original_media_type = getattr(metadata_record, "original_media_type", None)
+                    if not original_media_type:
+                        raise StorageError("Original metadata media type is required")
+                    l2_cid = self.metadata_service.store_level2(
+                        content=metadata_record.original_content.encode("utf-8"),
+                        content_type=original_media_type,
+                        schema=metadata_record.original_schema,
                     )
                     logger.info(f"Stored Level 2 metadata for {ark_id}: {l2_cid}")
 
                 # Store Level 1 (JSON) if missing
                 if not l1_cid:
-                    # Inject L2 CID into L1 JSON
-                    l1_json = metadata_record.level1_json.copy()
-                    l1_json["original_metadata"]["cid"] = l2_cid
-                    
-                    # Store L1
-                    import json
-                    l1_content = json.dumps(l1_json)
-                    l1_cid = self.metadata_storage.store_metadata(
-                        content=l1_content,
-                        format="json"
+                    _, l1_cid = self.metadata_service.store_level1_with_level2_reference(
+                        metadata_record.level1_json,
+                        l2_cid,
                     )
                     logger.info(f"Stored Level 1 metadata for {ark_id}: {l1_cid}")
                 

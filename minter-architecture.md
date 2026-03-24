@@ -37,9 +37,10 @@ The service is intentionally split into a few layers.
   - [`app/repositories/noid_counter_repository.py`](./app/repositories/noid_counter_repository.py)
   - [`app/repositories/worker_runtime_repository.py`](./app/repositories/worker_runtime_repository.py)
 - Metadata and validation
-  - [`app/metadata/schemas.py`](./app/metadata/schemas.py)
-  - [`app/storage/filesystem.py`](./app/storage/filesystem.py)
-  - [`app/storage/store_api.py`](./app/storage/store_api.py)
+  - [`dark_core_lib/metadata/schemas.py`](../../core/dark-core-lib/dark_core_lib/metadata/schemas.py)
+  - [`dark_core_lib/metadata/service.py`](../../core/dark-core-lib/dark_core_lib/metadata/service.py)
+  - [`dark_core_lib/metadata/storage/filesystem.py`](../../core/dark-core-lib/dark_core_lib/metadata/storage/filesystem.py)
+  - [`dark_core_lib/metadata/storage/store_api.py`](../../core/dark-core-lib/dark_core_lib/metadata/storage/store_api.py)
 - Worker
   - [`app/main_worker.py`](./app/main_worker.py)
   - [`app/workers/publisher.py`](./app/workers/publisher.py)
@@ -85,7 +86,7 @@ The API startup path in [`app/main.py`](./app/main.py) does three important thin
 Those singletons are created in [`app/dependencies.py`](./app/dependencies.py):
 
 - `DARKCoreClient`
-- metadata storage backend
+- metadata storage backend created through `dark_core_lib.metadata.get_metadata_storage(...)`
 
 ```mermaid
 sequenceDiagram
@@ -238,6 +239,7 @@ This keeps side effects serialized and easier to reason about:
 - retries can reuse previously stored CIDs
 - blockchain calls happen outside the request path
 - publication metrics can be derived from DB and worker heartbeat
+- minter and resolver can share the same Level-1 schema and storage contract without duplicating code
 
 ### Publish Cycle
 
@@ -285,6 +287,8 @@ The ordering is intentional:
 4. publish the Level-1 CID on-chain
 
 This makes Level-1 the canonical chain-facing entry point while still preserving the original payload.
+
+The concrete implementation of these steps is now shared through `dark_core_lib.metadata.MetadataService`.
 
 ## 8. State Transition Model
 

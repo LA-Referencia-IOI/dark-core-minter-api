@@ -8,6 +8,7 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+tests/.test_minter.sqlite
 .coverage
 htmlcov/
 *.log

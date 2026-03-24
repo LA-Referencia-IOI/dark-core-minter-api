@@ -58,7 +58,7 @@ Models
 Metadata Schemas
 ----------------
 
-.. automodule:: app.metadata.schemas
+.. automodule:: dark_core_lib.metadata.schemas
    :members:
    :undoc-members:
    :show-inheritance:

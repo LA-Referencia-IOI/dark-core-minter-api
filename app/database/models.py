@@ -157,6 +157,7 @@ class ARKMetadata(Base):
     # Level 2 — original metadata (opaque content from client)
     original_content = Column(Text, nullable=False)
     original_schema = Column(String(50), nullable=False)  # "dublin_core", etc.
+    original_media_type = Column(String(255), nullable=True)
     original_cid = Column(String(100), nullable=True)     # Set by worker after IPFS store
     
     # Timestamps
@@ -164,4 +165,7 @@ class ARKMetadata(Base):
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now(), nullable=False)
 
     def __repr__(self):
-        return f"<ARKMetadata(id={self.id}, ark_record_id={self.ark_record_id}, schema={self.original_schema})>"
+        return (
+            f"<ARKMetadata(id={self.id}, ark_record_id={self.ark_record_id}, "
+            f"schema={self.original_schema}, media_type={self.original_media_type})>"
+        )

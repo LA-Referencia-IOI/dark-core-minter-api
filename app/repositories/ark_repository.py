@@ -244,6 +244,7 @@ class ARKRepository:
         level1_json: dict,
         original_content: str,
         original_schema: str,
+        original_media_type: Optional[str] = None,
     ) -> ARKMetadata:
         """
         Create or update the two-level metadata record for an ARK.
@@ -254,6 +255,7 @@ class ARKRepository:
             metadata.level1_json = level1_json
             metadata.original_content = original_content
             metadata.original_schema = original_schema
+            metadata.original_media_type = original_media_type
             # CIDs are reset on update because content changed (worker will re-publish)
             metadata.level1_cid = None
             metadata.original_cid = None
@@ -264,6 +266,7 @@ class ARKRepository:
                 level1_json=level1_json,
                 original_content=original_content,
                 original_schema=original_schema,
+                original_media_type=original_media_type,
             )
             self.db.add(metadata)
         

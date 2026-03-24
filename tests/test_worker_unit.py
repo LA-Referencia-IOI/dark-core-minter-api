@@ -6,9 +6,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from dark_core_lib.exceptions import AuthorityError
+from dark_core_lib.metadata import StorageError, StoredDocument
 
 from app.models.states import ARKState
-from app.storage.exceptions import StorageError
 from app.workers.publisher import ARKPublisher
 
 
@@ -19,15 +19,15 @@ class MockMetadataStorage:
         self.should_fail = should_fail
         self.stored = {}
 
-    def store_metadata(self, content, format):
+    def store_document(self, content, content_type, schema=None):
         if self.should_fail:
             raise StorageError("Mock storage error")
         cid = f"mock_cid_{len(self.stored)}"
-        self.stored[cid] = (content, format)
+        self.stored[cid] = StoredDocument(content=content, content_type=content_type, schema=schema)
         return cid
 
-    def get_metadata(self, cid):
-        return self.stored.get(cid, (None, None))
+    def get_document(self, cid):
+        return self.stored[cid]
 
     def health_check(self):
         return not self.should_fail
@@ -69,6 +69,7 @@ class MockMetadataRecord:
         level1_json: dict = None,
         original_content: str = "<raw>metadata</raw>",
         original_schema: str = "dublin_core",
+        original_media_type: str = "application/xml",
         level1_cid: str = None,
         original_cid: str = None,
     ):
@@ -80,6 +81,7 @@ class MockMetadataRecord:
         }
         self.original_content = original_content
         self.original_schema = original_schema
+        self.original_media_type = original_media_type
         self.level1_cid = level1_cid
         self.original_cid = original_cid
 

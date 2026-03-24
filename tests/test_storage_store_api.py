@@ -8,9 +8,12 @@ from typing import Any, Dict, Optional
 import httpx
 import pytest
 
-from app.storage import get_metadata_storage
-from app.storage.exceptions import MetadataNotFoundError, StorageError
-from app.storage.store_api import StoreApiMetadataStorage
+from dark_core_lib.metadata import (
+    MetadataNotFoundError,
+    StorageError,
+    StoreApiMetadataStorage,
+    get_metadata_storage,
+)
 
 
 def _response(
@@ -53,7 +56,7 @@ class TestStoreApiMetadataStorage:
     def test_store_metadata_returns_cid(self):
         storage = StoreApiMetadataStorage("http://store-api:8002", timeout_seconds=3.0)
 
-        with patch("app.storage.store_api.httpx.post") as mock_post:
+        with patch("dark_core_lib.metadata.httpx.post") as mock_post:
             mock_post.return_value = _response(
                 "POST",
                 "http://store-api:8002/v1/store",
@@ -73,7 +76,7 @@ class TestStoreApiMetadataStorage:
     def test_store_metadata_raises_on_error_status(self):
         storage = StoreApiMetadataStorage("http://store-api:8002")
 
-        with patch("app.storage.store_api.httpx.post") as mock_post:
+        with patch("dark_core_lib.metadata.httpx.post") as mock_post:
             mock_post.return_value = _response(
                 "POST",
                 "http://store-api:8002/v1/store",
@@ -87,7 +90,7 @@ class TestStoreApiMetadataStorage:
     def test_store_metadata_raises_on_request_error(self):
         storage = StoreApiMetadataStorage("http://store-api:8002")
 
-        with patch("app.storage.store_api.httpx.post") as mock_post:
+        with patch("dark_core_lib.metadata.httpx.post") as mock_post:
             mock_post.side_effect = httpx.RequestError(
                 "network down",
                 request=httpx.Request("POST", "http://store-api:8002/v1/store"),
@@ -99,7 +102,7 @@ class TestStoreApiMetadataStorage:
     def test_get_metadata_returns_content_and_format(self):
         storage = StoreApiMetadataStorage("http://store-api:8002", timeout_seconds=2.0)
 
-        with patch("app.storage.store_api.httpx.get") as mock_get:
+        with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.return_value = _response(
                 "GET",
                 "http://store-api:8002/v1/retrieve/cid-1",
@@ -120,7 +123,7 @@ class TestStoreApiMetadataStorage:
     def test_get_metadata_not_found(self):
         storage = StoreApiMetadataStorage("http://store-api:8002")
 
-        with patch("app.storage.store_api.httpx.get") as mock_get:
+        with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.return_value = _response(
                 "GET",
                 "http://store-api:8002/v1/retrieve/missing",
@@ -134,7 +137,7 @@ class TestStoreApiMetadataStorage:
     def test_health_check_returns_true_when_backend_healthy(self):
         storage = StoreApiMetadataStorage("http://store-api:8002")
 
-        with patch("app.storage.store_api.httpx.get") as mock_get:
+        with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.return_value = _response(
                 "GET",
                 "http://store-api:8002/health",
@@ -147,7 +150,7 @@ class TestStoreApiMetadataStorage:
     def test_health_check_returns_false_on_request_error(self):
         storage = StoreApiMetadataStorage("http://store-api:8002")
 
-        with patch("app.storage.store_api.httpx.get") as mock_get:
+        with patch("dark_core_lib.metadata.httpx.get") as mock_get:
             mock_get.side_effect = httpx.RequestError(
                 "connection refused",
                 request=httpx.Request("GET", "http://store-api:8002/health"),

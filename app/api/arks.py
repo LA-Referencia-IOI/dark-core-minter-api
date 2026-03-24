@@ -4,6 +4,7 @@ ARK Native REST Endpoints.
 Implements the ARK lifecycle: reserved -> draft -> published -> tombstone.
 """
 
+import json
 import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Path
@@ -11,9 +12,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
 from dark_core_lib import DARKCoreClient
+from dark_core_lib.metadata import Level1Metadata, MetadataStorage
 
 from app.dependencies import get_corelib_client, get_db, get_metadata_storage
-from app.storage.base import MetadataStorage
 from app.middleware.auth import (
     enforce_authority_match,
     require_authority_identity,
@@ -32,7 +33,6 @@ from app.models.responses import (
     ARKResponse,
     ARKBatchResponse,
 )
-from app.metadata.schemas import Level1Metadata
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,31 @@ def _extract_minimal_metadata(level1_json: Optional[dict]) -> Optional[dict]:
     if not isinstance(level1_json, dict):
         return None
     return level1_json
+
+
+def _infer_original_media_type(
+    content: str,
+    explicit_media_type: Optional[str],
+    metadata_schema: str,
+) -> str:
+    """Infer the media type for the original metadata payload."""
+    if explicit_media_type and explicit_media_type.strip():
+        return explicit_media_type.split(";", 1)[0].strip().lower()
+
+    stripped = content.lstrip()
+    if stripped.startswith("<"):
+        return "application/xml"
+
+    try:
+        json.loads(content)
+        return "application/json"
+    except Exception:
+        pass
+
+    if metadata_schema in {"dublin_core", "jats", "openaire4", "oai_dc"}:
+        return "application/xml"
+
+    return "text/plain"
 
 
 @router.post(
@@ -503,11 +528,17 @@ async def update_ark_metadata(
     # We do NOT store to IPFS here. The worker will do that.
     level1_json = l1_model.model_dump(mode="json", by_alias=True)
     try:
+        original_media_type = _infer_original_media_type(
+            request.original_metadata,
+            request.metadata_media_type,
+            request.metadata_schema,
+        )
         db_metadata = ark_repo.create_or_update_metadata(
             ark_record_id=db_ark.id,
             level1_json=level1_json,
             original_content=request.original_metadata,
             original_schema=request.metadata_schema,
+            original_media_type=original_media_type,
         )
     except Exception as e:
         logger.error(f"Failed to store metadata in DB for {ark}: {e}")

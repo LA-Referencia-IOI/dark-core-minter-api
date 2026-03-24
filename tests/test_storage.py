@@ -11,8 +11,7 @@ import shutil
 import json
 from pathlib import Path
 
-from app.storage.filesystem import FileSystemMetadataStorage
-from app.storage.exceptions import StorageError, MetadataNotFoundError
+from dark_core_lib.metadata import FileSystemMetadataStorage, MetadataNotFoundError, StorageError
 
 
 class TestFileSystemMetadataStorage:

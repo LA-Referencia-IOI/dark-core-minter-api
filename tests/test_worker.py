@@ -7,10 +7,10 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
 from dark_core_lib.exceptions import AuthorityError
+from dark_core_lib.metadata import StorageError, StoredDocument
 
 from app.database.models import ARKMetadata, ARKRecord
 from app.models.states import ARKState
-from app.storage.exceptions import StorageError
 from app.workers.publisher import ARKPublisher
 
 
@@ -21,15 +21,15 @@ class MockMetadataStorage:
         self.should_fail = should_fail
         self.stored = {}
 
-    def store_metadata(self, content, format):
+    def store_document(self, content, content_type, schema=None):
         if self.should_fail:
             raise StorageError("Mock storage error")
         cid = f"mock_cid_{len(self.stored)}"
-        self.stored[cid] = (content, format)
+        self.stored[cid] = StoredDocument(content=content, content_type=content_type, schema=schema)
         return cid
 
-    def get_metadata(self, cid):
-        return self.stored.get(cid, (None, None))
+    def get_document(self, cid):
+        return self.stored[cid]
 
     def health_check(self):
         return not self.should_fail
@@ -70,6 +70,7 @@ def _create_ark_with_metadata(
         level1_json=_level1_payload(title=f"Title {name}"),
         original_content=f"<raw>{name}</raw>",
         original_schema="dublin_core",
+        original_media_type="application/xml",
     )
     db_session.add(metadata_record)
     db_session.commit()
@@ -114,9 +115,9 @@ class TestARKPublisher:
             cid=metadata_record.level1_cid,
         )
 
-        stored_l1_content, stored_l1_format = mock_storage.get_metadata(metadata_record.level1_cid)
-        parsed_l1 = json.loads(stored_l1_content)
-        assert stored_l1_format == "json"
+        stored_l1_document = mock_storage.get_document(metadata_record.level1_cid)
+        parsed_l1 = json.loads(stored_l1_document.content)
+        assert stored_l1_document.content_type == "application/json"
         assert parsed_l1["original_metadata"]["cid"] == metadata_record.original_cid
         assert publisher.stats["total_succeeded"] == 1
 

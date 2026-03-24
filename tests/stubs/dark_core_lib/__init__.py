@@ -1,6 +1,18 @@
 """Test stub package for dark_core_lib."""
 
 from .config import CoreConfig
+from .metadata import (
+    FileSystemMetadataStorage,
+    Level1Metadata,
+    MetadataNotFoundError,
+    MetadataService,
+    MetadataStorage,
+    OriginalMetadataRef,
+    StorageError,
+    StoreApiMetadataStorage,
+    StoredDocument,
+    get_metadata_storage,
+)
 from .models import ARKInfo, AuthorityInfo, TxReceiptInfo
 from .exceptions import (
     DarkCoreError,
@@ -23,4 +35,3 @@ class DARKCoreClient:
 
     def __init__(self, config: CoreConfig):
         self.config = config
-

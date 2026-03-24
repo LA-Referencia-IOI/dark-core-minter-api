@@ -45,7 +45,7 @@ flowchart LR
     CORE --> CHAIN["Blockchain RPC + Contracts"]
 
     W["Standalone Worker"] --> DB
-    W --> STORE["Metadata Storage\nfilesystem or dark-store-api"]
+    W --> STORE["Metadata Storage via dark-core-lib\nfilesystem or dark-store-api"]
     W --> CORE
 
     DB --> HB["worker_runtime_status"]
@@ -63,7 +63,7 @@ flowchart LR
   - exposes health and worker status
 - Worker process
   - claims `DRAFT` and `UPDATE` records in batches
-  - persists metadata to the configured storage backend
+  - persists metadata through the shared `dark_core_lib.metadata` layer
   - publishes create/update transactions through `dark-core-lib`
   - handles retries, backoff, and permanent failures
 - PostgreSQL
@@ -71,6 +71,7 @@ flowchart LR
   - stores reserved IDs, metadata, retry status, and worker heartbeat
 - Metadata storage backend
   - stores raw Level-2 content and the publishable Level-1 JSON
+  - is configured in the minter, but implemented in `dark-core-lib` so resolver and minter use the same contract
 - Blockchain
   - final public state for ARK registration and updates
 
@@ -238,6 +239,7 @@ Important points:
 - Level-2 is stored first.
 - Level-1 is then re-serialized with the embedded Level-2 CID.
 - the blockchain stores the Level-1 CID as the canonical pointer.
+- the shared implementation of this pipeline now lives in `dark_core_lib.metadata.MetadataService`.
 
 ### 4. Tombstone
 
@@ -278,6 +280,7 @@ flowchart TD
   - can be XML, JSON, or other supported text content
 - PostgreSQL stores both payloads before publication.
 - The storage backend stores the immutable content addressed versions.
+- The storage backend interface and Level-1 schema are shared with the resolver through `dark-core-lib`.
 
 ## Worker Model and Concurrency
 
@@ -385,6 +388,7 @@ erDiagram
         string level1_cid
         text original_content
         string original_schema
+        string original_media_type
         string original_cid
     }
 
@@ -411,7 +415,7 @@ erDiagram
 cd /Users/lmatas/source/dark-developer
 source venv/bin/activate
 pip install -r components/services/dark-core-minter-api/requirements.txt
-pip install -e components/libraries/dark-core-lib
+pip install -e components/core/dark-core-lib
 pip install -e components/services/dark-core-minter-api
 ```
 
@@ -467,7 +471,7 @@ docker compose up -d --build
 - `minter-api` and `minter-worker` join the external `dark-net` network.
 - inside Docker, `DARK_RPC_URL` is overridden to `http://rpc01:8545`.
 - PostgreSQL runs as a sibling service in the same compose project.
-- `minter-api` and `minter-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage`.
+- `minter-api` and `minter-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage` when `METADATA_STORAGE_TYPE=filesystem`.
 - `.env.integration` is preferred automatically when present.
 
 ## Metadata Backends
@@ -495,6 +499,7 @@ In that mode:
 - the API still stores Level-1 and Level-2 payloads in PostgreSQL first
 - the worker sends the payloads to `dark-store-api`
 - the returned CIDs are persisted locally and then published on-chain
+- the resolver must point at the same `dark-store-api` instance to resolve `?info` and `?metadata`
 
 ## Configuration
 
@@ -587,6 +592,10 @@ The notebooks directory contains both focused notebooks and a simpler consolidat
 - [notebooks/minter_05_batch_concurrency.ipynb](./notebooks/minter_05_batch_concurrency.ipynb)
 - [notebooks/minter_06_worker_publish_update.ipynb](./notebooks/minter_06_worker_publish_update.ipynb)
 - [notebooks/minter_07_chain_import_optional.ipynb](./notebooks/minter_07_chain_import_optional.ipynb)
+- [notebooks/minter_08_resolver_end_to_end.ipynb](./notebooks/minter_08_resolver_end_to_end.ipynb)
+  - simple direct-HTTP flow from authority creation to resolver lookup
+- `/Users/lmatas/source/dark-developer/notebooks/dark_e2e_authority_to_resolver.ipynb`
+  - root-level copy of the same simple end-to-end notebook for monorepo use
 
 See [notebooks/README.md](./notebooks/README.md) for execution notes and environment variables.
 

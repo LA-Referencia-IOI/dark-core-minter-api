@@ -7,8 +7,9 @@ Provides singleton instances of the dark-core-lib client.
 import logging
 from typing import Optional
 
-from dark_core_lib import DARKCoreClient, CoreConfig
+from dark_core_lib import DARKCoreClient, CoreConfig, get_metadata_storage as build_metadata_storage
 from dark_core_lib.exceptions import ConfigurationError
+from dark_core_lib.metadata import MetadataStorage
 
 from app.config import get_settings
 
@@ -103,10 +104,10 @@ def get_db():
 
 
 # Singleton metadata storage instance
-_metadata_storage: Optional["MetadataStorage"] = None
+_metadata_storage: Optional[MetadataStorage] = None
 
 
-def get_metadata_storage() -> "MetadataStorage":
+def get_metadata_storage() -> MetadataStorage:
     """
     Get the MetadataStorage singleton instance.
     
@@ -125,7 +126,7 @@ def get_metadata_storage() -> "MetadataStorage":
     return _metadata_storage
 
 
-def init_metadata_storage() -> "MetadataStorage":
+def init_metadata_storage() -> MetadataStorage:
     """
     Initialize the MetadataStorage singleton.
     
@@ -135,8 +136,6 @@ def init_metadata_storage() -> "MetadataStorage":
         Initialized MetadataStorage
     """
     global _metadata_storage
-    from app.storage import get_metadata_storage as build_metadata_storage
-    
     settings = get_settings()
 
     storage_type = settings.metadata_storage_type.lower()
@@ -168,8 +167,3 @@ def shutdown_metadata_storage() -> None:
         logger.info("Shutting down metadata storage")
         _metadata_storage = None
 
-
-# Type hint for MetadataStorage
-from typing import TYPE_CHECKING
-if TYPE_CHECKING:
-    from app.storage.base import MetadataStorage

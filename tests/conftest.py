@@ -4,6 +4,7 @@ Pytest configuration and fixtures.
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch
@@ -38,7 +39,7 @@ if not os.getenv("DARK_ADMIN_PRIVATE_KEY"):
 
 # Default to local SQLite for fast/offline test execution.
 # You can still force PostgreSQL by setting TEST_DATABASE_URL explicitly.
-_default_sqlite_path = (Path(__file__).parent / ".test_minter.sqlite").resolve()
+_default_sqlite_path = (Path(tempfile.gettempdir()) / "dark_core_minter_tests.sqlite").resolve()
 _test_db_url = os.getenv("TEST_DATABASE_URL", f"sqlite:///{_default_sqlite_path}")
 os.environ["DATABASE_URL"] = _test_db_url
 

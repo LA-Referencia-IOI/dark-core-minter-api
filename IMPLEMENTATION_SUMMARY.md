@@ -8,7 +8,7 @@ Active implementation with separated runtime architecture:
 - Publisher worker process (`app.main_worker`)
 - Full local ARK lifecycle persistence in `ark_records`
 - Deterministic sequential minting per namespace in `noid_counters`
-- Two-level metadata pipeline (L1 validated JSON + L2 original content) with pluggable worker storage backend (`filesystem` or `store_api`)
+- Two-level metadata pipeline (L1 validated JSON + L2 original content) with shared metadata/storage abstractions from `dark-core-lib`
 
 ## 1. Process Architecture
 
@@ -50,7 +50,7 @@ Relevant fields:
 - `naan`, `name`
 - `state` (`R`, `D`, `U`, `P`, `T`)
 - `authority_id`
-- `target`, `metadata_cid` (final L1 CID)
+- `target`
 - `created_at`, `updated_at`, `tombstoned_at`
 - `client_item_id`
 - publish tracking:
@@ -68,6 +68,7 @@ Relevant fields:
 - `level1_cid` (assigned by worker after storage)
 - `original_content` (raw Level-2 content)
 - `original_schema` (client-provided schema label, e.g. `dublin_core`, `oai_dc`)
+- `original_media_type` (client-provided or inferred MIME type for Level-2)
 - `original_cid` (assigned by worker after storage)
 
 ### Modeling decisions
@@ -206,6 +207,7 @@ Behavior details for `PUT /api/v1/arks/{ark}`:
   4. Persist both CIDs and publish on-chain using `level1_cid`.
 - `metadata_cid` is sourced from on-chain state (`cid`) and/or `ark_metadata.level1_cid`; it is not duplicated in `ark_records`.
 - `filesystem` and `store_api` backends are used by worker during the publish phase.
+- the implementation of those backends now lives in `dark_core_lib.metadata.storage`, not in the minter package.
 
 ## 8. Relevant Configuration
 
@@ -283,8 +285,8 @@ Recent full regression result: `107 passed`.
 - `app/repositories/ark_repository.py` (CAS transitions and atomic updates)
 - `app/workers/publisher.py` (`create_ark` vs `update_ark` by state)
 - `app/models/states.py` (new `UPDATE` state)
-- `app/storage/store_api.py` (HTTP metadata backend for `dark-store-api`)
-- `app/storage/__init__.py` (storage backend factory with `store_api`)
+- `dark_core_lib/metadata/service.py` (shared L1/L2 orchestration)
+- `dark_core_lib/metadata/storage/*` (shared storage backends used by minter and resolver)
 - `app/dependencies.py` (runtime backend selection by `METADATA_STORAGE_TYPE`)
 - `README.md`
 - `minter-architecture.md`
@@ -297,4 +299,4 @@ Recent full regression result: `107 passed`.
 
 ---
 
-**Overall status:** Operational implementation with full API/worker separation, two-level metadata pipeline, and robust PostgreSQL concurrency controls (row locks + CAS + advisory lock).
+**Overall status:** Operational implementation with full API/worker separation, two-level metadata pipeline, shared metadata/storage contract in `dark-core-lib`, and robust PostgreSQL concurrency controls (row locks + CAS + advisory lock).
