@@ -4,7 +4,6 @@ Request models for dARK Core API.
 Pydantic models for validating incoming API requests.
 """
 
-from typing import Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -37,10 +36,6 @@ class ReserveBatchItem(BaseModel):
     """Item for batch reservation."""
 
     model_config = ConfigDict(extra="forbid")
-    target: Optional[str] = Field(
-        None,
-        description="Initial target URL (optional)"
-    )
     client_item_id: str = Field(
         ...,
         description="Client-side ID for correlation (required in batch)"

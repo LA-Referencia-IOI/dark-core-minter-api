@@ -193,6 +193,7 @@ sequenceDiagram
 ```
 
 Important points:
+- reserve only assigns identifiers; it does not accept or persist a `target`
 - `minimal_metadata` is the validated Level-1 JSON payload.
 - `original_metadata` is the raw Level-2 payload.
 - For `RESERVED -> DRAFT`, the `target` URL is required.

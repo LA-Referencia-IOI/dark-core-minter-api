@@ -178,7 +178,7 @@ async def reserve_ark(
     response_model=ARKBatchResponse,
     response_model_exclude_none=True,
     summary="Batch Reserve ARKs",
-    description="Reserve multiple ARKs, optionally with initial targets.",
+    description="Reserve multiple ARKs in a single request.",
 )
 async def batch_reserve_ark(
     request: ReserveBatchRequest,

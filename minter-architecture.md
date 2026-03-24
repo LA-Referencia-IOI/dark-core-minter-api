@@ -221,6 +221,7 @@ sequenceDiagram
 
 ### Important Rules
 
+- reserve endpoints only allocate ARKs; `target` is supplied later during `PUT /arks/{ark}`
 - `RESERVED -> DRAFT` requires a non-empty `target`
 - `DRAFT -> DRAFT` overwrites pending payload before creation
 - `PUBLISHED -> UPDATE` stages a blockchain update

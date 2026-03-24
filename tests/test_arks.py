@@ -38,11 +38,9 @@ def test_batch_reserve(client):
             "naan": "12345",
             "items": [
                 {
-                    "target": "http://example.com/1",
                     "client_item_id": "req-001"
                 },
                 {
-                    "target": "http://example.com/2",
                     "client_item_id": "req-002"
                 }
             ]
@@ -56,6 +54,25 @@ def test_batch_reserve(client):
     assert data["results"][1]["client_item_id"] == "req-002"
     assert data["results"][0].get("target") is None
     assert data["results"][1].get("minimal_metadata") is None
+
+
+def test_batch_reserve_rejects_target_field(client):
+    """Batch reserve must reject target; target belongs to metadata staging."""
+    response = client.post(
+        "/api/v1/arks/batch",
+        json={
+            "authority_id": "test-uuid",
+            "naan": "12345",
+            "items": [
+                {
+                    "client_item_id": "req-001",
+                    "target": "http://example.com/1",
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 422
 
 
 def test_update_metadata_publish(client, mock_corelib):
