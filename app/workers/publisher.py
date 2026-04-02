@@ -11,7 +11,12 @@ from typing import List
 
 from sqlalchemy.orm import Session
 from dark_core_lib import DARKCoreClient
-from dark_core_lib.exceptions import ARKError, AuthorityError
+from dark_core_lib.exceptions import (
+    ARKError,
+    AuthorityError,
+    AuthorityNotFoundError,
+    AuthorizationError,
+)
 from dark_core_lib.metadata import MetadataService, MetadataStorage, StorageError
 
 from app.database.connection import SessionLocal
@@ -181,13 +186,34 @@ class ARKPublisher:
                 
                 logger.info(f"ARK {operation} published to blockchain: {ark_id}")
                 
-            except AuthorityError as e:
-                # Authority errors are permanent (unauthorized, etc.)
+            except (AuthorityNotFoundError, AuthorizationError) as e:
+                # Semantic authority failures won't recover with retries.
                 error_msg = f"Authority error (permanent): {e}"
                 logger.error(f"{error_msg} for ARK {ark_id}")
                 repo.mark_publish_failed(ark_id, error_msg, is_permanent=True)
                 db.commit()
                 self.stats["total_permanent_failures"] += 1
+                self._add_recent_error(ark_id, error_msg)
+                return False
+
+            except AuthorityError as e:
+                # Generic authority failures can be transient (RPC/lookup/contract call issues).
+                is_permanent = ark_record.publish_retry_count >= self.max_retries - 1
+                if is_permanent:
+                    error_msg = f"Authority error (max retries exceeded, permanent): {e}"
+                else:
+                    error_msg = f"Authority error (retriable): {e}"
+
+                logger.error(f"{error_msg} for ARK {ark_id}")
+                repo.mark_publish_failed(ark_id, error_msg, is_permanent=is_permanent)
+                db.commit()
+
+                if is_permanent:
+                    self.stats["total_permanent_failures"] += 1
+                    logger.error(
+                        f"ARK {ark_id} marked as permanently failed after {self.max_retries} authority attempts"
+                    )
+
                 self._add_recent_error(ark_id, error_msg)
                 return False
 

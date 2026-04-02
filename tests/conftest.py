@@ -5,6 +5,8 @@ Pytest configuration and fixtures.
 import os
 import sys
 import tempfile
+import shutil
+import atexit
 from pathlib import Path
 import pytest
 from unittest.mock import MagicMock, patch
@@ -37,9 +39,11 @@ if not os.getenv("DARK_CONTRACT_ADDRESS"):
 if not os.getenv("DARK_ADMIN_PRIVATE_KEY"):
     os.environ["DARK_ADMIN_PRIVATE_KEY"] = "0x0000000000000000000000000000000000000000000000000000000000000003"
 
-# Default to local SQLite for fast/offline test execution.
+# Default to a per-run local SQLite file for fast/offline test execution.
 # You can still force PostgreSQL by setting TEST_DATABASE_URL explicitly.
-_default_sqlite_path = (Path(tempfile.gettempdir()) / "dark_core_minter_tests.sqlite").resolve()
+_default_sqlite_dir = Path(tempfile.mkdtemp(prefix="dark_core_minter_tests_")).resolve()
+atexit.register(lambda: shutil.rmtree(_default_sqlite_dir, ignore_errors=True))
+_default_sqlite_path = _default_sqlite_dir / "test.sqlite"
 _test_db_url = os.getenv("TEST_DATABASE_URL", f"sqlite:///{_default_sqlite_path}")
 os.environ["DATABASE_URL"] = _test_db_url
 
@@ -132,21 +136,27 @@ def client(mock_corelib, override_get_db):
     """
     Create a test client with mocked dependencies.
     """
+    mock_metadata_storage = MagicMock()
+    mock_metadata_storage.health_check.return_value = True
+
     # Override dependencies
     app.dependency_overrides[get_corelib_client] = lambda: mock_corelib
     app.dependency_overrides[get_db] = override_get_db
     dependencies_module._corelib_client = mock_corelib
+    dependencies_module._metadata_storage = mock_metadata_storage
     
     # Mock the lifespan initialization to prevent blockchain connection
     with patch("app.main.init_corelib_client", return_value=mock_corelib):
         with patch("app.database.init_db"):  # Skip DB migrations in tests
-            with TestClient(app) as test_client:
-                test_client.headers.update({"X-Authority-Id": "test-uuid"})
-                yield test_client
+            with patch("app.dependencies.init_metadata_storage", return_value=mock_metadata_storage):
+                with TestClient(app) as test_client:
+                    test_client.headers.update({"X-Authority-Id": "test-uuid"})
+                    yield test_client
     
     # Clear overrides after test
     app.dependency_overrides.clear()
     dependencies_module._corelib_client = None
+    dependencies_module._metadata_storage = None
 
 
 @pytest.fixture

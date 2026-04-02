@@ -540,7 +540,7 @@ These values are required for a functional blockchain-connected deployment.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://dark:dark_password@localhost:5432/minter` |
+| `DATABASE_URL` | PostgreSQL connection string | `postgresql://dark:dark_password@localhost:5433/minter` |
 | `DATABASE_ECHO` | SQL echo logging | `false` |
 | `DATABASE_POOL_SIZE` | Pool size | `5` |
 | `DATABASE_MAX_OVERFLOW` | Overflow connections | `10` |

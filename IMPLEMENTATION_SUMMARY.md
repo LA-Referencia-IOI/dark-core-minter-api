@@ -213,7 +213,7 @@ Behavior details for `PUT /api/v1/arks/{ark}`:
 
 ```bash
 # DB
-DATABASE_URL=postgresql://dark:dark_password@localhost:5432/minter
+DATABASE_URL=postgresql://dark:dark_password@localhost:5433/minter
 DATABASE_ECHO=false
 DATABASE_POOL_SIZE=5
 DATABASE_MAX_OVERFLOW=10

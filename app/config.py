@@ -45,7 +45,7 @@ class Settings(BaseSettings):
     batch_size_limit: int = 100
     
     # Database Configuration
-    database_url: str = "postgresql://dark:dark_password@localhost:5432/minter"
+    database_url: str = "postgresql://dark:dark_password@localhost:5433/minter"
     database_echo: bool = False
     database_pool_size: int = 5
     database_max_overflow: int = 10

@@ -15,6 +15,6 @@ if [[ -z "${db_password}" ]]; then
   db_password="dark_password"
 fi
 
-export TEST_DATABASE_URL="postgresql://dark:${db_password}@localhost:5432/minter_test"
+export TEST_DATABASE_URL="postgresql://dark:${db_password}@localhost:5433/minter_test"
 
 python3 -m pytest -q "$@"

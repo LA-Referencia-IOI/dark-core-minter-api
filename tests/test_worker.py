@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import Mock, patch
 
-from dark_core_lib.exceptions import AuthorityError
+from dark_core_lib.exceptions import AuthorityError, AuthorityNotFoundError, AuthorizationError
 from dark_core_lib.metadata import StorageError, StoredDocument
 
 from app.database.models import ARKMetadata, ARKRecord
@@ -196,7 +196,9 @@ class TestARKPublisher:
         ark_record, _ = _create_ark_with_metadata(db_session, name="test-auth-error")
 
         mock_corelib = Mock()
-        mock_corelib.create_ark = Mock(side_effect=AuthorityError("Unauthorized"))
+        mock_corelib.create_ark = Mock(
+            side_effect=AuthorityError("Failed to get authority: {'code': -32603, 'message': 'Internal error'}")
+        )
 
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
@@ -209,6 +211,87 @@ class TestARKPublisher:
         with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
             success = publisher.publish_single_ark("ark:12345/test-auth-error")
+
+        assert success is False
+        db_session.refresh(ark_record)
+        assert ark_record.publish_retry_count == 1
+        assert ark_record.publish_permanently_failed == 0
+        assert "Authority error (retriable)" in ark_record.publish_last_error
+        assert publisher.stats["total_permanent_failures"] == 0
+
+    def test_publish_single_ark_authority_error_max_retries_exceeded(self, db_session):
+        ark_record, _ = _create_ark_with_metadata(
+            db_session,
+            name="test-auth-max-retries",
+            publish_retry_count=4,
+        )
+
+        mock_corelib = Mock()
+        mock_corelib.create_ark = Mock(
+            side_effect=AuthorityError("Failed to get authority key: {'code': -32603, 'message': 'Internal error'}")
+        )
+
+        publisher = ARKPublisher(
+            corelib_client=mock_corelib,
+            metadata_storage=MockMetadataStorage(),
+            batch_size=10,
+            max_retries=5,
+            backoff_base=2.0,
+        )
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            success = publisher.publish_single_ark("ark:12345/test-auth-max-retries")
+
+        assert success is False
+        db_session.refresh(ark_record)
+        assert ark_record.publish_retry_count == 5
+        assert ark_record.publish_permanently_failed == 1
+        assert "Authority error (max retries exceeded, permanent)" in ark_record.publish_last_error
+        assert publisher.stats["total_permanent_failures"] == 1
+
+    def test_publish_single_ark_authority_not_found_is_permanent(self, db_session):
+        ark_record, _ = _create_ark_with_metadata(db_session, name="test-auth-not-found")
+
+        mock_corelib = Mock()
+        mock_corelib.create_ark = Mock(side_effect=AuthorityNotFoundError("Authority not found"))
+
+        publisher = ARKPublisher(
+            corelib_client=mock_corelib,
+            metadata_storage=MockMetadataStorage(),
+            batch_size=10,
+            max_retries=5,
+            backoff_base=2.0,
+        )
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            success = publisher.publish_single_ark("ark:12345/test-auth-not-found")
+
+        assert success is False
+        db_session.refresh(ark_record)
+        assert ark_record.publish_retry_count == 1
+        assert ark_record.publish_permanently_failed == 1
+        assert "Authority error (permanent)" in ark_record.publish_last_error
+        assert publisher.stats["total_permanent_failures"] == 1
+
+    def test_publish_single_ark_authorization_error_is_permanent(self, db_session):
+        ark_record, _ = _create_ark_with_metadata(db_session, name="test-authorization-error")
+
+        mock_corelib = Mock()
+        mock_corelib.create_ark = Mock(side_effect=AuthorizationError("NAAN not authorized"))
+
+        publisher = ARKPublisher(
+            corelib_client=mock_corelib,
+            metadata_storage=MockMetadataStorage(),
+            batch_size=10,
+            max_retries=5,
+            backoff_base=2.0,
+        )
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            success = publisher.publish_single_ark("ark:12345/test-authorization-error")
 
         assert success is False
         db_session.refresh(ark_record)
