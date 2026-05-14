@@ -56,8 +56,8 @@ class Settings(BaseSettings):
     
     # Worker Configuration
     worker_enabled: bool = True
-    worker_interval_seconds: int = 60  # Run every 60 seconds
-    worker_batch_size: int = 10  # Process up to 10 ARKs per cycle
+    worker_interval_seconds: int = 30  # Run every 30 seconds
+    worker_batch_size: int = 100  # Process up to 100 ARKs per cycle
     worker_max_retries: int = 5  # Max retry attempts before marking as failed
     worker_retry_backoff_base: float = 2.0  # Exponential backoff base (seconds)
     worker_runtime_name: str = "ark-publisher"
