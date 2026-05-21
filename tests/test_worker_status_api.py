@@ -446,3 +446,98 @@ def test_worker_status_includes_queue_state_and_error_summary(client, test_db):
         "published": 1,
         "tombstone": 1,
     }
+
+
+def test_worker_permanent_errors_endpoint_paginates_and_serializes(client, test_db):
+    """Permanent error report should expose blocked ARKs with pagination."""
+    now = _utc_now()
+    metadata_error = _add_ark(
+        test_db,
+        name="metadata-permanent",
+        state=ARKState.DRAFT,
+        publish_retry_count=5,
+        publish_last_attempt_at=now - timedelta(minutes=10),
+        publish_last_error="metadata failed permanently",
+        publish_permanently_failed=1,
+        metadata_complete=False,
+    )
+    chain_error = _add_ark(
+        test_db,
+        name="chain-permanent",
+        state=ARKState.UPDATE,
+        publish_retry_count=5,
+        publish_last_attempt_at=now - timedelta(minutes=5),
+        publish_last_error="chain reverted permanently",
+        publish_permanently_failed=1,
+        metadata_complete=True,
+    )
+    chain_error.updated_at = now
+    metadata_error.updated_at = now - timedelta(minutes=1)
+    _add_ark(
+        test_db,
+        name="retryable",
+        state=ARKState.DRAFT,
+        publish_retry_count=1,
+        publish_last_attempt_at=now,
+        publish_last_error="temporary",
+        publish_permanently_failed=0,
+    )
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/errors/permanent?page=1&page_size=1")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["filters"] == {"stage": "all"}
+    assert data["pagination"] == {
+        "page": 1,
+        "page_size": 1,
+        "total": 2,
+        "total_pages": 2,
+        "has_next": True,
+        "has_previous": False,
+    }
+    assert len(data["items"]) == 1
+    item = data["items"][0]
+    assert item["ark"] == "ark:12345/chain-permanent"
+    assert item["stage"] == "chain"
+    assert item["state"] == ARKState.UPDATE.value
+    assert item["publish_retry_count"] == 5
+    assert item["publish_permanently_failed"] is True
+    assert item["publish_last_error"] == "chain reverted permanently"
+    assert item["metadata"]["level1_cid"] == "l1-chain-permanent"
+    assert item["metadata"]["original_cid"] == "l2-chain-permanent"
+
+
+def test_worker_permanent_errors_endpoint_filters_stage(client, test_db):
+    """Permanent error report should filter by inferred metadata/chain stage."""
+    now = _utc_now()
+    _add_ark(
+        test_db,
+        name="metadata-permanent",
+        state=ARKState.DRAFT,
+        publish_retry_count=5,
+        publish_last_attempt_at=now,
+        publish_last_error="metadata failed permanently",
+        publish_permanently_failed=1,
+        metadata_complete=False,
+    )
+    _add_ark(
+        test_db,
+        name="chain-permanent",
+        state=ARKState.DRAFT,
+        publish_retry_count=5,
+        publish_last_attempt_at=now,
+        publish_last_error="chain failed permanently",
+        publish_permanently_failed=1,
+        metadata_complete=True,
+    )
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/errors/permanent?stage=metadata")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["pagination"]["total"] == 1
+    assert data["items"][0]["ark"] == "ark:12345/metadata-permanent"
+    assert data["items"][0]["stage"] == "metadata"

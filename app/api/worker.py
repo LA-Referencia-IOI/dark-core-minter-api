@@ -36,6 +36,11 @@ def _metadata_complete(metadata: ARKMetadata | None) -> bool:
     return bool(metadata and metadata.level1_cid and metadata.original_cid)
 
 
+def _metadata_stage(metadata: ARKMetadata | None) -> str:
+    """Infer the active worker stage from persisted metadata CIDs."""
+    return "chain" if _metadata_complete(metadata) else "metadata"
+
+
 def _build_worker_config(settings) -> Dict[str, Any]:
     """Return effective worker settings relevant for publication cycles."""
     return {
@@ -120,7 +125,7 @@ def _build_queue_summary(db: Session, settings, now: datetime) -> Dict[str, Any]
     oldest_error = {"metadata": None, "chain": None}
 
     for record, metadata in pending_rows:
-        stage = "chain" if _metadata_complete(metadata) else "metadata"
+        stage = _metadata_stage(metadata)
 
         if record.publish_permanently_failed == 1:
             errors[stage]["permanent"] += 1
@@ -170,6 +175,31 @@ def _build_queue_summary(db: Session, settings, now: datetime) -> Dict[str, Any]
         "queues": queues,
         "errors": errors,
         "by_state": by_state,
+    }
+
+
+def _serialize_permanent_error(record: ARKRecord, metadata: ARKMetadata | None) -> Dict[str, Any]:
+    """Serialize one permanently failed ARK for operational review."""
+    return {
+        "ark": record.ark,
+        "naan": record.naan,
+        "name": record.name,
+        "state": record.state,
+        "stage": _metadata_stage(metadata),
+        "authority_id": record.authority_id,
+        "target": record.target,
+        "publish_retry_count": record.publish_retry_count,
+        "publish_permanently_failed": bool(record.publish_permanently_failed),
+        "publish_last_error": record.publish_last_error,
+        "publish_last_attempt_at": _isoformat_or_none(record.publish_last_attempt_at),
+        "created_at": _isoformat_or_none(record.created_at),
+        "updated_at": _isoformat_or_none(record.updated_at),
+        "metadata": {
+            "level1_cid": metadata.level1_cid if metadata else None,
+            "original_cid": metadata.original_cid if metadata else None,
+            "original_schema": metadata.original_schema if metadata else None,
+            "original_media_type": metadata.original_media_type if metadata else None,
+        },
     }
 
 
@@ -583,3 +613,77 @@ async def get_worker_status(
     if detail == "full":
         return full_status
     return _build_simple_status(full_status)
+
+
+@router.get("/errors/permanent", response_model=Dict[str, Any])
+async def list_permanent_worker_errors(
+    stage: str = Query(
+        default="all",
+        pattern="^(all|metadata|chain)$",
+        description="Filter by inferred failed stage.",
+    ),
+    page: int = Query(
+        default=1,
+        ge=1,
+        description="1-based page number.",
+    ),
+    page_size: int = Query(
+        default=50,
+        ge=1,
+        le=200,
+        description="Items per page.",
+    ),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """
+    List permanently failed ARKs for operational review.
+
+    Stage is inferred from metadata CIDs:
+    - `metadata`: Level-1 or original CID is missing.
+    - `chain`: both CIDs exist, so the ARK reached blockchain publication.
+    """
+    query = (
+        db.query(ARKRecord, ARKMetadata)
+        .outerjoin(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+        .filter(ARKRecord.publish_permanently_failed == 1)
+    )
+
+    if stage == "metadata":
+        query = query.filter(
+            (ARKMetadata.id.is_(None))
+            | (ARKMetadata.level1_cid.is_(None))
+            | (ARKMetadata.original_cid.is_(None))
+        )
+    elif stage == "chain":
+        query = query.filter(
+            ARKMetadata.level1_cid.is_not(None),
+            ARKMetadata.original_cid.is_not(None),
+        )
+
+    total = int(query.count())
+    total_pages = ceil(total / page_size) if total else 0
+    offset = (page - 1) * page_size
+    rows = (
+        query.order_by(ARKRecord.updated_at.desc(), ARKRecord.id.desc())
+        .offset(offset)
+        .limit(page_size)
+        .all()
+    )
+
+    return {
+        "filters": {
+            "stage": stage,
+        },
+        "pagination": {
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+            "total_pages": total_pages,
+            "has_next": page < total_pages,
+            "has_previous": page > 1 and total > 0,
+        },
+        "items": [
+            _serialize_permanent_error(record, metadata)
+            for record, metadata in rows
+        ],
+    }
