@@ -8,14 +8,16 @@ The notebooks follow the same service lifecycle described in the main docs:
 
 1. reserve an ARK locally
 2. stage metadata locally as `DRAFT` or `UPDATE`
-3. let the standalone worker publish it
-4. verify the resulting `PUBLISHED` state or local `TOMBSTONE`
+3. let the metadata worker persist metadata and purge local payloads
+4. let the chain worker publish the ARK on-chain
+5. verify the resulting `PUBLISHED` state or local `TOMBSTONE`
 
 That means:
 
 - `POST /arks` and `POST /arks/batch` reserve only
 - `PUT /arks/{ark}` stages metadata only
-- the worker owns storage persistence and blockchain publication
+- the metadata worker owns storage persistence
+- the chain worker owns blockchain publication
 - `DELETE /arks/{ark}` is a local tombstone flow
 
 Contract note:
@@ -35,7 +37,7 @@ Contract note:
   - Single reserve/get lifecycle, malformed ARK checks, unauthorized reserve checks, checkdigit mutation behavior.
 
 - `minter_03_update_metadata_formats.ipynb`
-  - `RESERVED -> DRAFT`, `DRAFT -> DRAFT` overwrite, validation errors, and two-level metadata payloads (`minimal_metadata` + `original_metadata`).
+  - `RESERVED -> DRAFT`, rejection of pending `DRAFT` overwrites, validation errors, and two-level metadata payloads (`minimal_metadata` + `original_metadata`).
 
 - `minter_04_tombstone_missing.ipynb`
   - Tombstone lifecycle (`DRAFT -> TOMBSTONE`), delete idempotency, blocked updates on tombstoned ARKs, missing-record update/delete behavior with two-level payloads.
@@ -44,14 +46,14 @@ Contract note:
   - Batch reserve success/failure paths and parallel reserve uniqueness checks.
 
 - `minter_06_worker_publish_update.ipynb`
-  - Worker-driven transitions (`DRAFT -> PUBLISHED`, `PUBLISHED -> UPDATE -> PUBLISHED`) including L2->L1 CID chaining.
+  - Worker-driven transitions (`DRAFT -> PUBLISHED`, `PUBLISHED -> UPDATE -> PUBLISHED`) including L2->L1 CID chaining, local payload purge, and chain publication.
 
 - `minter_07_chain_import_optional.ipynb`
   - Optional local import path for pre-existing on-chain ARKs (`EXISTING_CHAIN_ARK`) followed by UPDATE with two-level metadata.
 
 - `minter_08_resolver_end_to_end.ipynb`
   - Straight-line notebook with direct HTTP calls.
-  - Covers authority creation, later NAAN assignment, reserve, metadata staging, worker publication, resolver redirect, `?info`, and `?metadata`.
+  - Covers authority creation, later NAAN assignment, reserve, metadata staging, metadata persistence, chain publication, resolver redirect, `?info`, and `?metadata`.
 - `/Users/lmatas/source/dark-developer/notebooks/dark_e2e_authority_to_resolver.ipynb`
   - root-level copy of the same notebook for monorepo-wide access.
 
@@ -89,5 +91,5 @@ Local auth note:
 - Most notebooks include the authority bootstrap step; if you already have an authorized authority, set:
   - `REGISTER_AUTHORITY=false`
   - `AUTHORITY_ID=<existing-authorized-uuid>`
-- Worker-specific checks in `minter_06_worker_publish_update.ipynb` require the standalone worker to be running, because publish is worker-owned rather than request-owned.
+- Worker-specific checks in `minter_06_worker_publish_update.ipynb` require both worker processes to be running, because metadata persistence and chain publication are worker-owned rather than request-owned.
 - Each notebook prints a final pass/fail summary and raises an assertion if any check fails.

@@ -4,6 +4,7 @@ ARK Native REST Endpoints.
 Implements the ARK lifecycle: reserved -> draft -> published -> tombstone.
 """
 
+import json
 import logging
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Path
@@ -70,6 +71,41 @@ def _extract_minimal_metadata(level1_json: Optional[dict]) -> Optional[dict]:
     if not isinstance(level1_json, dict):
         return None
     return level1_json
+
+
+def _load_minimal_metadata_from_storage(
+    level1_cid: Optional[str],
+    storage: MetadataStorage,
+) -> Optional[dict]:
+    """Best-effort load of Level-1 metadata from persisted storage."""
+    if not level1_cid:
+        return None
+
+    try:
+        document = storage.get_document(level1_cid)
+        raw_content = document.content
+        if isinstance(raw_content, bytes):
+            raw_content = raw_content.decode("utf-8")
+        return _extract_minimal_metadata(json.loads(raw_content))
+    except Exception as exc:
+        logger.warning(f"Could not load Level 1 metadata from storage for CID {level1_cid}: {exc}")
+        return None
+
+
+def _resolve_minimal_metadata(
+    db_metadata,
+    storage: MetadataStorage,
+    fallback_level1_cid: Optional[str] = None,
+) -> Optional[dict]:
+    """Return Level-1 metadata from DB first, then storage by CID."""
+    minimal_metadata = _extract_minimal_metadata(
+        db_metadata.level1_json if db_metadata else None
+    )
+    if minimal_metadata is not None:
+        return minimal_metadata
+
+    level1_cid = db_metadata.level1_cid if db_metadata else fallback_level1_cid
+    return _load_minimal_metadata_from_storage(level1_cid or fallback_level1_cid, storage)
 
 
 @router.post(
@@ -291,6 +327,7 @@ async def get_ark(
     ark: str = Path(..., description="Full ARK identifier (e.g. ark:/12345/xyz)"),
     cert_info: dict = Depends(require_mtls),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
+    storage: MetadataStorage = Depends(get_metadata_storage),
     db: Session = Depends(get_db),
 ) -> ARKResponse:
     """
@@ -312,12 +349,10 @@ async def get_ark(
         db_metadata = ark_repo.get_metadata_by_ark_id(db_ark.id)
         metadata_cid = db_metadata.level1_cid if db_metadata else None
         metadata_schema = db_metadata.original_schema if db_metadata else None
-        minimal_metadata = _extract_minimal_metadata(
-            db_metadata.level1_json if db_metadata else None
-        )
+        minimal_metadata = _resolve_minimal_metadata(db_metadata, storage)
 
         # Found in database
-        if db_ark.state in [ARKState.RESERVED, ARKState.DRAFT]:
+        if db_ark.state in [ARKState.RESERVED, ARKState.DRAFT, ARKState.UPDATE]:
             # Return from DB directly (not yet on blockchain)
             return ARKResponse(
                 ark=db_ark.ark,
@@ -326,18 +361,26 @@ async def get_ark(
                 metadata_cid=metadata_cid,
                 metadata_schema=metadata_schema,
                 minimal_metadata=minimal_metadata,
+                level1_cid=db_metadata.level1_cid if db_metadata else None,
+                level2_cid=db_metadata.original_cid if db_metadata else None,
+                client_item_id=db_ark.client_item_id,
             )
         elif db_ark.state == ARKState.PUBLISHED:
             # Combine DB metadata with blockchain data
             try:
                 info = corelib_client.get_ark(naan, name)
+                chain_minimal_metadata = minimal_metadata or _resolve_minimal_metadata(
+                    db_metadata,
+                    storage,
+                    fallback_level1_cid=info.cid,
+                )
                 return ARKResponse(
                     ark=ark,
                     state=ARKState.PUBLISHED,
                     target=info.url,  # From blockchain
                     metadata_cid=info.cid,  # From blockchain
                     metadata_schema=metadata_schema,  # From DB
-                    minimal_metadata=minimal_metadata,
+                    minimal_metadata=chain_minimal_metadata,
                     level1_cid=db_metadata.level1_cid if db_metadata else None,
                     level2_cid=db_metadata.original_cid if db_metadata else None,
                     client_item_id=db_ark.client_item_id,
@@ -365,6 +408,9 @@ async def get_ark(
                 metadata_cid=metadata_cid,
                 metadata_schema=metadata_schema,
                 minimal_metadata=minimal_metadata,
+                level1_cid=db_metadata.level1_cid if db_metadata else None,
+                level2_cid=db_metadata.original_cid if db_metadata else None,
+                client_item_id=db_ark.client_item_id,
             )
     
     # 2. Fallback: Query blockchain (ARK might have been created outside this API)
@@ -478,6 +524,13 @@ async def update_ark_metadata(
             status_code=403,
             detail=f"Authority {request.authority_id} does not own this ARK"
         )
+
+    # Pending create/update payloads are worker-owned. Do not allow API overwrites
+    # while metadata persistence or chain publication may be in flight.
+    if db_ark.state == ARKState.DRAFT:
+        raise HTTPException(status_code=409, detail="ARK already has pending creation")
+    if db_ark.state == ARKState.UPDATE:
+        raise HTTPException(status_code=409, detail="ARK already has pending update")
     
     # 5. Validate minimal metadata schema (Level 1)
     # request.minimal_metadata is a dict validated against Level1Metadata.
@@ -530,18 +583,14 @@ async def update_ark_metadata(
                 ark=ark,
                 target=request.target,
             )
-        elif db_ark.state == ARKState.DRAFT:
-            # Idempotent overwrite of pending create_ark payload.
-            db_ark = ark_repo.update_draft_content(
-                ark=ark,
-                target=request.target,
-            )
-        else:
+        elif db_ark.state == ARKState.PUBLISHED:
             # Existing on-chain ARK: queue update_ark via worker.
             db_ark = ark_repo.update_to_update(
                 ark=ark,
                 target=request.target,
             )
+        else:
+            raise ValueError(f"ARK state {db_ark.state} cannot be updated")
 
         db.commit()
         db.refresh(db_ark)

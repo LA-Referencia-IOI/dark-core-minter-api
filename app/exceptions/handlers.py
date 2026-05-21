@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from dark_core_lib.exceptions import (
     DarkCoreError,
     ConfigurationError,
+    ConnectionError as CoreConnectionError,
     AuthorityError,
     ARKError,
     TransactionError,
@@ -131,6 +132,20 @@ def register_exception_handlers(app: FastAPI) -> None:
                 error="CONFIGURATION_ERROR",
                 message="Internal configuration error",
                 retryable=False,
+            ).model_dump(),
+        )
+
+    @app.exception_handler(CoreConnectionError)
+    async def connection_error_handler(request: Request, exc: CoreConnectionError):
+        """Handle unavailable blockchain RPC/connection failures."""
+        logger.error(f"Blockchain connection error: {exc}")
+
+        return JSONResponse(
+            status_code=503,
+            content=ErrorResponse(
+                error="BLOCKCHAIN_UNAVAILABLE",
+                message=str(exc),
+                retryable=True,
             ).model_dump(),
         )
     

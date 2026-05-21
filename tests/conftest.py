@@ -144,14 +144,24 @@ def client(mock_corelib, override_get_db):
     app.dependency_overrides[get_db] = override_get_db
     dependencies_module._corelib_client = mock_corelib
     dependencies_module._metadata_storage = mock_metadata_storage
+    mock_rpc_health = {
+        "available": True,
+        "state": "available",
+        "checked_at": "2026-01-21T12:00:00",
+        "last_ok_at": "2026-01-21T12:00:00",
+        "last_error": None,
+        "block_number": 12345,
+    }
     
-    # Mock the lifespan initialization to prevent blockchain connection
+    # Mock startup and RPC health to keep tests offline.
     with patch("app.main.init_corelib_client", return_value=mock_corelib):
-        with patch("app.database.init_db"):  # Skip DB migrations in tests
+        with patch("app.database.init_db"):
             with patch("app.dependencies.init_metadata_storage", return_value=mock_metadata_storage):
-                with TestClient(app) as test_client:
-                    test_client.headers.update({"X-Authority-Id": "test-uuid"})
-                    yield test_client
+                with patch("app.main.check_rpc_health", return_value=mock_rpc_health):
+                    with patch("app.api.worker.check_rpc_health", return_value=mock_rpc_health):
+                        with TestClient(app) as test_client:
+                            test_client.headers.update({"X-Authority-Id": "test-uuid"})
+                            yield test_client
     
     # Clear overrides after test
     app.dependency_overrides.clear()

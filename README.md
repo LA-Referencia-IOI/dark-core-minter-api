@@ -1,6 +1,6 @@
 # dARK Core Minter API
 
-REST API and background worker for ARK reservation, metadata staging, and on-chain publication using `dark-core-lib`.
+REST API and background workers for ARK reservation, metadata staging, metadata persistence, and on-chain publication using `dark-core-lib`.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)](https://fastapi.tiangolo.com/)
@@ -15,6 +15,7 @@ REST API and background worker for ARK reservation, metadata staging, and on-cha
    - move ARKs into `DRAFT` or `UPDATE`
 2. asynchronous worker work
    - persist Level-2 and Level-1 metadata to the configured storage backend
+   - purge local staged metadata payloads after storage persistence
    - publish `create_ark` or `update_ark` on-chain through `dark-core-lib`
    - finalize the ARK as `PUBLISHED`
 
@@ -44,9 +45,11 @@ flowchart LR
     API --> CORE["dark-core-lib"]
     CORE --> CHAIN["Blockchain RPC + Contracts"]
 
-    W["Standalone Worker"] --> DB
-    W --> STORE["Metadata Storage via dark-core-lib\nfilesystem or dark-store-api"]
-    W --> CORE
+    MW["Metadata Worker"] --> DB
+    MW --> STORE["Metadata Storage via dark-core-lib\nfilesystem or dark-store-api"]
+
+    CW["Chain Worker"] --> DB
+    CW --> CORE
 
     DB --> HB["worker_runtime_status"]
     API --> WS["GET /api/v1/worker/status"]
@@ -61,14 +64,20 @@ flowchart LR
   - validates Level-1 metadata
   - stores Level-1 and Level-2 metadata in PostgreSQL
   - exposes health and worker status
-- Worker process
-  - claims `DRAFT` and `UPDATE` records in batches
+- Metadata worker process
+  - claims `DRAFT` and `UPDATE` records whose metadata CIDs are incomplete
   - persists metadata through the shared `dark_core_lib.metadata` layer
+  - stores `level1_cid` and `original_cid`
+  - purges local `level1_json` and `original_content`
+  - keeps DB heartbeat fresh during long metadata cycles
+- Chain worker process
+  - claims `DRAFT` and `UPDATE` records whose CIDs are complete
   - publishes create/update transactions through `dark-core-lib`
-  - handles retries, backoff, and permanent failures
+  - handles retries, backoff, and permanent failures for blockchain publication
+  - keeps DB heartbeat fresh during long blockchain batches
 - PostgreSQL
   - source of truth for local lifecycle state
-  - stores reserved IDs, metadata, retry status, and worker heartbeat
+  - stores reserved IDs, staged metadata, CIDs, retry status, and worker heartbeats
 - Metadata storage backend
   - stores raw Level-2 content and the publishable Level-1 JSON
   - is configured in the minter, but implemented in `dark-core-lib` so resolver and minter use the same contract
@@ -82,7 +91,8 @@ sequenceDiagram
     participant Client as "Client"
     participant API as "Minter API"
     participant DB as "PostgreSQL"
-    participant Worker as "Worker"
+    participant MetadataWorker as "Metadata Worker"
+    participant ChainWorker as "Chain Worker"
     participant Store as "Metadata Storage"
     participant Core as "dark-core-lib"
     participant Chain as "Blockchain"
@@ -95,12 +105,15 @@ sequenceDiagram
     API->>DB: store L1 + L2, move to DRAFT/UPDATE
     API-->>Client: 200 pending publication
 
-    Worker->>DB: claim pending ARKs
-    Worker->>Store: store Level-2 metadata
-    Worker->>Store: store Level-1 metadata with embedded L2 reference
-    Worker->>Core: create_ark or update_ark
+    MetadataWorker->>DB: claim ARKs pending metadata persistence
+    MetadataWorker->>Store: store Level-2 metadata
+    MetadataWorker->>Store: store Level-1 metadata with embedded L2 reference
+    MetadataWorker->>DB: persist CIDs and purge local payloads
+
+    ChainWorker->>DB: claim ARKs with complete CIDs
+    ChainWorker->>Core: create_ark or update_ark
     Core->>Chain: signed transaction
-    Worker->>DB: mark ARK as PUBLISHED
+    ChainWorker->>DB: mark ARK as PUBLISHED
 ```
 
 ## ARK Lifecycle
@@ -111,10 +124,8 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> RESERVED: POST /api/v1/arks
     RESERVED --> DRAFT: PUT /api/v1/arks/{ark}
-    DRAFT --> DRAFT: overwrite pending create
     DRAFT --> PUBLISHED: worker create_ark
     PUBLISHED --> UPDATE: PUT /api/v1/arks/{ark}
-    UPDATE --> UPDATE: overwrite pending update
     UPDATE --> PUBLISHED: worker update_ark
     RESERVED --> TOMBSTONE: DELETE /api/v1/arks/{ark}
     DRAFT --> TOMBSTONE: DELETE /api/v1/arks/{ark}
@@ -171,7 +182,7 @@ Important points:
 
 ### 2. Update Metadata
 
-`PUT /api/v1/arks/{ark}` does not publish immediately. It stores metadata locally and prepares the record for the worker.
+`PUT /api/v1/arks/{ark}` does not publish immediately. It stores metadata locally and prepares the record for the asynchronous workers.
 
 ```mermaid
 sequenceDiagram
@@ -189,7 +200,7 @@ sequenceDiagram
         API->>DB: import local record if owner matches authority
         API->>DB: move to UPDATE
     end
-    API-->>Client: 200 pending worker publication
+    API-->>Client: 200 pending asynchronous processing
 ```
 
 Important points:
@@ -200,47 +211,68 @@ Important points:
 - If an ARK exists on-chain but not locally, the minter can import it into the local DB before staging an update.
 - The import path now validates that the blockchain owner matches the authority making the request.
 
-### 3. Async Publish
+### 3. Async Metadata Persistence and Publish
 
-The worker is the only component that writes metadata to the backend and publishes blockchain transactions.
+The asynchronous path is split into two independent workers. The metadata worker is the only component that writes staged metadata to the backend. The chain worker is the only component that publishes blockchain transactions.
 
 ```mermaid
 sequenceDiagram
-    participant Worker as "ARKPublisher"
+    participant MetadataWorker as "MetadataPersistenceWorker"
+    participant ChainWorker as "ChainPublisherWorker"
     participant Repo as "ARKRepository"
     participant DB as "PostgreSQL"
     participant Store as "Metadata Storage"
     participant Core as "dark-core-lib"
     participant Chain as "Blockchain"
 
-    Worker->>Repo: get_drafts_pending_publish(limit)
+    MetadataWorker->>Repo: get_metadata_pending_persist(limit)
     Repo->>DB: SELECT ... FOR UPDATE SKIP LOCKED
     Repo->>DB: mark publish_last_attempt_at
-    Worker->>DB: commit claim
+    MetadataWorker->>DB: commit claim
 
     loop each claimed ARK
-        Worker->>Store: store Level-2 content
-        Store-->>Worker: level2_cid
-        Worker->>Store: store Level-1 JSON with schema + media_type + level2_cid
-        Store-->>Worker: level1_cid
-        Worker->>Repo: persist CIDs in DB
-        alt state is DRAFT
-            Worker->>Core: create_ark(..., cid=level1_cid)
-        else state is UPDATE
-            Worker->>Core: update_ark(..., cid=level1_cid)
+        MetadataWorker->>Store: store Level-2 content
+        Store-->>MetadataWorker: original_cid
+        MetadataWorker->>Store: store Level-1 JSON with schema + media_type + original_cid
+        Store-->>MetadataWorker: level1_cid
+        MetadataWorker->>Repo: persist CIDs, purge local payloads, reset publish tracking
+    end
+
+    ChainWorker->>Repo: get_chain_pending_publish(limit)
+    Repo->>DB: SELECT rows with complete CIDs
+    Repo->>DB: mark publish_last_attempt_at
+    ChainWorker->>DB: commit claim
+
+    ChainWorker->>ChainWorker: group claimed ARKs by authority_id
+    loop each authority group
+        ChainWorker->>Core: publish_ark_operations(..., pipeline_size)
+        Core->>Chain: send signed txs with sequential pending nonces
+        Core->>Chain: wait receipts and return one semantic result per ARK
+        alt result confirmed
+            ChainWorker->>Repo: update_to_published
+        else reverted, ambiguous, send_failed, or not_sent
+            ChainWorker->>Core: get_ark(naan, name)
+            alt on-chain cid/url match expected values
+                ChainWorker->>Repo: update_to_published
+            else missing or divergent on-chain state
+                ChainWorker->>Repo: mark retryable or permanent failure
+            end
         end
-        Core->>Chain: signed tx
-        Worker->>Repo: update_to_published
-        Worker->>DB: commit
+        ChainWorker->>DB: commit
     end
 ```
 
 Important points:
-- storage and blockchain publication happen in the worker, not in the request thread.
+- storage and blockchain publication happen in workers, not in the request thread.
 - Level-2 is stored first.
 - Level-1 is then re-serialized with the embedded Level-2 reference: `schema`, `media_type`, and `cid`.
+- after both CIDs are stored, local `level1_json` and `original_content` are purged from PostgreSQL.
 - the blockchain stores the Level-1 CID as the canonical pointer.
+- `publish_*` retry fields are reused for the currently pending stage; they are reset after metadata persistence succeeds so blockchain retries start cleanly.
 - the shared implementation of this pipeline now lives in `dark_core_lib.metadata.MetadataService`.
+- the chain worker calls `dark-core-lib` through `publish_ark_operations(...)`, grouping ARKs by `authority_id` and sending individual create/update transactions with sequential pending nonces.
+- `CHAIN_WORKER_PAGE_SIZE` is the only chain size knob: it is both the number of ARKs claimed per cycle and the core-lib transaction pipeline window; the default is `20`.
+- the chain worker only reads blockchain during error handling. Reconcile never creates a different operation; it only confirms that the failed/ambiguous write already produced the expected `target` + `level1_cid`, or classifies the failure for retry/permanent handling.
 
 ### 4. Tombstone
 
@@ -279,7 +311,10 @@ flowchart TD
 - Level-2
   - original raw payload as submitted by the client
   - can be XML, JSON, or other supported text content
-- PostgreSQL stores both payloads before publication.
+- PostgreSQL stores both payloads only while they are staged for metadata persistence.
+- After metadata persistence succeeds, PostgreSQL keeps CIDs and schema/media-type fields but purges `level1_json` and `original_content`.
+- `GET /api/v1/arks/{ark}` returns `minimal_metadata` from local DB when available; after purge it best-effort loads Level-1 from the configured storage backend using `level1_cid`.
+- If that storage lookup fails, `GET /api/v1/arks/{ark}` still returns state, target, CIDs, and schema without `minimal_metadata`.
 - The storage backend stores the immutable content addressed versions.
 - The storage backend interface and Level-1 schema are shared with the resolver through `dark-core-lib`.
 
@@ -291,7 +326,7 @@ flowchart TD
 flowchart TD
     S["worker start"] --> P["pidfile guard"]
     P --> L["PostgreSQL advisory lock"]
-    L -->|lock acquired| R["scheduler loop"]
+    L -->|lock acquired| R["post-cycle sleep loop"]
     L -->|lock denied| X["abort startup"]
     R --> H["persist heartbeat in worker_runtime_status"]
     H --> API["/api/v1/worker/status"]
@@ -299,7 +334,7 @@ flowchart TD
 
 The worker uses two protections:
 - local pidfile guard
-- PostgreSQL advisory lock derived from `WORKER_RUNTIME_NAME`
+- PostgreSQL advisory lock derived from each worker runtime name
 
 ### Publish Concurrency Strategy
 
@@ -317,19 +352,81 @@ This gives us:
 - compare-and-set style final state transitions
 - retry tracking that survives restarts
 
+### Worker Status
+
+`GET /api/v1/worker/status` returns a compact operational summary by default:
+
+```json
+{
+  "overall": "degraded",
+  "message": "Metadata worker is backlogged with 6862 pending; Chain worker is backlogged with 1573 pending.",
+  "workers": {
+    "metadata": {
+      "state": "backlogged",
+      "alive": true,
+      "last_heartbeat_seconds": 9,
+      "last_cycle": {
+        "processed": 100,
+        "succeeded": 100,
+        "failed": 0,
+        "duration_seconds": 10.573
+      },
+      "queue": {
+        "pending": 6862,
+        "ready": 6830,
+        "delayed": 32
+      }
+    }
+  },
+  "errors": {
+    "retrying": 0,
+    "permanent": 0
+  },
+  "arks": {
+    "reserved": 70,
+    "draft": 8435,
+    "update": 0,
+    "published": 96,
+    "tombstone": 0
+  }
+}
+```
+
+In the compact payload, `last_cycle.processed` means "attempted in the latest worker cycle". It is not a lifetime counter and it is not the remaining queue size. For the chain worker, `last_cycle.succeeded` means ARKs published or reconciled as already published in the latest cycle. For the metadata worker, it means ARKs whose metadata was persisted in the latest cycle.
+
+Use `GET /api/v1/worker/status?detail=full` for detailed heartbeat, queue, cadence, config, and host/process fields. The full payload includes a `cadence` block for each worker:
+
+- `last_cycle_duration_seconds`: how long the last cycle took.
+- `last_cycle_processed`: how many ARKs the last cycle attempted.
+- `page_size`: how many ARKs this worker can claim in one cycle.
+- `sleep_seconds`: how long the worker sleeps after an empty or partial page.
+- `last_cycle_full_page`: whether the last cycle processed a full page.
+- `next_action`: `continue`, `sleep`, or `pause_rpc`.
+- `sleep_seconds_next`: the next planned wait, if any.
+- `cycle_utilization_ratio`: `last_cycle_duration_seconds / sleep_seconds`.
+- `ready_pages`: how many configured pages are needed for the currently ready queue.
+- `estimated_seconds_to_drain_ready`: rough drain time for the ready queue at the current sleep and page size.
+- `pressure`: compact state such as `idle`, `working`, `backlogged`, `rpc_unavailable`, `stale`, or `unknown`.
+
+For the chain worker, `last_cycle_full_page=true` means the worker will continue immediately without sleeping. If the RPC is unavailable, it does not claim ARKs and reports `next_action=pause_rpc`.
+
+Worker heartbeats are emitted by a lightweight supervisor thread, so a full chain batch can take longer than `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` without incorrectly marking the worker stale.
+
+The detailed `config.chain.worker_page_size` field shows the active chain transaction pipeline window because chain page size and core-lib pipeline size are intentionally the same value. `last_cycle.processed` still means ARKs attempted in the latest cycle, not transactions confirmed forever and not queue size.
+
 ## API Surface
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
 | `/api/v1/arks` | `POST` | Reserve one ARK |
 | `/api/v1/arks/batch` | `POST` | Reserve multiple ARKs |
-| `/api/v1/arks/{ark}` | `GET` | Resolve ARK state and metadata |
+| `/api/v1/arks/{ark}` | `GET` | Read local ARK state plus metadata/CIDs, with best-effort storage fallback |
 | `/api/v1/arks/{ark}` | `PUT` | Stage metadata and move to `DRAFT` or `UPDATE` |
 | `/api/v1/arks/{ark}` | `DELETE` | Tombstone an ARK locally |
 | `/api/v1/authority/{uuid}` | `GET` | Fetch authority details |
 | `/api/v1/authority/{uuid}/naans` | `GET` | List authorized NAANs |
 | `/api/v1/authority/{uuid}/authorized/{naan}` | `GET` | Check NAAN authorization |
-| `/api/v1/worker/status` | `GET` | Read worker heartbeat and counters |
+| `/api/v1/worker/status` | `GET` | Read compact worker, queue, error, and ARK state summary |
 | `/health` | `GET` | Check database, blockchain, and storage wiring |
 
 ## Authentication and Authorization
@@ -432,13 +529,19 @@ pip install -e ../dark-core-lib
 ### Run API and Worker Manually
 
 ```bash
+# Run schema migrations explicitly before starting API/workers
+python -m app.database migrate
+
 # API
 uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
 
-# Worker
-python -m app.main_worker run
+# Metadata worker
+python -m app.main_worker metadata
 
-# Worker status helper
+# Chain worker
+python -m app.main_worker chain
+
+# Legacy chain-worker status helper
 dark-core-worker-status
 ```
 
@@ -454,7 +557,8 @@ flowchart LR
     MINTER["minter compose"] --> NET
     MINTER --> PG["postgres"]
     MINTER --> API["minter-api"]
-    MINTER --> W["minter-worker"]
+    MINTER --> MW["minter-metadata-worker"]
+    MINTER --> CW["minter-chain-worker"]
 ```
 
 ### Start Order
@@ -464,16 +568,21 @@ cd /Users/lmatas/source/dark-developer/components/blockchain/dark-env
 docker compose up -d
 
 cd /Users/lmatas/source/dark-developer/components/services/dark-core-minter-api
+docker compose run --rm minter-api migrate
 docker compose up -d --build
 ```
 
 ### Docker Notes
 
-- `minter-api` and `minter-worker` join the external `dark-net` network.
+- `minter-api`, `minter-metadata-worker`, and `minter-chain-worker` join the external `dark-net` network.
 - inside Docker, `DARK_RPC_URL` is overridden to `http://rpc01:8545`.
 - PostgreSQL runs as a sibling service in the same compose project.
-- `minter-api` and `minter-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage` when `METADATA_STORAGE_TYPE=filesystem`.
+- `minter-api`, `minter-metadata-worker`, and `minter-chain-worker` share PostgreSQL.
+- `minter-api` and `minter-metadata-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage` when `METADATA_STORAGE_TYPE=filesystem`.
 - `.env.integration` is preferred automatically when present.
+- Alembic migrations are explicit: run `docker compose run --rm minter-api migrate` after schema changes or a fresh database.
+- `minter-api` defaults to one Uvicorn worker. Increase `MINTER_API_WORKERS` only when HTTP concurrency requires it.
+- The API starts without requiring RPC. The chain worker pauses as `PAUSED_RPC_UNAVAILABLE` while RPC is unavailable and resumes after recovery.
 
 ## Metadata Backends
 
@@ -498,8 +607,8 @@ METADATA_STORE_API_TIMEOUT_SECONDS=10.0
 
 In that mode:
 - the API still stores Level-1 and Level-2 payloads in PostgreSQL first
-- the worker sends raw Level-2 bytes and Level-1 JSON to `dark-store-api`
-- the returned CIDs are persisted locally and then published on-chain
+- the metadata worker sends raw Level-2 bytes and Level-1 JSON to `dark-store-api`
+- the returned CIDs are persisted locally, local payloads are purged, and the chain worker publishes `level1_cid` on-chain
 - the resolver must point at the same `dark-store-api` instance to resolve `?info` and `?metadata`
 - `L1.original_metadata` carries the Level-2 `schema`, `media_type`, and internal `cid`
 
@@ -513,12 +622,23 @@ The app prefers `.env.integration` over `.env`.
 |----------|-------------|---------|
 | `MINTER_API_HOST` | API bind host | `0.0.0.0` |
 | `MINTER_API_PORT` | API bind port | `8001` |
+| `MINTER_API_WORKERS` | Uvicorn worker processes | `1` |
 | `BATCH_SIZE_LIMIT` | Max items per batch reserve request | `100` |
-| `WORKER_ENABLED` | Enable standalone worker | `true` |
-| `WORKER_INTERVAL_SECONDS` | Publish cycle interval | `60` |
-| `WORKER_BATCH_SIZE` | ARKs per worker cycle | `10` |
-| `WORKER_MAX_RETRIES` | Retry attempts before permanent failure | `5` |
-| `WORKER_RUNTIME_NAME` | Logical worker identity | `ark-publisher` |
+| `METADATA_WORKER_ENABLED` | Enable metadata persistence worker | `true` |
+| `METADATA_WORKER_PAGE_SIZE` | ARKs per metadata cycle | `100` |
+| `METADATA_WORKER_SLEEP_SECONDS` | Metadata sleep after an empty or partial page | `2` |
+| `METADATA_WORKER_MAX_RETRIES` | Metadata retry attempts before permanent failure | `5` |
+| `METADATA_WORKER_RUNTIME_NAME` | Metadata worker identity | `metadata-publisher` |
+| `CHAIN_WORKER_ENABLED` | Enable blockchain publication worker | `true` |
+| `CHAIN_WORKER_PAGE_SIZE` | ARKs per chain cycle and max in-flight core-lib transaction window | `20` |
+| `CHAIN_WORKER_SLEEP_SECONDS` | Chain sleep after an empty or partial page | `5` |
+| `CHAIN_WORKER_RPC_RETRY_SECONDS` | Sleep while chain worker is paused for unavailable RPC | `10` |
+| `CHAIN_WORKER_MAX_RETRIES` | Chain retry attempts before permanent failure | `5` |
+| `CHAIN_WORKER_RUNTIME_NAME` | Chain worker identity | `chain-publisher` |
+| `WORKER_HEARTBEAT_INTERVAL_SECONDS` | DB heartbeat interval for both workers | `10` |
+| `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` | Stale heartbeat threshold | `180` |
+
+Legacy `WORKER_*` variables are still accepted as aliases for `CHAIN_WORKER_*`.
 
 Backward compatibility aliases still accepted:
 - `CORE_API_HOST`
@@ -529,12 +649,15 @@ Backward compatibility aliases still accepted:
 | Variable | Description |
 |----------|-------------|
 | `DARK_RPC_URL` | RPC endpoint |
+| `DARK_RPC_HEALTH_TIMEOUT_SECONDS` | Timeout for lightweight RPC health checks |
+| `DARK_RPC_CONNECT_RETRY_SECONDS` | Max retry window when initializing dark-core-lib |
+| `DARK_RPC_CONNECT_RETRY_INTERVAL_SECONDS` | Delay between dark-core-lib connection retries |
 | `DARK_CHAIN_ID` | Chain id |
 | `DARK_AUTHORITY_ADDRESS` | Authority contract address |
 | `DARK_CONTRACT_ADDRESS` | dARK contract address |
 | `DARK_ADMIN_PRIVATE_KEY` | Admin signer private key |
 
-These values are required for a functional blockchain-connected deployment.
+These values are required for blockchain operations. DB-only API endpoints and worker status can remain available when RPC is temporarily down.
 
 ### Database
 
@@ -606,8 +729,8 @@ See [notebooks/README.md](./notebooks/README.md) for execution notes and environ
 ### ARKs remain in `DRAFT` or `UPDATE`
 
 Check, in this order:
-1. worker process or container is running
-2. `GET /api/v1/worker/status` shows a fresh heartbeat
+1. both worker containers are running
+2. `GET /api/v1/worker/status` shows `workers.metadata.alive=true` and `workers.chain.alive=true`
 3. blockchain connectivity is healthy
 4. storage backend is reachable and writable
 5. the ARK has not reached permanent failure state

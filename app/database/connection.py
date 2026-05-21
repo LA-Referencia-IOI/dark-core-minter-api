@@ -7,7 +7,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 
 from app.config import get_settings
@@ -58,44 +58,49 @@ SessionLocal = get_session_local
 
 def init_db() -> None:
     """
-    Initialize the database.
-    
-    1. Runs Alembic migrations (fails fast if migration fails)
-    2. Falls back to creating tables if Alembic not configured
-    
+    Initialize database connectivity without mutating schema.
+
+    Schema migrations are intentionally run on demand through run_migrations()
+    or the Docker entrypoint "migrate" command.
+
     Raises:
-        Exception: If migrations fail or database initialization fails
+        Exception: If the database cannot be reached.
     """
     logger.info("Initializing database...")
-    
-    # Try to run Alembic migrations
+
     try:
-        # Check if alembic.ini exists
-        alembic_ini = Path("alembic.ini")
-        if alembic_ini.exists():
-            logger.info("Running Alembic migrations...")
-            result = subprocess.run(
-                [sys.executable, "-m", "alembic", "upgrade", "head"],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            logger.info("Alembic migrations completed successfully")
-            logger.debug(result.stdout)
-        else:
-            logger.warning("alembic.ini not found, falling back to create_all()")
-            # Fallback: create tables directly
-            from app.database.models import Base
-            engine = get_engine()
-            Base.metadata.create_all(bind=engine)
-            logger.info("Database tables created via create_all()")
-    
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Alembic migration failed: {e.stderr}")
-        raise Exception(f"Database migration failed: {e.stderr}") from e
+        with get_engine().connect() as connection:
+            connection.execute(text("SELECT 1"))
+        logger.info("Database connection verified successfully")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         raise
+
+
+def run_migrations() -> None:
+    """
+    Run Alembic migrations on demand.
+
+    This is deliberately separate from API and worker startup so multiprocess
+    servers do not run concurrent migrations.
+    """
+    alembic_ini = Path("alembic.ini")
+    if not alembic_ini.exists():
+        raise FileNotFoundError("alembic.ini not found; cannot run migrations")
+
+    logger.info("Running Alembic migrations...")
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logger.info("Alembic migrations completed successfully")
+        logger.debug(result.stdout)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Alembic migration failed: {e.stderr}")
+        raise Exception(f"Database migration failed: {e.stderr}") from e
 
 
 def close_db() -> None:

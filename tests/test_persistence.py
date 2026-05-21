@@ -2,9 +2,12 @@
 Additional tests for ARK persistence and error handling.
 """
 
+import json
 from types import SimpleNamespace
 import pytest
 from unittest.mock import patch
+from dark_core_lib.metadata import StoredDocument
+import app.dependencies as dependencies_module
 from app.models.states import ARKState
 from app.database.models import ARKRecord, ARKMetadata
 from app.config import get_settings
@@ -214,8 +217,8 @@ def test_update_ark_to_draft(client, test_db, mock_corelib):
     assert db_meta.original_cid is None
 
 
-def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_corelib):
-    """Updating an ARK already in DRAFT should overwrite pending payload."""
+def test_update_ark_in_draft_is_rejected_without_overwrite(client, test_db, mock_corelib):
+    """Updating an ARK already in DRAFT should not overwrite pending payload."""
     mock_corelib.is_authorized_for_naan.return_value = True
     
     # Create a DRAFT ARK directly in DB
@@ -250,7 +253,6 @@ def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_corelib):
     old_meta.original_cid = "old-l2-cid"
     test_db.commit()
     
-    # Update again (should overwrite and remain DRAFT)
     response = client.put(
         f"/api/v1/arks/ark:12345/{name}",
         json=_build_update_payload(
@@ -260,21 +262,18 @@ def test_update_ark_in_draft_overwrites_payload(client, test_db, mock_corelib):
             original_metadata="<new>raw</new>",
         ),
     )
-    
-    assert response.status_code == 200
-    body = response.json()
-    assert body["state"] == ARKState.DRAFT
-    assert body["target"] == "https://new-url.org"
-    assert body.get("metadata_schema") == "dublin_core"
-    assert body.get("level1_cid") is None
-    assert body.get("level2_cid") is None
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "ARK already has pending creation"
 
     test_db.refresh(db_ark)
+    assert db_ark.state == ARKState.DRAFT
+    assert db_ark.target == "https://example.org"
     db_meta = test_db.query(ARKMetadata).filter_by(ark_record_id=db_ark.id).first()
-    assert db_meta.level1_json["title"] == "New title"
-    assert db_meta.original_content == "<new>raw</new>"
-    assert db_meta.level1_cid is None
-    assert db_meta.original_cid is None
+    assert db_meta.level1_json["title"] == "Old title"
+    assert db_meta.original_content == "<old>raw</old>"
+    assert db_meta.level1_cid == "old-l1-cid"
+    assert db_meta.original_cid == "old-l2-cid"
 
 
 def test_update_ark_published_transitions_to_update(client, test_db, mock_corelib):
@@ -317,6 +316,60 @@ def test_update_ark_published_transitions_to_update(client, test_db, mock_coreli
     assert db_meta.level1_json["title"] == "Updated Title"
     assert db_meta.level1_cid is None
     assert db_meta.original_cid is None
+
+
+def test_update_ark_in_update_is_rejected_without_overwrite(client, test_db, mock_corelib):
+    """Updating an ARK already in UPDATE should not overwrite pending payload."""
+    from app.repositories import ARKRepository
+
+    repo = ARKRepository(test_db)
+    name = _expected_name("12345", 44)
+    db_ark = repo.create_published_import(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+        target="https://published.example/original",
+    )
+    test_db.flush()
+    db_ark.state = ARKState.UPDATE
+    db_ark.target = "https://published.example/pending"
+    db_meta = repo.create_or_update_metadata(
+        ark_record_id=db_ark.id,
+        level1_json={
+            "title": "Pending title",
+            "authors": ["Pending Author"],
+            "year": 2024,
+            "original_metadata": {
+                "schema": "dublin_core",
+                "media_type": "application/xml",
+                "cid": None,
+            },
+        },
+        original_content="<pending>raw</pending>",
+        original_schema="dublin_core",
+        original_media_type="application/xml",
+    )
+    test_db.commit()
+
+    response = client.put(
+        f"/api/v1/arks/ark:12345/{name}",
+        json=_build_update_payload(
+            target="https://published.example/newer",
+            title="Newer Title",
+            year=2025,
+            original_metadata="<newer>raw</newer>",
+        ),
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "ARK already has pending update"
+
+    test_db.refresh(db_ark)
+    test_db.refresh(db_meta)
+    assert db_ark.state == ARKState.UPDATE
+    assert db_ark.target == "https://published.example/pending"
+    assert db_meta.level1_json["title"] == "Pending title"
+    assert db_meta.original_content == "<pending>raw</pending>"
 
 
 def test_update_ark_imports_blockchain_record_when_missing(client, test_db, mock_corelib):
@@ -413,12 +466,60 @@ def test_update_to_published_requires_draft_state(test_db):
         repo.update_to_published(f"ark:12345/{name}")
 
 
+def test_update_draft_content_rejects_pending_overwrite(test_db):
+    """Repository guard should reject legacy DRAFT in-place updates."""
+    from app.repositories import ARKRepository
+
+    repo = ARKRepository(test_db)
+    name = _expected_name("12345", 54)
+    db_ark = repo.create_reserved(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+    )
+    test_db.flush()
+    db_ark.state = ARKState.DRAFT
+    db_ark.target = "https://example.org/original"
+    test_db.commit()
+
+    with pytest.raises(ValueError, match="pending creation"):
+        repo.update_draft_content(f"ark:12345/{name}", target="https://example.org/new")
+
+    test_db.refresh(db_ark)
+    assert db_ark.state == ARKState.DRAFT
+    assert db_ark.target == "https://example.org/original"
+
+
+def test_update_to_update_requires_published_state(test_db):
+    """Repository CAS should reject UPDATE -> UPDATE overwrites."""
+    from app.repositories import ARKRepository
+
+    repo = ARKRepository(test_db)
+    name = _expected_name("12345", 55)
+    db_ark = repo.create_published_import(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+        target="https://example.org/pending",
+    )
+    test_db.flush()
+    db_ark.state = ARKState.UPDATE
+    test_db.commit()
+
+    with pytest.raises(ValueError, match="PUBLISHED state"):
+        repo.update_to_update(f"ark:12345/{name}", target="https://example.org/new")
+
+    test_db.refresh(db_ark)
+    assert db_ark.state == ARKState.UPDATE
+    assert db_ark.target == "https://example.org/pending"
+
+
 def test_tombstone_transition_is_idempotent(test_db):
     """Tombstone transition should be safe to call multiple times."""
     from app.repositories import ARKRepository
 
     repo = ARKRepository(test_db)
-    name = _expected_name("12345", 53)
+    name = _expected_name("12345", 56)
     repo.create_reserved(
         naan="12345",
         name=name,
@@ -554,6 +655,131 @@ def test_get_ark_from_db(client, test_db, mock_corelib):
     assert data["state"] == ARKState.DRAFT
     assert "metadata_format" not in data
     assert data["minimal_metadata"]["alternate_identifiers"][0]["schema"] == "doi"
+
+
+def test_get_ark_after_metadata_payload_purge(client, test_db, mock_corelib):
+    """GET should load minimal metadata from storage when local payloads are purged."""
+    mock_corelib.is_authorized_for_naan.return_value = True
+    dependencies_module._metadata_storage.get_document.return_value = StoredDocument(
+        content=json.dumps(
+            {
+                "title": "Purged Resource",
+                "authors": ["Test Author"],
+                "year": 2024,
+                "original_metadata": {
+                    "schema": "dublin_core",
+                    "media_type": "application/xml",
+                    "cid": "cid-level-2",
+                },
+            }
+        ).encode("utf-8"),
+        content_type="application/json",
+    )
+
+    from app.repositories import ARKRepository
+
+    ark_repo = ARKRepository(test_db)
+    name = _expected_name("12345", 78)
+    db_ark = ark_repo.create_reserved(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+    )
+    test_db.flush()
+    db_ark.state = ARKState.DRAFT
+    ark_repo.create_or_update_metadata(
+        ark_record_id=db_ark.id,
+        level1_json={
+            "title": "Purged Resource",
+            "authors": ["Test Author"],
+            "year": 2024,
+            "original_metadata": {
+                "schema": "dublin_core",
+                "media_type": "application/xml",
+                "cid": None,
+            },
+        },
+        original_content="<raw>metadata</raw>",
+        original_schema="dublin_core",
+        original_media_type="application/xml",
+    )
+    test_db.flush()
+    ark_repo.update_metadata_cids(
+        db_ark.id,
+        level1_cid="cid-level-1",
+        level2_cid="cid-level-2",
+        purge_local=True,
+        reset_publish_tracking=True,
+    )
+    test_db.commit()
+
+    response = client.get(f"/api/v1/arks/ark:12345/{name}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["metadata_cid"] == "cid-level-1"
+    assert data["level1_cid"] == "cid-level-1"
+    assert data["level2_cid"] == "cid-level-2"
+    assert data["metadata_schema"] == "dublin_core"
+    assert data["minimal_metadata"]["title"] == "Purged Resource"
+    dependencies_module._metadata_storage.get_document.assert_called_once_with("cid-level-1")
+
+
+def test_get_ark_after_metadata_payload_purge_storage_failure_is_best_effort(
+    client,
+    test_db,
+    mock_corelib,
+):
+    """GET should still return CIDs/schema if storage lookup fails."""
+    mock_corelib.is_authorized_for_naan.return_value = True
+    dependencies_module._metadata_storage.get_document.side_effect = RuntimeError("store unavailable")
+
+    from app.repositories import ARKRepository
+
+    ark_repo = ARKRepository(test_db)
+    name = _expected_name("12345", 79)
+    db_ark = ark_repo.create_reserved(
+        naan="12345",
+        name=name,
+        authority_id="test-uuid",
+    )
+    test_db.flush()
+    db_ark.state = ARKState.DRAFT
+    ark_repo.create_or_update_metadata(
+        ark_record_id=db_ark.id,
+        level1_json={
+            "title": "Purged Resource",
+            "authors": ["Test Author"],
+            "year": 2024,
+            "original_metadata": {
+                "schema": "dublin_core",
+                "media_type": "application/xml",
+                "cid": None,
+            },
+        },
+        original_content="<raw>metadata</raw>",
+        original_schema="dublin_core",
+        original_media_type="application/xml",
+    )
+    test_db.flush()
+    ark_repo.update_metadata_cids(
+        db_ark.id,
+        level1_cid="cid-level-1",
+        level2_cid="cid-level-2",
+        purge_local=True,
+        reset_publish_tracking=True,
+    )
+    test_db.commit()
+
+    response = client.get(f"/api/v1/arks/ark:12345/{name}")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["metadata_cid"] == "cid-level-1"
+    assert data["level1_cid"] == "cid-level-1"
+    assert data["level2_cid"] == "cid-level-2"
+    assert data["metadata_schema"] == "dublin_core"
+    assert "minimal_metadata" not in data
 
 
 def test_tombstone_ark(client, test_db, mock_corelib):

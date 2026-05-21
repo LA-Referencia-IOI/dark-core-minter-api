@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.dependencies import init_corelib_client, shutdown_corelib_client, get_corelib_client, get_db
 from app.api.router import api_router
 from app.exceptions.handlers import register_exception_handlers
+from app.utils.rpc_health import check_rpc_health
 
 # Configure logging
 # Configure logging
@@ -57,13 +58,8 @@ async def lifespan(app: FastAPI):
         logger.error(f"Failed to initialize database: {e}")
         raise
     
-    # Initialize blockchain client
-    try:
-        corelib_client = init_corelib_client()
-        logger.info(f"Connected to blockchain at block {corelib_client.get_block_number()}")
-    except Exception as e:
-        logger.error(f"Failed to initialize dark-core-lib client: {e}")
-        raise
+    # Blockchain client is initialized lazily by endpoints that need it. This
+    # keeps DB-only endpoints available when RPC is temporarily unavailable.
     
     # Initialize metadata storage
     try:
@@ -133,18 +129,13 @@ def create_app() -> FastAPI:
         status = "healthy"
         response = {}
         
-        # Check blockchain
-        try:
-            corelib_client = get_corelib_client()
-            connected = corelib_client.is_connected()
-            block = corelib_client.get_block_number() if connected else None
-            response["blockchain_connected"] = connected
-            response["current_block"] = block
-            if not connected:
-                status = "degraded"
-        except Exception as e:
-            response["blockchain_connected"] = False
-            response["blockchain_error"] = str(e)
+        # Check blockchain RPC without requiring the full core-lib client.
+        rpc = check_rpc_health()
+        response["blockchain_connected"] = bool(rpc["available"])
+        response["current_block"] = rpc["block_number"]
+        response["rpc"] = rpc
+        if not rpc["available"]:
+            response["blockchain_error"] = rpc["last_error"]
             status = "degraded"
         
         # Check database
@@ -201,4 +192,5 @@ def run_server():
         host=settings.minter_api_host,
         port=settings.minter_api_port,
         reload=False,
+        workers=settings.minter_api_workers,
     )

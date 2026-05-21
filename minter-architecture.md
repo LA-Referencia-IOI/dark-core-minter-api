@@ -13,9 +13,9 @@ The minter is built around a few explicit design choices:
 - PostgreSQL is the local source of truth
 - blockchain logic is delegated to `dark-core-lib`
 - metadata persistence is pluggable
-- worker execution is singleton-oriented
+- each worker execution is singleton-oriented
 
-Those choices let the service accept requests quickly, survive transient blockchain or storage failures, and keep retry state outside process memory.
+Those choices let the service accept requests quickly, survive transient blockchain or storage failures, decouple metadata persistence from chain publication, and keep retry state outside process memory.
 
 ## 2. Module Map
 
@@ -57,21 +57,24 @@ flowchart LR
     API --> Core["dark-core-lib client"]
     Core --> Chain["Authority + dARK contracts"]
 
-    Worker["Standalone worker process"] --> DB
-    Worker --> Store["Metadata storage backend"]
-    Worker --> Core
+    MetadataWorker["Metadata worker process"] --> DB
+    MetadataWorker --> Store["Metadata storage backend"]
+
+    ChainWorker["Chain worker process"] --> DB
+    ChainWorker --> Core
 
     DB --> Runtime["worker_runtime_status"]
     API --> Status["GET /api/v1/worker/status"]
     Status --> Runtime
 ```
 
-The API and worker are separate processes on purpose:
+The API and workers are separate processes on purpose:
 
 - API stays responsive and transactional
-- worker owns the slow path
+- metadata worker owns storage persistence
+- chain worker owns blockchain publication
 - retry and failure tracking stay in PostgreSQL
-- deployment can scale API and keep worker singleton
+- deployment can scale API while keeping each worker singleton
 
 ## 4. Startup and Dependency Wiring
 
@@ -80,13 +83,14 @@ The API and worker are separate processes on purpose:
 The API startup path in [`app/main.py`](./app/main.py) does three important things:
 
 1. validates runtime configuration
-2. initializes the database
-3. initializes long-lived singletons
+2. verifies database connectivity
+3. initializes non-blockchain long-lived singletons
 
 Those singletons are created in [`app/dependencies.py`](./app/dependencies.py):
 
-- `DARKCoreClient`
 - metadata storage backend created through `dark_core_lib.metadata.get_metadata_storage(...)`
+
+`DARKCoreClient` is lazy: endpoints that require blockchain initialize it on demand, while DB-only endpoints and worker status can remain available during RPC outages. Alembic migrations are not part of normal startup and must be run explicitly.
 
 ```mermaid
 sequenceDiagram
@@ -94,36 +98,39 @@ sequenceDiagram
     participant Config as "Settings"
     participant DB as "init_db()"
     participant Deps as "dependencies.py"
-    participant Core as "DARKCoreClient"
     participant Store as "MetadataStorage"
 
     Main->>Config: load .env.integration or .env
-    Main->>Config: validate blockchain and mTLS settings
+    Main->>Config: validate mTLS settings
     Main->>DB: init_db()
-    Main->>Deps: init_corelib_client()
-    Deps->>Core: build configured client
     Main->>Deps: init_metadata_storage()
     Deps->>Store: build filesystem/store_api backend
+    Note over Main,Deps: DARKCoreClient is initialized lazily by endpoints that need blockchain
 ```
 
 ### Worker Startup
 
-The worker startup path in [`app/main_worker.py`](./app/main_worker.py) adds lifecycle controls on top of normal dependency init:
+The worker startup path in [`app/main_worker.py`](./app/main_worker.py) supports two modes: `metadata` and `chain`. Both modes add lifecycle controls on top of normal dependency init:
 
 - pidfile guard
 - PostgreSQL advisory lock
-- scheduler loop
-- heartbeat persistence
+- post-cycle sleep loop
+- heartbeat persistence, including a supervisor thread for long-running cycles
 
 ```mermaid
 flowchart TD
-    A["worker process start"] --> B["create pidfile guard"]
+    A["worker process start"] --> B["create pidfile guard by worker name"]
     B --> C["init_db()"]
     C --> D["acquire PostgreSQL advisory lock"]
-    D -->|success| E["init dark-core-lib"]
-    E --> F["init metadata storage"]
-    F --> G["start APScheduler"]
-    G --> H["write RUNNING heartbeat"]
+    D -->|metadata worker| E["init metadata storage"]
+    D -->|chain worker| F["check RPC health"]
+    F -->|unavailable| P["write PAUSED_RPC_UNAVAILABLE heartbeat and sleep"]
+    P --> F
+    F -->|available| Q["init dark-core-lib with retry"]
+    E --> G["start heartbeat supervisor"]
+    Q --> G
+    G --> H["start post-cycle sleep loop"]
+    H --> I["write RUNNING heartbeat"]
     D -->|failure| X["abort startup"]
 ```
 
@@ -205,7 +212,7 @@ sequenceDiagram
     API->>API: validate checkdigit and authority identity
     alt ARK exists locally
         API->>Repo: create_or_update_metadata()
-        API->>Repo: update_to_draft/update_draft_content/update_to_update
+        API->>Repo: update_to_draft/update_to_update
         Repo->>DB: CAS state transition
     else ARK missing locally
         API->>Core: get_ark / get_authority
@@ -223,60 +230,98 @@ sequenceDiagram
 
 - reserve endpoints only allocate ARKs; `target` is supplied later during `PUT /arks/{ark}`
 - `RESERVED -> DRAFT` requires a non-empty `target`
-- `DRAFT -> DRAFT` overwrites pending payload before creation
+- `DRAFT` rejects further `PUT` requests until the worker publishes or tombstones it
 - `PUBLISHED -> UPDATE` stages a blockchain update
-- `UPDATE -> UPDATE` overwrites the pending update payload
+- `UPDATE` rejects further `PUT` requests until the worker publishes or tombstones it
 - `TOMBSTONE` is terminal for write flows
 
-## 7. Publish Path: Worker-Owned Slow Path
+## 7. Worker-Owned Slow Paths
 
-The publish logic lives in [`app/workers/publisher.py`](./app/workers/publisher.py). The worker does not keep long-lived in-memory queues. It queries PostgreSQL every cycle and claims work there.
+The slow-path logic lives in [`app/workers/publisher.py`](./app/workers/publisher.py). Workers do not keep long-lived in-memory queues. Each worker queries PostgreSQL every cycle, claims work there, and records retry state in the same rows.
 
-### Why the worker owns storage and chain publication
+### Why storage and chain publication are separate
 
-This keeps side effects serialized and easier to reason about:
+Storage writes and blockchain transactions have different failure modes, latency profiles, and operational dependencies. Splitting them keeps each stage easier to reason about:
 
-- metadata CIDs are produced in one place
-- retries can reuse previously stored CIDs
+- metadata CIDs are produced before any chain call
+- blockchain retries can reuse previously stored CIDs
+- local metadata payloads can be purged once CIDs are complete
 - blockchain calls happen outside the request path
 - publication metrics can be derived from DB and worker heartbeat
 - minter and resolver can share the same Level-1 schema and storage contract without duplicating code
 
-### Publish Cycle
+### Metadata Persistence Cycle
 
 ```mermaid
 sequenceDiagram
-    participant Scheduler as "APScheduler"
-    participant Publisher as "ARKPublisher"
+    participant Loop as "worker loop"
+    participant Worker as "MetadataPersistenceWorker"
     participant Repo as "ARKRepository"
     participant DB as "PostgreSQL"
     participant Store as "Metadata backend"
+
+    Loop->>Worker: run_publish_cycle()
+    Worker->>Repo: get_metadata_pending_persist()
+    Repo->>DB: SELECT DRAFT/UPDATE with incomplete CIDs
+    Repo->>DB: mark publish_last_attempt_at
+    Worker->>DB: commit claim
+
+    loop each claimed ARK
+        Worker->>Repo: load record + metadata
+        Worker->>Store: store Level-2
+        Store-->>Worker: original_cid
+        Worker->>Store: store Level-1 with embedded original_cid
+        Store-->>Worker: level1_cid
+        Worker->>Repo: update_metadata_cids(purge_local=true, reset_publish_tracking=true)
+        Worker->>DB: commit
+    end
+```
+
+### Chain Publication Cycle
+
+```mermaid
+sequenceDiagram
+    participant Loop as "worker loop"
+    participant Worker as "ChainPublisherWorker"
+    participant Repo as "ARKRepository"
+    participant DB as "PostgreSQL"
     participant Core as "dark-core-lib"
     participant Chain as "Blockchain"
 
-    Scheduler->>Publisher: run_publish_cycle()
-    Publisher->>Repo: get_drafts_pending_publish()
+    Loop->>Worker: run_publish_cycle()
+    Worker->>Repo: get_chain_pending_publish()
     Repo->>DB: SELECT ... FOR UPDATE SKIP LOCKED
     Repo->>DB: set publish_last_attempt_at
-    Publisher->>DB: commit claim
+    Worker->>DB: commit claim
 
-    loop each claimed ARK
-        Publisher->>Repo: load record + metadata
-        Publisher->>Store: store Level-2
-        Store-->>Publisher: original_cid
-        Publisher->>Store: store Level-1 with embedded original_cid
-        Store-->>Publisher: level1_cid
-        Publisher->>Repo: update_metadata_cids()
-        alt state == DRAFT
-            Publisher->>Core: create_ark()
-        else state == UPDATE
-            Publisher->>Core: update_ark()
+    Worker->>Worker: group claimed ARKs by authority_id
+
+    loop each authority group
+        Worker->>Core: publish_ark_operations(operations, pipeline_size)
+        Core->>Chain: send signed txs with sequential pending nonces
+        Core->>Chain: wait receipts and return one result per ARK
+        alt result confirmed
+            Worker->>Repo: update_to_published()
+        else reverted, ambiguous, send_failed, or not_sent
+            Worker->>Core: get_ark(naan, name)
+            alt on-chain target + CID match expected state
+                Worker->>Repo: update_to_published()
+            else missing/divergent on-chain state
+                Worker->>Repo: mark retryable or permanent failure
+            end
         end
-        Core->>Chain: transaction
-        Publisher->>Repo: update_to_published()
-        Publisher->>DB: commit
+        Worker->>DB: commit
     end
 ```
+
+The chain worker's normal success path is intentionally write-only after the local claim. It calls `dark-core-lib` through `publish_ark_operations(...)`, so the worker path does not run routine `exists()` before create/update writes, and it does not run routine `get()` after successful receipts. The core library sends individual transactions with sequential pending nonces per authority window; `CHAIN_WORKER_PAGE_SIZE` controls both the claim size and the core-lib pipeline window, and defaults to `20`.
+
+Reconcile is reserved for error handling. It is a verification step, not a mutation step:
+
+- if on-chain `url` and `cid` already match the expected `target` and `level1_cid`, the worker finalizes local state as `PUBLISHED`;
+- if a `DRAFT` create finds an existing but different ARK, the worker treats it as a permanent conflict and does not automatically run `update_ark`;
+- if an `UPDATE` finds a different or missing on-chain ARK, the original error class decides retry vs permanent failure;
+- if the reconcile read itself fails, the worker falls back to the original error classification.
 
 ### Storage Ordering
 
@@ -285,7 +330,9 @@ The ordering is intentional:
 1. store Level-2 raw payload
 2. inject `original_metadata.cid` into Level-1 JSON
 3. store finalized Level-1 JSON
-4. publish the Level-1 CID on-chain
+4. persist both CIDs in PostgreSQL
+5. purge local `level1_json` and `original_content`
+6. publish the Level-1 CID on-chain from the chain worker
 
 This makes Level-1 the canonical chain-facing entry point while still preserving the original payload.
 
@@ -299,10 +346,8 @@ The lifecycle enum is defined in [`app/models/states.py`](./app/models/states.py
 stateDiagram-v2
     [*] --> RESERVED: reserve
     RESERVED --> DRAFT: stage create
-    DRAFT --> DRAFT: overwrite pending create
     DRAFT --> PUBLISHED: worker create_ark
     PUBLISHED --> UPDATE: stage update
-    UPDATE --> UPDATE: overwrite pending update
     UPDATE --> PUBLISHED: worker update_ark
     RESERVED --> TOMBSTONE: local delete
     DRAFT --> TOMBSTONE: local delete
@@ -328,7 +373,7 @@ The minter relies on PostgreSQL semantics for most of its concurrency guarantees
 ```mermaid
 flowchart LR
     A["NOID counter"] --> B["atomic counter allocation"]
-    C["Pending publish claims"] --> D["FOR UPDATE SKIP LOCKED"]
+    C["Pending worker claims"] --> D["FOR UPDATE SKIP LOCKED"]
     E["Lifecycle transitions"] --> F["CAS SQL updates"]
     G["Worker singleton"] --> H["advisory lock + pidfile"]
     I["Retry schedule"] --> J["publish_last_attempt_at + retry_count"]
@@ -344,9 +389,9 @@ The counter repository uses:
 
 Operationally, the minter is designed around PostgreSQL deployment, and that is where the strongest guarantees exist.
 
-### Publish Claims
+### Worker Claims
 
-`get_drafts_pending_publish()` does not keep long row locks for the whole publish transaction. Instead it:
+`get_metadata_pending_persist()` and `get_chain_pending_publish()` do not keep long row locks for the whole external operation. Instead they:
 
 1. selects pending records with `FOR UPDATE SKIP LOCKED`
 2. marks them as attempted
@@ -367,7 +412,7 @@ Retry state is persisted in the DB, not memory:
 - `publish_retry_count`
 - `publish_last_attempt_at`
 - `publish_permanently_failed`
-- `publish_error`
+- `publish_last_error`
 
 That means retries survive:
 
@@ -375,23 +420,27 @@ That means retries survive:
 - container recreation
 - worker crashes
 
+The same `publish_*` fields track whichever stage is currently active. Before both metadata CIDs exist they refer to metadata persistence; after both CIDs exist they refer to blockchain publication. The metadata worker resets these fields once CIDs are complete, so the chain worker starts with a clean retry budget.
+
 ## 10. Worker Runtime Status
 
 Worker liveness is represented in the database through `worker_runtime_status`, not by inspecting process internals over IPC.
 
 ```mermaid
 sequenceDiagram
-    participant Worker as "main_worker"
+    participant Worker as "main_worker metadata/chain"
     participant Repo as "WorkerRuntimeRepository"
     participant DB as "PostgreSQL"
     participant API as "/api/v1/worker/status"
 
-    Worker->>Repo: upsert_status(RUNNING, heartbeat, counters)
+    Worker->>Repo: upsert_status(worker_name, RUNNING, heartbeat, counters)
+    Worker->>Repo: supervisor upsert during long cycles
     Repo->>DB: UPSERT worker_runtime_status
-    API->>Repo: get_by_name(worker_runtime_name)
+    API->>Repo: get_by_name(metadata_worker_runtime_name)
+    API->>Repo: get_by_name(chain_worker_runtime_name)
     Repo->>DB: SELECT heartbeat row
     API->>API: derive running/stale flags
-    API-->>Client: worker status payload
+    API-->>Client: combined worker status payload
 ```
 
 This makes worker status available even when:
@@ -399,6 +448,29 @@ This makes worker status available even when:
 - API and worker are different containers
 - worker logs are not directly accessible
 - only the shared database is visible
+
+`GET /api/v1/worker/status` returns a compact operational summary by default:
+
+- `overall`: `ok`, `degraded`, or `down`
+- `message`: one-line human-readable status
+- `workers.metadata` and `workers.chain`: compact worker state, liveness, last-cycle summary, and queue summary
+- `errors`: aggregate retrying/permanent error counts
+- `arks`: aggregate ARK counts by lifecycle state
+
+Queue metrics are read-only aggregate queries over `ark_records` and `ark_metadata`.
+
+In compact mode, `last_cycle.processed` is the number of ARKs attempted in the latest cycle. It is not a lifetime counter and it is not the queue size. For metadata it means "attempted metadata persistence"; for chain it means "attempted on-chain publication". `last_cycle.succeeded` means persisted for metadata and published or reconciled-as-published for chain.
+
+`GET /api/v1/worker/status?detail=full` returns detailed heartbeat, queue, cadence, config, and host/process fields. In full mode, each worker status includes `cadence` metrics:
+
+- `last_cycle_duration_seconds` and last-cycle attempted/succeeded/failed counts
+- `page_size`, `sleep_seconds`, `next_action`, and `sleep_seconds_next`
+- `last_cycle_full_page`, true when the previous cycle processed at least one full page
+- `cycle_utilization_ratio`, calculated as cycle duration divided by worker sleep
+- `ready_pages` and `estimated_seconds_to_drain_ready` for the ready queue
+- `pressure`, a compact state for operational dashboards
+
+Full status also includes `config.chain.worker_page_size`, which is the active max in-flight transaction window per authority because chain page size and pipeline size are the same.
 
 ## 11. Data Model
 
@@ -420,10 +492,11 @@ erDiagram
     ARK_METADATA {
         int id PK
         int ark_record_id FK
-        json level1_json
+        json level1_json "nullable after purge"
         string level1_cid
-        text original_content
+        text original_content "nullable after purge"
         string original_schema
+        string original_media_type
         string original_cid
     }
 
@@ -442,6 +515,10 @@ erDiagram
         datetime last_heartbeat_at
         datetime started_at
         datetime last_cycle_at
+        float last_cycle_duration_seconds
+        int last_cycle_processed
+        int last_cycle_succeeded
+        int last_cycle_failed
         int total_processed
         int total_succeeded
         int total_failed
@@ -454,7 +531,8 @@ erDiagram
 - `ark_records`
   - lifecycle state and identity of each ARK
 - `ark_metadata`
-  - staged and published metadata payloads plus CIDs
+  - staged metadata payloads, published CIDs, and schema/media-type fields
+  - `level1_json` and `original_content` are nullable because they are purged after successful metadata persistence
 - `noid_counters`
   - deterministic namespace counters
 - `worker_runtime_status`
@@ -493,16 +571,18 @@ flowchart LR
     MINTER["components/services/dark-core-minter-api"] --> NET
     MINTER --> PG["postgres container"]
     MINTER --> API["minter-api"]
-    MINTER --> W["minter-worker"]
+    MINTER --> MW["minter-metadata-worker"]
+    MINTER --> CW["minter-chain-worker"]
     API --> VOL["metadata-storage volume"]
-    W --> VOL
+    MW --> VOL
 ```
 
 Important deployment assumptions:
 
 - blockchain is already running on `dark-net`
-- API and worker share PostgreSQL
-- API and worker share metadata storage when filesystem backend is used
+- API and both workers share PostgreSQL
+- API and metadata worker share metadata storage when filesystem backend is used
+- chain worker does not need local metadata payloads; it only needs target, authority, ARK identity, and CIDs
 - `.env.integration` is the preferred deployed config file
 
 ## 14. Tradeoffs and Current Limits

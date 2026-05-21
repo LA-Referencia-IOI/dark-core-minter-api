@@ -40,6 +40,7 @@ class Settings(BaseSettings):
         default=8001,
         validation_alias=AliasChoices("MINTER_API_PORT", "CORE_API_PORT"),
     )
+    minter_api_workers: int = 1
     
     # Batch processing
     batch_size_limit: int = 100
@@ -55,12 +56,20 @@ class Settings(BaseSettings):
     auth_cache_maxsize: int = 1000
     
     # Worker Configuration
-    worker_enabled: bool = True
-    worker_interval_seconds: int = 30  # Run every 30 seconds
-    worker_batch_size: int = 100  # Process up to 100 ARKs per cycle
-    worker_max_retries: int = 5  # Max retry attempts before marking as failed
-    worker_retry_backoff_base: float = 2.0  # Exponential backoff base (seconds)
-    worker_runtime_name: str = "ark-publisher"
+    metadata_worker_enabled: bool = True
+    metadata_worker_page_size: int = 100
+    metadata_worker_sleep_seconds: int = 2
+    metadata_worker_max_retries: int = 5
+    metadata_worker_retry_backoff_base: float = 2.0
+    metadata_worker_runtime_name: str = "metadata-publisher"
+
+    chain_worker_enabled: bool = True
+    chain_worker_page_size: int = 20
+    chain_worker_sleep_seconds: int = 5
+    chain_worker_rpc_retry_seconds: int = 10
+    chain_worker_max_retries: int = 5
+    chain_worker_retry_backoff_base: float = 2.0
+    chain_worker_runtime_name: str = "chain-publisher"
     worker_heartbeat_interval_seconds: int = 10
     worker_heartbeat_stale_after_seconds: int = 180
     
@@ -83,11 +92,14 @@ class Settings(BaseSettings):
     
     # Blockchain connection shared with dark-core-lib
     dark_rpc_url: str = "http://localhost:8545"
+    dark_rpc_health_timeout_seconds: float = 2.0
+    dark_rpc_connect_retry_seconds: float = 30.0
+    dark_rpc_connect_retry_interval_seconds: float = 2.0
     dark_chain_id: int = 1337
     dark_authority_address: str = ""
     dark_contract_address: str = ""
     dark_admin_private_key: str = ""
-    
+
     def validate_blockchain_config(self) -> None:
         """Validate that blockchain configuration is complete."""
         missing = []

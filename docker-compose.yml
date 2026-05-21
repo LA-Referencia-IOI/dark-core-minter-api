@@ -41,9 +41,27 @@ services:
       - minter-net
       - dark-net
 
-  minter-worker:
+  minter-metadata-worker:
     build: *minter-build
-    command: ["worker"]
+    command: ["metadata-worker"]
+    volumes:
+      - metadata-storage:/app/metadata_storage
+    env_file:
+      - .env.integration
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
+      - DARK_RPC_URL=http://rpc01:8545
+    restart: unless-stopped
+    networks:
+      - minter-net
+      - dark-net
+
+  minter-chain-worker:
+    build: *minter-build
+    command: ["chain-worker"]
     volumes:
       - metadata-storage:/app/metadata_storage
     env_file:

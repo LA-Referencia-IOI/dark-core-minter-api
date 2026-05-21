@@ -5,8 +5,9 @@ Unit tests for ARKPublisher using mocks only (no real DB).
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from dark_core_lib.exceptions import AuthorityError, AuthorityNotFoundError, AuthorizationError
+from dark_core_lib.exceptions import ARKNotFoundError, AuthorityError, AuthorityNotFoundError, AuthorizationError
 from dark_core_lib.metadata import StorageError, StoredDocument
+from dark_core_lib.models import ARKPublishResult
 
 from app.models.states import ARKState
 from app.workers.publisher import ARKPublisher
@@ -94,10 +95,33 @@ def _build_repo(ark_record, metadata_record):
     repo = Mock()
     repo.get_by_ark.return_value = ark_record
     repo.get_metadata_by_ark_id.return_value = metadata_record
-    repo.update_metadata_cids = Mock()
+
+    def _update_metadata_cids(
+        ark_record_id,
+        level1_cid=None,
+        level2_cid=None,
+        purge_local=False,
+        reset_publish_tracking=False,
+    ):
+        if metadata_record is None:
+            return
+        if level1_cid is not None:
+            metadata_record.level1_cid = level1_cid
+        if level2_cid is not None:
+            metadata_record.original_cid = level2_cid
+        if purge_local:
+            metadata_record.level1_json = None
+            metadata_record.original_content = None
+        if reset_publish_tracking:
+            ark_record.publish_retry_count = 0
+
+    repo.update_metadata_cids = Mock(side_effect=_update_metadata_cids)
     repo.update_to_published = Mock()
     repo.mark_publish_failed = Mock()
+    repo.defer_publish_retry = Mock()
     repo.get_drafts_pending_publish.return_value = []
+    repo.get_metadata_pending_persist.return_value = []
+    repo.get_chain_pending_publish.return_value = []
     return repo
 
 
@@ -116,7 +140,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=mock_storage,
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -134,7 +158,10 @@ class TestARKPublisherUnit:
 
     def test_publish_single_ark_update_calls_update_ark(self):
         ark_record = MockARKRecord(ark_id=2, naan="12345", name="update", state=ARKState.UPDATE)
-        metadata_record = MockMetadataRecord()
+        metadata_record = MockMetadataRecord(
+            level1_cid="cid-level-1",
+            original_cid="cid-level-2",
+        )
         mock_repo = _build_repo(ark_record, metadata_record)
 
         mock_corelib = Mock()
@@ -144,7 +171,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -165,7 +192,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=Mock(),
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -181,16 +208,20 @@ class TestARKPublisherUnit:
 
     def test_publish_single_ark_authority_error(self):
         ark_record = MockARKRecord(ark_id=4, naan="12345", name="auth-error", state=ARKState.DRAFT)
-        metadata_record = MockMetadataRecord()
+        metadata_record = MockMetadataRecord(
+            level1_cid="cid-level-1",
+            original_cid="cid-level-2",
+        )
         mock_repo = _build_repo(ark_record, metadata_record)
 
         mock_corelib = Mock()
         mock_corelib.create_ark = Mock(side_effect=AuthorityError("Unauthorized"))
+        mock_corelib.get_ark = Mock(side_effect=ARKNotFoundError("not found"))
 
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -214,7 +245,10 @@ class TestARKPublisherUnit:
             state=ARKState.DRAFT,
             publish_retry_count=4,
         )
-        metadata_record = MockMetadataRecord()
+        metadata_record = MockMetadataRecord(
+            level1_cid="cid-level-1",
+            original_cid="cid-level-2",
+        )
         mock_repo = _build_repo(ark_record, metadata_record)
 
         mock_corelib = Mock()
@@ -223,7 +257,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -241,7 +275,10 @@ class TestARKPublisherUnit:
 
     def test_publish_single_ark_authority_not_found_is_permanent(self):
         ark_record = MockARKRecord(ark_id=41, naan="12345", name="auth-not-found", state=ARKState.DRAFT)
-        metadata_record = MockMetadataRecord()
+        metadata_record = MockMetadataRecord(
+            level1_cid="cid-level-1",
+            original_cid="cid-level-2",
+        )
         mock_repo = _build_repo(ark_record, metadata_record)
 
         mock_corelib = Mock()
@@ -250,7 +287,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -277,7 +314,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -301,7 +338,10 @@ class TestARKPublisherUnit:
             state=ARKState.DRAFT,
             publish_retry_count=4,
         )
-        metadata_record = MockMetadataRecord()
+        metadata_record = MockMetadataRecord(
+            level1_cid="cid-level-1",
+            original_cid="cid-level-2",
+        )
         mock_repo = _build_repo(ark_record, metadata_record)
 
         mock_corelib = Mock()
@@ -310,7 +350,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -340,23 +380,51 @@ class TestARKPublisherUnit:
         }
 
         mock_repo = Mock()
-        mock_repo.get_drafts_pending_publish.return_value = [
+        mock_repo.get_metadata_pending_persist.return_value = [
             SimpleNamespace(ark=draft_1.ark),
             SimpleNamespace(ark=draft_2.ark),
         ]
+        mock_repo.get_chain_pending_publish.return_value = [
+            draft_1,
+            draft_2,
+        ]
         mock_repo.get_by_ark.side_effect = lambda ark: by_ark.get(ark)
         mock_repo.get_metadata_by_ark_id.side_effect = lambda ark_id: by_id.get(ark_id)
-        mock_repo.update_metadata_cids = Mock()
+
+        def _update_metadata_cids(
+            ark_record_id,
+            level1_cid=None,
+            level2_cid=None,
+            purge_local=False,
+            reset_publish_tracking=False,
+        ):
+            metadata = by_id.get(ark_record_id)
+            if metadata is None:
+                return
+            if level1_cid is not None:
+                metadata.level1_cid = level1_cid
+            if level2_cid is not None:
+                metadata.original_cid = level2_cid
+            if purge_local:
+                metadata.level1_json = None
+                metadata.original_content = None
+
+        mock_repo.update_metadata_cids = Mock(side_effect=_update_metadata_cids)
         mock_repo.update_to_published = Mock()
         mock_repo.mark_publish_failed = Mock()
 
         mock_corelib = Mock()
-        mock_corelib.create_ark = Mock()
+        mock_corelib.publish_ark_operations = Mock(
+            side_effect=lambda uuid, operations, pipeline_size: [
+                ARKPublishResult(ref=operation.ref, action=operation.action, status="confirmed")
+                for operation in operations
+            ]
+        )
 
         publisher = ARKPublisher(
             corelib_client=mock_corelib,
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )
@@ -368,6 +436,7 @@ class TestARKPublisherUnit:
 
         assert publisher.stats["total_processed"] == 2
         assert publisher.stats["total_succeeded"] == 2
+        mock_corelib.publish_ark_operations.assert_called_once()
 
     def test_storage_health_check(self):
         storage = MockMetadataStorage()
@@ -380,7 +449,7 @@ class TestARKPublisherUnit:
         publisher = ARKPublisher(
             corelib_client=Mock(),
             metadata_storage=MockMetadataStorage(),
-            batch_size=10,
+            page_size=10,
             max_retries=5,
             backoff_base=2.0,
         )

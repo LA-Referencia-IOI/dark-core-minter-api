@@ -22,15 +22,25 @@ fi
 
 HOST="${MINTER_API_HOST:-${CORE_API_HOST:-0.0.0.0}}"
 PORT="${MINTER_API_PORT:-${CORE_API_PORT:-8001}}"
+API_WORKERS="${MINTER_API_WORKERS:-1}"
 
 MODE="${1:-api}"
 
 case "$MODE" in
   api)
-    run_as_appuser "uvicorn app.main:app --host '$HOST' --port '$PORT' --workers 4"
+    run_as_appuser "uvicorn app.main:app --host '$HOST' --port '$PORT' --workers '$API_WORKERS'"
+    ;;
+  migrate)
+    run_as_appuser "python -m app.database migrate"
     ;;
   worker)
-    run_as_appuser "python -m app.main_worker"
+    run_as_appuser "python -m app.main_worker chain"
+    ;;
+  chain-worker)
+    run_as_appuser "python -m app.main_worker chain"
+    ;;
+  metadata-worker)
+    run_as_appuser "python -m app.main_worker metadata"
     ;;
   *)
     if [ "$(id -u)" = "0" ]; then

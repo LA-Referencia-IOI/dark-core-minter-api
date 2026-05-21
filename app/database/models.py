@@ -7,6 +7,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Column,
+    Float,
     Integer,
     BigInteger,
     String,
@@ -105,7 +106,7 @@ class NoidCounter(Base):
 
 class WorkerRuntimeStatus(Base):
     """
-    Runtime status for standalone workers using DB heartbeat.
+    Runtime status for worker processes using DB heartbeat.
 
     The API reads this table to expose worker status without
     direct process coupling.
@@ -121,6 +122,10 @@ class WorkerRuntimeStatus(Base):
     last_heartbeat_at = Column(DateTime, nullable=False, index=True)
     started_at = Column(DateTime, nullable=False)
     last_cycle_at = Column(DateTime, nullable=True)
+    last_cycle_duration_seconds = Column(Float, nullable=True)
+    last_cycle_processed = Column(Integer, nullable=True)
+    last_cycle_succeeded = Column(Integer, nullable=True)
+    last_cycle_failed = Column(Integer, nullable=True)
     last_error = Column(Text, nullable=True)
 
     total_processed = Column(Integer, nullable=False, default=0, server_default="0")
@@ -151,11 +156,11 @@ class ARKMetadata(Base):
     ark_record_id = Column(Integer, ForeignKey("ark_records.id"), nullable=False, unique=True, index=True)
     
     # Level 1 — minimal metadata (validated JSON from client)
-    level1_json = Column(JSON, nullable=False)
+    level1_json = Column(JSON, nullable=True)
     level1_cid = Column(String(100), nullable=True)   # Set by worker after IPFS store
     
     # Level 2 — original metadata (opaque content from client)
-    original_content = Column(Text, nullable=False)
+    original_content = Column(Text, nullable=True)
     original_schema = Column(String(50), nullable=False)  # "dublin_core", etc.
     original_media_type = Column(String(255), nullable=True)
     original_cid = Column(String(100), nullable=True)     # Set by worker after IPFS store

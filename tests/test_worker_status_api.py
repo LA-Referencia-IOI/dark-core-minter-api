@@ -4,7 +4,7 @@ Tests for worker status API backed by DB heartbeat.
 
 from datetime import datetime, timedelta, timezone
 
-from app.database.models import ARKRecord, WorkerRuntimeStatus
+from app.database.models import ARKMetadata, ARKRecord, WorkerRuntimeStatus
 from app.models.states import ARKState
 
 
@@ -22,6 +22,7 @@ def _add_ark(
     publish_last_attempt_at=None,
     publish_last_error=None,
     publish_permanently_failed: int = 0,
+    metadata_complete: bool = False,
 ):
     """Create an ARK row with worker-tracking fields for status tests."""
     ark = ARKRecord(
@@ -38,26 +39,70 @@ def _add_ark(
         publish_permanently_failed=publish_permanently_failed,
     )
     db.add(ark)
+    db.flush()
+    db.add(
+        ARKMetadata(
+            ark_record_id=ark.id,
+            level1_json=None if metadata_complete else {"title": name},
+            level1_cid=f"l1-{name}" if metadata_complete else None,
+            original_content=None if metadata_complete else f"<raw>{name}</raw>",
+            original_schema="dublin_core",
+            original_media_type="application/xml",
+            original_cid=f"l2-{name}" if metadata_complete else None,
+        )
+    )
     return ark
 
 
-def test_worker_status_unknown_when_no_heartbeat(client):
-    """API should return UNKNOWN when no worker heartbeat exists."""
+def test_worker_status_simple_unknown_when_no_heartbeat(client):
+    """Default API response should be compact and readable with no heartbeat."""
     response = client.get("/api/v1/worker/status")
 
     assert response.status_code == 200
     data = response.json()
-    assert data["enabled"] is False
-    assert data["running"] is False
-    assert data["status"] == "UNKNOWN"
-    assert data["source"] == "db_heartbeat"
-    assert data["queue"] == {
-        "pending_total": 0,
-        "ready_now": 0,
-        "delayed_by_backoff": 0,
-        "oldest_pending_at": None,
+    assert data["overall"] == "down"
+    assert data["rpc"]["available"] is True
+    assert data["workers"]["metadata"]["state"] == "unknown"
+    assert data["workers"]["metadata"]["alive"] is False
+    assert data["workers"]["metadata"]["queue"] == {"pending": 0, "ready": 0, "delayed": 0}
+    assert data["workers"]["chain"]["state"] == "unknown"
+    assert data["workers"]["chain"]["alive"] is False
+    assert data["workers"]["chain"]["queue"] == {"pending": 0, "ready": 0, "delayed": 0}
+    assert data["errors"] == {"retrying": 0, "permanent": 0}
+    assert data["arks"] == {
+        "reserved": 0,
+        "draft": 0,
+        "update": 0,
+        "published": 0,
+        "tombstone": 0,
     }
-    assert data["errors"] == {
+    assert "config" not in data
+    assert "cadence" not in data
+    assert "running" not in data
+    assert "Metadata worker is unknown" in data["message"]
+
+
+def test_worker_status_full_unknown_when_no_heartbeat(client):
+    """Full API response should include detailed per-worker debug data."""
+    response = client.get("/api/v1/worker/status?detail=full")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["workers"]["metadata"]["enabled"] is True
+    assert data["workers"]["metadata"]["running"] is False
+    assert data["workers"]["metadata"]["status"] == "UNKNOWN"
+    assert data["workers"]["metadata"]["source"] == "db_heartbeat"
+    assert data["workers"]["chain"]["enabled"] is True
+    assert data["workers"]["chain"]["running"] is False
+    assert data["workers"]["chain"]["status"] == "UNKNOWN"
+    assert data["queues"]["metadata"]["pending_total"] == 0
+    assert data["queues"]["chain"]["pending_total"] == 0
+    assert data["errors"]["chain"] == {
+        "retrying": 0,
+        "permanent": 0,
+        "oldest_error_at": None,
+    }
+    assert data["errors"]["metadata"] == {
         "retrying": 0,
         "permanent": 0,
         "oldest_error_at": None,
@@ -69,8 +114,154 @@ def test_worker_status_unknown_when_no_heartbeat(client):
         "published": 0,
         "tombstone": 0,
     }
-    assert data["config"]["worker_interval_seconds"] == 30
-    assert data["config"]["worker_batch_size"] == 100
+    assert data["config"]["metadata"]["worker_page_size"] == 100
+    assert data["config"]["metadata"]["worker_sleep_seconds"] == 2
+    assert data["config"]["chain"]["worker_page_size"] == 20
+    assert data["config"]["chain"]["worker_sleep_seconds"] == 5
+    assert data["workers"]["chain"]["cadence"]["pressure"] == "unknown"
+    assert data["workers"]["chain"]["cadence"]["page_size"] == 20
+    assert data["workers"]["chain"]["cadence"]["sleep_seconds"] == 5
+    assert data["workers"]["chain"]["cadence"]["last_cycle_full_page"] is False
+    assert data["workers"]["chain"]["cadence"]["next_action"] == "sleep"
+    assert data["workers"]["chain"]["cadence"]["sleep_seconds_next"] == 5
+    assert data["rpc"]["available"] is True
+    assert data["config"]["chain"]["worker_rpc_retry_seconds"] == 10
+    assert data["config"]["rpc"]["health_timeout_seconds"] == 2.0
+    assert "running" not in data
+    assert "queue" not in data
+    assert "cadence" not in data
+
+
+def test_worker_status_simple_summarizes_live_workers_and_queues(client, test_db):
+    """Default status should expose only operational fields for live workers."""
+    now = _utc_now()
+    for worker_name in ("metadata-publisher", "chain-publisher"):
+        test_db.add(
+            WorkerRuntimeStatus(
+                worker_name=worker_name,
+                instance_id=f"{worker_name}-instance",
+                host="worker-host",
+                pid=12345,
+                status="RUNNING",
+                last_heartbeat_at=now,
+                started_at=now - timedelta(minutes=2),
+                last_cycle_at=now - timedelta(seconds=5),
+                last_cycle_duration_seconds=2.5,
+                last_cycle_processed=1,
+                last_cycle_succeeded=1,
+                last_cycle_failed=0,
+                total_processed=1,
+                total_succeeded=1,
+                total_failed=0,
+                total_permanent_failures=0,
+            )
+        )
+    _add_ark(test_db, name="metadata-ready", state=ARKState.DRAFT)
+    _add_ark(test_db, name="chain-ready", state=ARKState.DRAFT, metadata_complete=True)
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["overall"] == "ok"
+    assert data["workers"]["metadata"]["state"] == "working"
+    assert data["workers"]["metadata"]["alive"] is True
+    assert data["workers"]["metadata"]["last_cycle"] == {
+        "processed": 1,
+        "succeeded": 1,
+        "failed": 0,
+        "duration_seconds": 2.5,
+        "page_size": 100,
+        "full_page": False,
+        "next_action": "sleep",
+    }
+    assert data["workers"]["metadata"]["queue"] == {"pending": 1, "ready": 1, "delayed": 0}
+    assert data["workers"]["chain"]["state"] == "working"
+    assert data["workers"]["chain"]["alive"] is True
+    assert data["workers"]["chain"]["queue"] == {"pending": 1, "ready": 1, "delayed": 0}
+    assert data["errors"] == {"retrying": 0, "permanent": 0}
+    assert data["arks"]["draft"] == 2
+    assert "config" not in data
+    assert "queues" not in data
+
+
+def test_worker_status_reports_chain_worker_paused_for_rpc(client, test_db):
+    """Fresh PAUSED_RPC_UNAVAILABLE heartbeat should read as alive but degraded."""
+    now = _utc_now()
+    test_db.add(
+        WorkerRuntimeStatus(
+            worker_name="chain-publisher",
+            instance_id="instance-paused",
+            host="worker-host",
+            pid=12345,
+            status="PAUSED_RPC_UNAVAILABLE",
+            last_heartbeat_at=now,
+            started_at=now - timedelta(minutes=2),
+            last_error="RPC unavailable: connection refused",
+            total_processed=0,
+            total_succeeded=0,
+            total_failed=0,
+            total_permanent_failures=0,
+        )
+    )
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["overall"] == "degraded"
+    assert data["workers"]["chain"]["state"] == "paused_rpc_unavailable"
+    assert data["workers"]["chain"]["alive"] is True
+    assert "paused because RPC is unavailable" in data["message"]
+
+
+def test_worker_status_message_mentions_permanent_errors(client, test_db):
+    """Idle workers with permanent ARK errors should explain degraded status."""
+    now = _utc_now()
+    for worker_name in ("metadata-publisher", "chain-publisher"):
+        test_db.add(
+            WorkerRuntimeStatus(
+                worker_name=worker_name,
+                instance_id=f"{worker_name}-instance",
+                host="worker-host",
+                pid=12345,
+                status="RUNNING",
+                last_heartbeat_at=now,
+                started_at=now - timedelta(minutes=2),
+                last_cycle_at=now - timedelta(seconds=5),
+                last_cycle_duration_seconds=0.01,
+                last_cycle_processed=0,
+                last_cycle_succeeded=0,
+                last_cycle_failed=0,
+                total_processed=0,
+                total_succeeded=0,
+                total_failed=0,
+                total_permanent_failures=0,
+            )
+        )
+    _add_ark(
+        test_db,
+        name="blocked-permanent",
+        state=ARKState.DRAFT,
+        publish_retry_count=5,
+        publish_last_attempt_at=now - timedelta(minutes=5),
+        publish_last_error="permanent failure",
+        publish_permanently_failed=1,
+    )
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/status")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["overall"] == "degraded"
+    assert data["workers"]["metadata"]["state"] == "idle"
+    assert data["workers"]["metadata"]["activity"] == "idle"
+    assert data["workers"]["metadata"]["status"] == "running"
+    assert data["errors"] == {"retrying": 0, "permanent": 1}
+    assert "1 permanent ARK errors require review" in data["message"]
 
 
 def test_worker_status_running_from_fresh_heartbeat(client, test_db):
@@ -78,7 +269,7 @@ def test_worker_status_running_from_fresh_heartbeat(client, test_db):
     now = _utc_now()
     test_db.add(
         WorkerRuntimeStatus(
-            worker_name="ark-publisher",
+            worker_name="chain-publisher",
             instance_id="instance-1",
             host="worker-host",
             pid=12345,
@@ -86,6 +277,10 @@ def test_worker_status_running_from_fresh_heartbeat(client, test_db):
             last_heartbeat_at=now,
             started_at=now - timedelta(minutes=2),
             last_cycle_at=now - timedelta(seconds=30),
+            last_cycle_duration_seconds=8.5,
+            last_cycle_processed=10,
+            last_cycle_succeeded=9,
+            last_cycle_failed=1,
             total_processed=10,
             total_succeeded=9,
             total_failed=1,
@@ -94,18 +289,31 @@ def test_worker_status_running_from_fresh_heartbeat(client, test_db):
     )
     test_db.commit()
 
-    response = client.get("/api/v1/worker/status")
+    response = client.get("/api/v1/worker/status?detail=full")
     assert response.status_code == 200
 
     data = response.json()
-    assert data["enabled"] is True
-    assert data["running"] is True
-    assert data["stale"] is False
-    assert data["status"] == "RUNNING"
-    assert data["worker_name"] == "ark-publisher"
-    assert data["stats"]["total_processed"] == 10
-    assert data["queue"]["pending_total"] == 0
-    assert data["errors"]["permanent"] == 0
+    chain = data["workers"]["chain"]
+    assert chain["enabled"] is True
+    assert chain["running"] is True
+    assert chain["stale"] is False
+    assert chain["status"] == "RUNNING"
+    assert chain["worker_name"] == "chain-publisher"
+    assert chain["stats"]["total_processed"] == 10
+    assert chain["cadence"]["page_size"] == 20
+    assert chain["cadence"]["sleep_seconds"] == 5
+    assert chain["cadence"]["rpc_retry_seconds"] == 10
+    assert chain["cadence"]["last_cycle_duration_seconds"] == 8.5
+    assert chain["cadence"]["last_cycle_processed"] == 10
+    assert chain["cadence"]["last_cycle_succeeded"] == 9
+    assert chain["cadence"]["last_cycle_failed"] == 1
+    assert chain["cadence"]["cycle_utilization_ratio"] == 1.7
+    assert chain["cadence"]["last_cycle_full_page"] is False
+    assert chain["cadence"]["next_action"] == "sleep"
+    assert chain["cadence"]["sleep_seconds_next"] == 5
+    assert chain["cadence"]["pressure"] == "idle"
+    assert data["queues"]["chain"]["pending_total"] == 0
+    assert data["errors"]["chain"]["permanent"] == 0
 
 
 def test_worker_status_stale_when_heartbeat_is_old(client, test_db):
@@ -113,7 +321,7 @@ def test_worker_status_stale_when_heartbeat_is_old(client, test_db):
     old = _utc_now() - timedelta(minutes=10)
     test_db.add(
         WorkerRuntimeStatus(
-            worker_name="ark-publisher",
+            worker_name="chain-publisher",
             instance_id="instance-2",
             host="worker-host",
             pid=99999,
@@ -128,14 +336,54 @@ def test_worker_status_stale_when_heartbeat_is_old(client, test_db):
     )
     test_db.commit()
 
-    response = client.get("/api/v1/worker/status")
+    response = client.get("/api/v1/worker/status?detail=full")
     assert response.status_code == 200
 
     data = response.json()
-    assert data["enabled"] is True
-    assert data["running"] is False
-    assert data["stale"] is True
-    assert data["status"] == "RUNNING"
+    chain = data["workers"]["chain"]
+    assert chain["enabled"] is True
+    assert chain["running"] is False
+    assert chain["stale"] is True
+    assert chain["status"] == "RUNNING"
+    assert chain["cadence"]["pressure"] == "stale"
+
+
+def test_worker_status_reports_full_page_continue_action(client, test_db):
+    """API should show when the worker will continue after a full page."""
+    now = _utc_now()
+    test_db.add(
+        WorkerRuntimeStatus(
+            worker_name="chain-publisher",
+            instance_id="instance-overlap",
+            host="worker-host",
+            pid=12345,
+            status="RUNNING",
+            last_heartbeat_at=now,
+            started_at=now - timedelta(minutes=2),
+            last_cycle_at=now - timedelta(seconds=5),
+            last_cycle_duration_seconds=35.25,
+            last_cycle_processed=100,
+            last_cycle_succeeded=100,
+            last_cycle_failed=0,
+            total_processed=100,
+            total_succeeded=100,
+            total_failed=0,
+            total_permanent_failures=0,
+        )
+    )
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/status?detail=full")
+    assert response.status_code == 200
+
+    data = response.json()
+    cadence = data["workers"]["chain"]["cadence"]
+    assert cadence["last_cycle_duration_seconds"] == 35.25
+    assert cadence["cycle_utilization_ratio"] == 7.05
+    assert cadence["last_cycle_full_page"] is True
+    assert cadence["next_action"] == "continue"
+    assert cadence["sleep_seconds_next"] == 0
+    assert cadence["pressure"] == "backlogged"
 
 
 def test_worker_status_includes_queue_state_and_error_summary(client, test_db):
@@ -178,18 +426,18 @@ def test_worker_status_includes_queue_state_and_error_summary(client, test_db):
     )
     test_db.commit()
 
-    response = client.get("/api/v1/worker/status")
+    response = client.get("/api/v1/worker/status?detail=full")
     assert response.status_code == 200
 
     data = response.json()
-    assert data["queue"]["pending_total"] == 4
-    assert data["queue"]["ready_now"] == 3
-    assert data["queue"]["delayed_by_backoff"] == 1
-    assert data["queue"]["oldest_pending_at"] == old_pending.isoformat()
+    assert data["queues"]["metadata"]["pending_total"] == 4
+    assert data["queues"]["metadata"]["ready_now"] == 3
+    assert data["queues"]["metadata"]["delayed_by_backoff"] == 1
+    assert data["queues"]["metadata"]["oldest_pending_at"] == old_pending.isoformat()
 
-    assert data["errors"]["retrying"] == 2
-    assert data["errors"]["permanent"] == 1
-    assert data["errors"]["oldest_error_at"] == old_error.isoformat()
+    assert data["errors"]["metadata"]["retrying"] == 2
+    assert data["errors"]["metadata"]["permanent"] == 1
+    assert data["errors"]["metadata"]["oldest_error_at"] == old_error.isoformat()
 
     assert data["by_state"] == {
         "reserved": 1,

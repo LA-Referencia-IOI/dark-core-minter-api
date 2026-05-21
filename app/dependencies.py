@@ -5,10 +5,11 @@ Provides singleton instances of the dark-core-lib client.
 """
 
 import logging
+import time
 from typing import Optional
 
 from dark_core_lib import DARKCoreClient, CoreConfig, get_metadata_storage as build_metadata_storage
-from dark_core_lib.exceptions import ConfigurationError
+from dark_core_lib.exceptions import ConfigurationError, ConnectionError as CoreConnectionError
 from dark_core_lib.metadata import MetadataStorage
 
 from app.config import get_settings
@@ -31,14 +32,31 @@ def get_corelib_client() -> DARKCoreClient:
     """
     global _corelib_client
     if _corelib_client is None:
-        raise RuntimeError(
-            "dark-core-lib client not initialized. "
-            "Call init_corelib_client() during application startup."
-        )
+        return init_corelib_client(max_wait_seconds=0)
     return _corelib_client
 
 
-def init_corelib_client() -> DARKCoreClient:
+def _build_corelib_config() -> CoreConfig:
+    """Build dark-core-lib configuration from application settings."""
+    settings = get_settings()
+    settings.validate_blockchain_config()
+
+    return CoreConfig(
+        rpc_url=settings.dark_rpc_url,
+        chain_id=settings.dark_chain_id,
+        authority_contract_address=settings.dark_authority_address,
+        dark_contract_address=settings.dark_contract_address,
+        admin_private_key=settings.dark_admin_private_key,
+        read_only=False,
+    )
+
+
+def init_corelib_client(
+    *,
+    max_wait_seconds: Optional[float] = None,
+    retry_interval_seconds: Optional[float] = None,
+    force_reconnect: bool = False,
+) -> DARKCoreClient:
     """
     Initialize the DARKCoreClient singleton.
     
@@ -52,24 +70,41 @@ def init_corelib_client() -> DARKCoreClient:
     """
     global _corelib_client
     
+    if _corelib_client is not None and not force_reconnect:
+        return _corelib_client
+
     settings = get_settings()
-    settings.validate_blockchain_config()
-    
-    logger.info("Initializing DARKCoreClient...")
-    
-    config = CoreConfig(
-        rpc_url=settings.dark_rpc_url,
-        chain_id=settings.dark_chain_id,
-        authority_contract_address=settings.dark_authority_address,
-        dark_contract_address=settings.dark_contract_address,
-        admin_private_key=settings.dark_admin_private_key,
-        read_only=False,
+    wait_seconds = (
+        float(max_wait_seconds)
+        if max_wait_seconds is not None
+        else float(settings.dark_rpc_connect_retry_seconds)
     )
-    
-    _corelib_client = DARKCoreClient(config)
-    logger.info("DARKCoreClient initialized successfully")
-    
-    return _corelib_client
+    retry_seconds = (
+        float(retry_interval_seconds)
+        if retry_interval_seconds is not None
+        else float(settings.dark_rpc_connect_retry_interval_seconds)
+    )
+    deadline = time.monotonic() + max(wait_seconds, 0.0)
+    config = _build_corelib_config()
+
+    logger.info("Initializing DARKCoreClient...")
+
+    while True:
+        try:
+            _corelib_client = DARKCoreClient(config)
+            logger.info("DARKCoreClient initialized successfully")
+            return _corelib_client
+        except CoreConnectionError:
+            _corelib_client = None
+            if time.monotonic() >= deadline:
+                raise
+
+            sleep_seconds = min(max(retry_seconds, 0.1), max(deadline - time.monotonic(), 0.1))
+            logger.warning(
+                "DARKCoreClient RPC connection failed; retrying in %.1fs",
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
 
 
 def shutdown_corelib_client() -> None:
@@ -166,4 +201,3 @@ def shutdown_metadata_storage() -> None:
     if _metadata_storage is not None:
         logger.info("Shutting down metadata storage")
         _metadata_storage = None
-

@@ -5,7 +5,7 @@ ARK repository for database operations.
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import update
+from sqlalchemy import or_, update
 from sqlalchemy.orm import Session
 
 from app.database.models import ARKRecord, ARKMetadata
@@ -269,6 +269,14 @@ class ARKRepository:
                 original_media_type=original_media_type,
             )
             self.db.add(metadata)
+
+        ark_record = self.db.query(ARKRecord).filter_by(id=ark_record_id).first()
+        if ark_record:
+            ark_record.publish_retry_count = 0
+            ark_record.publish_last_error = None
+            ark_record.publish_last_attempt_at = None
+            ark_record.publish_permanently_failed = 0
+            ark_record.updated_at = _utc_now()
         
         return metadata
 
@@ -278,17 +286,107 @@ class ARKRepository:
     def update_metadata_cids(
         self,
         ark_record_id: int,
-        level1_cid: str,
-        level2_cid: str,
+        level1_cid: Optional[str] = None,
+        level2_cid: Optional[str] = None,
+        purge_local: bool = False,
+        reset_publish_tracking: bool = False,
     ) -> None:
         """Update CIDs after worker processing."""
         metadata = self.get_metadata_by_ark_id(ark_record_id)
         if not metadata:
             raise ValueError(f"Metadata not found for ARK ID {ark_record_id}")
         
-        metadata.level1_cid = level1_cid
-        metadata.original_cid = level2_cid
+        if level1_cid is not None:
+            metadata.level1_cid = level1_cid
+        if level2_cid is not None:
+            metadata.original_cid = level2_cid
+        if purge_local:
+            metadata.level1_json = None
+            metadata.original_content = None
         metadata.updated_at = _utc_now()
+
+        if reset_publish_tracking:
+            ark_record = self.db.query(ARKRecord).filter_by(id=ark_record_id).first()
+            if ark_record:
+                ark_record.publish_retry_count = 0
+                ark_record.publish_last_error = None
+                ark_record.publish_last_attempt_at = None
+                ark_record.publish_permanently_failed = 0
+                ark_record.updated_at = _utc_now()
+
+    def get_metadata_pending_persist(
+        self,
+        limit: int = 10,
+        max_retries: int = 5,
+        backoff_base: float = 2.0,
+    ) -> List[ARKRecord]:
+        """Get DRAFT/UPDATE ARKs whose metadata still needs persisted CIDs."""
+        query = (
+            self.db.query(ARKRecord)
+            .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+            .filter(
+                ARKRecord.state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value]),
+                ARKRecord.publish_permanently_failed == 0,
+                or_(ARKMetadata.level1_cid.is_(None), ARKMetadata.original_cid.is_(None)),
+            )
+        )
+
+        return self._claim_ready_records(query, limit, max_retries, backoff_base)
+
+    def get_chain_pending_publish(
+        self,
+        limit: int = 10,
+        max_retries: int = 5,
+        backoff_base: float = 2.0,
+    ) -> List[ARKRecord]:
+        """Get DRAFT/UPDATE ARKs with persisted metadata ready for blockchain."""
+        query = (
+            self.db.query(ARKRecord)
+            .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+            .filter(
+                ARKRecord.state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value]),
+                ARKRecord.publish_permanently_failed == 0,
+                ARKMetadata.level1_cid.isnot(None),
+                ARKMetadata.original_cid.isnot(None),
+            )
+        )
+
+        return self._claim_ready_records(query, limit, max_retries, backoff_base)
+
+    def _claim_ready_records(
+        self,
+        query,
+        limit: int,
+        max_retries: int,
+        backoff_base: float,
+    ) -> List[ARKRecord]:
+        """Apply backoff and claim ready records for a worker cycle."""
+        now = _utc_now()
+
+        dialect_name = self.db.get_bind().dialect.name
+        if dialect_name == "postgresql":
+            fetch_limit = max(limit * 5, limit)
+            candidates = (
+                query.order_by(ARKRecord.authority_id.asc(), ARKRecord.created_at.asc())
+                .limit(fetch_limit)
+                .with_for_update(skip_locked=True)
+                .all()
+            )
+        else:
+            candidates = query.order_by(ARKRecord.authority_id.asc(), ARKRecord.created_at.asc()).all()
+
+        ready_records = []
+        for record in candidates:
+            if not _is_ready_for_publish(record, now, backoff_base, max_retries):
+                continue
+
+            record.publish_last_attempt_at = now
+            record.updated_at = now
+            ready_records.append(record)
+            if len(ready_records) >= limit:
+                break
+
+        return ready_records
 
     def update_draft_content(
         self,
@@ -296,40 +394,23 @@ class ARKRepository:
         target: str,
     ) -> ARKRecord:
         """
-        Update an ARK already in DRAFT without changing state.
+        Legacy guard for the old DRAFT overwrite path.
+
+        DRAFT payloads are worker-owned once staged, so callers must not mutate
+        them in place. Keep the method as an explicit rejection point for any
+        older internal code that still reaches for it.
         """
         try:
             naan, name = parse_ark(ark)
         except ValueError as exc:
             raise ValueError(f"ARK not found: {ark}") from exc
 
-        if not target:
-            raise ValueError("Target URL is required")
-
-        now = _utc_now()
-        result = self.db.execute(
-            update(ARKRecord)
-            .where(
-                ARKRecord.naan == naan,
-                ARKRecord.name == name,
-                ARKRecord.state == ARKState.DRAFT.value,
-            )
-            .values(
-                target=target,
-                updated_at=now,
-            )
-        )
-
-        if result.rowcount == 0:
-            existing = self.get_by_naan_name(naan, name)
-            if not existing:
-                raise ValueError(f"ARK not found: {ark}")
-            raise ValueError(f"ARK must be in DRAFT state, currently {existing.state}")
-
         db_ark = self.get_by_naan_name(naan, name)
-        if db_ark is None:
+        if not db_ark:
             raise ValueError(f"ARK not found: {ark}")
-        return db_ark
+        if db_ark.state != ARKState.DRAFT:
+            raise ValueError(f"ARK must be in DRAFT state, currently {db_ark.state}")
+        raise ValueError("ARK already has pending creation")
 
     def update_to_update(
         self,
@@ -339,7 +420,7 @@ class ARKRepository:
         """
         Transition ARK to UPDATE state with pending metadata changes.
 
-        Allowed source states: PUBLISHED and UPDATE.
+        Allowed source state: PUBLISHED.
         """
         try:
             naan, name = parse_ark(ark)
@@ -355,7 +436,7 @@ class ARKRepository:
             .where(
                 ARKRecord.naan == naan,
                 ARKRecord.name == name,
-                ARKRecord.state.in_([ARKState.PUBLISHED.value, ARKState.UPDATE.value]),
+                ARKRecord.state == ARKState.PUBLISHED.value,
             )
             .values(
                 state=ARKState.UPDATE.value,
@@ -369,7 +450,7 @@ class ARKRepository:
             if not existing:
                 raise ValueError(f"ARK not found: {ark}")
             raise ValueError(
-                f"ARK must be in PUBLISHED or UPDATE state, currently {existing.state}"
+                f"ARK must be in PUBLISHED state, currently {existing.state}"
             )
 
         db_ark = self.get_by_naan_name(naan, name)
@@ -394,42 +475,11 @@ class ARKRepository:
         Returns:
             List of ARKRecord in DRAFT state ready to publish
         """
-        query = self.db.query(ARKRecord).filter(
-            ARKRecord.state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value]),
-            ARKRecord.publish_permanently_failed == 0,  # Not marked as failed
+        return self.get_chain_pending_publish(
+            limit=limit,
+            max_retries=max_retries,
+            backoff_base=backoff_base,
         )
-
-        # Apply backoff filtering and claim rows by updating publish_last_attempt_at.
-        now = _utc_now()
-
-        dialect_name = self.db.get_bind().dialect.name
-        if dialect_name == "postgresql":
-            # Lock a window of rows and skip rows already locked by other workers.
-            # We over-fetch to keep enough candidates after Python backoff filtering.
-            fetch_limit = max(limit * 5, limit)
-            candidates = (
-                query.order_by(ARKRecord.created_at.asc())
-                .limit(fetch_limit)
-                .with_for_update(skip_locked=True)
-                .all()
-            )
-        else:
-            # Best effort fallback for non-PostgreSQL dialects.
-            candidates = query.order_by(ARKRecord.created_at.asc()).all()
-
-        ready_drafts = []
-        for draft in candidates:
-            if not _is_ready_for_publish(draft, now, backoff_base, max_retries):
-                continue
-
-            # Claim for this cycle so concurrent workers skip the same draft.
-            draft.publish_last_attempt_at = now
-            draft.updated_at = now
-            ready_drafts.append(draft)
-            if len(ready_drafts) >= limit:
-                break
-
-        return ready_drafts
     
     def update_to_published(
         self,
@@ -577,6 +627,44 @@ class ARKRepository:
                 ARKRecord.name == name,
             )
             .values(**values)
+        )
+
+        if result.rowcount == 0:
+            raise ValueError(f"ARK not found: {ark}")
+
+        db_ark = self.get_by_naan_name(naan, name)
+        if db_ark is None:
+            raise ValueError(f"ARK not found: {ark}")
+        return db_ark
+
+    def defer_publish_retry(
+        self,
+        ark: str,
+        error_message: str,
+    ) -> ARKRecord:
+        """
+        Release a claimed publish attempt without consuming an ARK retry.
+
+        Used for infrastructure failures where the worker cannot safely decide
+        publication state, such as RPC loss during reconcile.
+        """
+        try:
+            naan, name = parse_ark(ark)
+        except ValueError as exc:
+            raise ValueError(f"ARK not found: {ark}") from exc
+
+        now = _utc_now()
+        result = self.db.execute(
+            update(ARKRecord)
+            .where(
+                ARKRecord.naan == naan,
+                ARKRecord.name == name,
+            )
+            .values(
+                publish_last_error=error_message[:1000],
+                publish_last_attempt_at=None,
+                updated_at=now,
+            )
         )
 
         if result.rowcount == 0:

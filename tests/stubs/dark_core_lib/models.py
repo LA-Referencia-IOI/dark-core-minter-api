@@ -36,3 +36,25 @@ class TxReceiptInfo:
     status: int
     gas_used: Optional[int]
     block_number: Optional[int]
+
+
+@dataclass
+class ARKPublishOperation:
+    """Minimal semantic ARK publish operation used in tests."""
+
+    ref: str
+    action: str
+    naan: str
+    name: str
+    url: str
+    cid: str
+
+
+@dataclass
+class ARKPublishResult:
+    """Minimal semantic ARK publish result used in tests."""
+
+    ref: str
+    action: str
+    status: str
+    error: Optional[str] = None

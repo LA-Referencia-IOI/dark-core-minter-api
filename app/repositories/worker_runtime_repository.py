@@ -34,6 +34,10 @@ class WorkerRuntimeRepository:
         heartbeat_at: datetime,
         started_at: datetime,
         last_cycle_at: Optional[datetime] = None,
+        last_cycle_duration_seconds: Optional[float] = None,
+        last_cycle_processed: Optional[int] = None,
+        last_cycle_succeeded: Optional[int] = None,
+        last_cycle_failed: Optional[int] = None,
         last_error: Optional[str] = None,
         total_processed: int = 0,
         total_succeeded: int = 0,
@@ -57,6 +61,10 @@ class WorkerRuntimeRepository:
                 last_heartbeat_at=heartbeat_at,
                 started_at=started_at,
                 last_cycle_at=last_cycle_at,
+                last_cycle_duration_seconds=last_cycle_duration_seconds,
+                last_cycle_processed=last_cycle_processed,
+                last_cycle_succeeded=last_cycle_succeeded,
+                last_cycle_failed=last_cycle_failed,
                 last_error=last_error,
                 total_processed=total_processed,
                 total_succeeded=total_succeeded,
@@ -73,6 +81,10 @@ class WorkerRuntimeRepository:
         record.last_heartbeat_at = heartbeat_at
         record.started_at = started_at
         record.last_cycle_at = last_cycle_at
+        record.last_cycle_duration_seconds = last_cycle_duration_seconds
+        record.last_cycle_processed = last_cycle_processed
+        record.last_cycle_succeeded = last_cycle_succeeded
+        record.last_cycle_failed = last_cycle_failed
         record.last_error = last_error
         record.total_processed = total_processed
         record.total_succeeded = total_succeeded
@@ -80,4 +92,3 @@ class WorkerRuntimeRepository:
         record.total_permanent_failures = total_permanent_failures
 
         return record
-
