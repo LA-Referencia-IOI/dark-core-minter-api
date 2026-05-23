@@ -37,6 +37,26 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _is_storage_infrastructure_error(error: Exception | str) -> bool:
+    """Return True for storage backend failures that should not consume ARK retries."""
+    message = str(error).lower()
+    return any(
+        token in message
+        for token in (
+            "not enough peers",
+            "available candidates",
+            "cluster pin registration failed",
+            "store api store failed (500)",
+            "ipfs connection failed",
+            "connection",
+            "timeout",
+            "timed out",
+            "unavailable",
+            "refused",
+        )
+    )
+
+
 class _WorkerStatsMixin:
     """Shared in-process counters exposed through DB heartbeat."""
 
@@ -45,12 +65,15 @@ class _WorkerStatsMixin:
             "total_processed": 0,
             "total_succeeded": 0,
             "total_failed": 0,
+            "total_deferred": 0,
             "total_permanent_failures": 0,
             "last_run_at": None,
             "last_run_duration": None,
             "last_run_processed": None,
             "last_run_succeeded": None,
             "last_run_failed": None,
+            "last_run_deferred": None,
+            "last_run_page_size": None,
             "recent_errors": [],
         }
 
@@ -76,6 +99,7 @@ class _WorkerStatsMixin:
             "processed": int(self.stats["total_processed"] or 0),
             "succeeded": int(self.stats["total_succeeded"] or 0),
             "failed": int(self.stats["total_failed"] or 0),
+            "deferred": int(self.stats["total_deferred"] or 0),
         }
 
     def _record_cycle_metrics(self, start_time: datetime, before: dict) -> float:
@@ -86,6 +110,7 @@ class _WorkerStatsMixin:
         self.stats["last_run_processed"] = int(self.stats["total_processed"] or 0) - before["processed"]
         self.stats["last_run_succeeded"] = int(self.stats["total_succeeded"] or 0) - before["succeeded"]
         self.stats["last_run_failed"] = int(self.stats["total_failed"] or 0) - before["failed"]
+        self.stats["last_run_deferred"] = int(self.stats["total_deferred"] or 0) - before["deferred"]
         return duration
 
 
@@ -174,6 +199,14 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
             except StorageError as e:
                 if l2_cid and not had_l2_cid:
                     repo.update_metadata_cids(ark_record.id, level2_cid=l2_cid)
+                if _is_storage_infrastructure_error(e):
+                    error_msg = f"Metadata storage unavailable (infrastructure): {e}"
+                    logger.warning(f"{error_msg} for ARK {ark_id}")
+                    repo.defer_publish_retry(ark_id, error_msg)
+                    db.commit()
+                    self._add_recent_error(ark_id, error_msg)
+                    return False
+
                 is_permanent = (
                     "is required" in str(e)
                     or ark_record.publish_retry_count >= self.max_retries - 1
@@ -339,6 +372,7 @@ class ChainPublisherWorker(_WorkerStatsMixin):
         logger.warning(f"{error_msg} for ARK {ark_id}; deferring without consuming retry")
         repo.defer_publish_retry(ark_id, error_msg)
         db.commit()
+        self.stats["total_deferred"] += 1
         self._add_recent_error(ark_id, error_msg)
         return False
 
@@ -375,6 +409,14 @@ class ChainPublisherWorker(_WorkerStatsMixin):
                 db=db,
                 ark_id=ark_id,
                 error_msg=f"{error_msg}; reconcile unavailable",
+            )
+
+        if original_is_infrastructure and reconcile_result == "missing":
+            return self._defer_infrastructure_retry(
+                repo=repo,
+                db=db,
+                ark_id=ark_id,
+                error_msg=f"{error_msg}; reconcile result: missing",
             )
 
         is_permanent = original_is_permanent
@@ -646,21 +688,27 @@ class ChainPublisherWorker(_WorkerStatsMixin):
             "operation": operation,
         }
 
-    def _publish_authority_group(self, authority_id: str, items: list[dict]) -> None:
+    def _publish_authority_group(
+        self,
+        authority_id: str,
+        items: list[dict],
+        *,
+        pipeline_size: int,
+    ) -> None:
         """Publish one authority group through the core-lib nonce pipeline."""
         operations = [item["operation"] for item in items]
         logger.info(
             "Publishing %s ARKs for authority %s with page_size=%s",
             len(operations),
             authority_id,
-            self.page_size,
+            pipeline_size,
         )
 
         try:
             results = self.corelib_client.publish_ark_operations(
                 uuid=authority_id,
                 operations=operations,
-                pipeline_size=self.page_size,
+                pipeline_size=pipeline_size,
             )
         except Exception as exc:
             logger.error(f"Pipeline publish failed for authority {authority_id}: {exc}")
@@ -685,10 +733,12 @@ class ChainPublisherWorker(_WorkerStatsMixin):
             if not self._apply_pipeline_result(item, result):
                 self.stats["total_failed"] += 1
 
-    def run_publish_cycle(self) -> None:
+    def run_publish_cycle(self, effective_page_size: int | None = None) -> None:
         """Run one blockchain publication cycle."""
         start_time = _utc_now()
         before = self._snapshot_cycle_totals()
+        cycle_page_size = max(int(effective_page_size or self.page_size), 1)
+        self.stats["last_run_page_size"] = cycle_page_size
 
         try:
             session_factory = SessionLocal()
@@ -697,7 +747,7 @@ class ChainPublisherWorker(_WorkerStatsMixin):
             try:
                 repo = ARKRepository(db)
                 records = repo.get_chain_pending_publish(
-                    limit=self.page_size,
+                    limit=cycle_page_size,
                     max_retries=self.max_retries,
                     backoff_base=self.backoff_base,
                 )
@@ -722,7 +772,11 @@ class ChainPublisherWorker(_WorkerStatsMixin):
                 grouped_items[item["authority_id"]].append(item)
 
             for authority_id, group_items in grouped_items.items():
-                self._publish_authority_group(authority_id, group_items)
+                self._publish_authority_group(
+                    authority_id,
+                    group_items,
+                    pipeline_size=cycle_page_size,
+                )
 
         except Exception as e:
             logger.error(f"Error in blockchain publish cycle: {e}")

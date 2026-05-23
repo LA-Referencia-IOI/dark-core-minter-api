@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     metadata_worker_enabled: bool = True
     metadata_worker_page_size: int = 100
     metadata_worker_sleep_seconds: int = 2
+    metadata_worker_storage_retry_seconds: int = 10
     metadata_worker_max_retries: int = 5
     metadata_worker_retry_backoff_base: float = 2.0
     metadata_worker_runtime_name: str = "metadata-publisher"
@@ -67,11 +68,17 @@ class Settings(BaseSettings):
     chain_worker_page_size: int = 20
     chain_worker_sleep_seconds: int = 5
     chain_worker_rpc_retry_seconds: int = 10
+    chain_worker_congestion_retry_seconds: int = 30
+    chain_worker_block_stall_seconds: int = 120
+    chain_worker_adaptive_page_enabled: bool = True
+    chain_worker_min_page_size: int = 1
+    chain_worker_recovery_success_cycles: int = 3
     chain_worker_max_retries: int = 5
     chain_worker_retry_backoff_base: float = 2.0
     chain_worker_runtime_name: str = "chain-publisher"
     worker_heartbeat_interval_seconds: int = 10
     worker_heartbeat_stale_after_seconds: int = 180
+    permanent_rescue_max_items: int = 50
     
     # Metadata Storage Configuration
     metadata_storage_type: str = "store_api"  # "filesystem" or "store_api"
@@ -96,6 +103,7 @@ class Settings(BaseSettings):
     dark_rpc_connect_retry_seconds: float = 30.0
     dark_rpc_connect_retry_interval_seconds: float = 2.0
     dark_chain_id: int = 1337
+    dark_gas_limit: int = 550000
     dark_authority_address: str = ""
     dark_contract_address: str = ""
     dark_admin_private_key: str = ""

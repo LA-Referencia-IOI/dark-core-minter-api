@@ -270,8 +270,10 @@ Important points:
 - the blockchain stores the Level-1 CID as the canonical pointer.
 - `publish_*` retry fields are reused for the currently pending stage; they are reset after metadata persistence succeeds so blockchain retries start cleanly.
 - the shared implementation of this pipeline now lives in `dark_core_lib.metadata.MetadataService`.
+- the metadata worker checks metadata storage readiness before claiming ARKs. If Store API/IPFS is unavailable, or IPFS Cluster reports too few peers, it pauses as `PAUSED_STORAGE_UNAVAILABLE` and does not consume ARK retries.
 - the chain worker calls `dark-core-lib` through `publish_ark_operations(...)`, grouping ARKs by `authority_id` and sending individual create/update transactions with sequential pending nonces.
-- `CHAIN_WORKER_PAGE_SIZE` is the only chain size knob: it is both the number of ARKs claimed per cycle and the core-lib transaction pipeline window; the default is `20`.
+- `CHAIN_WORKER_PAGE_SIZE` is the nominal maximum chain page size; the default is `20`. Before each cycle, the worker asks `dark-core-lib` for `get_chain_capacity(...)` and may temporarily use a smaller effective page size for both DB claim and the core-lib pipeline window.
+- the chain worker pauses before claiming ARKs if core-lib reports RPC unavailable, stalled block production, or critical chain congestion. It also pauses after a full effective page of infrastructure-deferred receipt failures, which protects QBFT/Besu from repeated saturated pages.
 - the chain worker only reads blockchain during error handling. Reconcile never creates a different operation; it only confirms that the failed/ambiguous write already produced the expected `target` + `level1_cid`, or classifies the failure for retry/permanent handling.
 
 ### 4. Tombstone
@@ -398,7 +400,8 @@ Use `GET /api/v1/worker/status?detail=full` for detailed heartbeat, queue, caden
 
 - `last_cycle_duration_seconds`: how long the last cycle took.
 - `last_cycle_processed`: how many ARKs the last cycle attempted.
-- `page_size`: how many ARKs this worker can claim in one cycle.
+- `page_size`: the nominal maximum ARKs this worker can claim in one cycle.
+- `effective_page_size_recommended`: the current core-lib recommendation for chain pacing.
 - `sleep_seconds`: how long the worker sleeps after an empty or partial page.
 - `last_cycle_full_page`: whether the last cycle processed a full page.
 - `next_action`: `continue`, `sleep`, or `pause_rpc`.
@@ -408,11 +411,19 @@ Use `GET /api/v1/worker/status?detail=full` for detailed heartbeat, queue, caden
 - `estimated_seconds_to_drain_ready`: rough drain time for the ready queue at the current sleep and page size.
 - `pressure`: compact state such as `idle`, `working`, `backlogged`, `rpc_unavailable`, `stale`, or `unknown`.
 
-For the chain worker, `last_cycle_full_page=true` means the worker will continue immediately without sleeping. If the RPC is unavailable, it does not claim ARKs and reports `next_action=pause_rpc`.
+The payload also includes `chain_capacity`, a semantic snapshot returned by `dark-core-lib` with the current capacity state, reason, block number, txpool pending count when available, and recommended effective page size.
+
+For the chain worker, `last_cycle_full_page=true` means the worker will continue immediately without sleeping. If core-lib reports RPC or chain capacity unavailable, it does not claim ARKs and reports `next_action=pause_rpc` or `next_action=pause_chain`.
 
 Worker heartbeats are emitted by a lightweight supervisor thread, so a full chain batch can take longer than `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` without incorrectly marking the worker stale.
 
 The detailed `config.chain.worker_page_size` field shows the active chain transaction pipeline window because chain page size and core-lib pipeline size are intentionally the same value. `last_cycle.processed` still means ARKs attempted in the latest cycle, not transactions confirmed forever and not queue size.
+
+### Worker Errors and Rescue
+
+`GET /api/v1/worker/errors` returns a compact error report by default. Add `list=permanent`, `list=retrying`, or `list=all` to receive paginated rows. Both summary and list modes accept `authority_id`, `stage=all|metadata|chain`, and `error_type=all|transaction_reverted|gas_limit|authority|metadata_storage|infrastructure|reconcile_conflict|max_retries|unknown`.
+
+`POST /api/v1/worker/errors/rescue` applies a rescue action to the same filtered universe, limited to permanent chain-stage errors for the authenticated authority. It retries one ARK at a time with `DARK_GAS_LIMIT * 2`; if the gas estimate is still above that limit, the ARK remains permanent and is classified as `gas_limit`.
 
 ## API Surface
 
@@ -427,6 +438,8 @@ The detailed `config.chain.worker_page_size` field shows the active chain transa
 | `/api/v1/authority/{uuid}/naans` | `GET` | List authorized NAANs |
 | `/api/v1/authority/{uuid}/authorized/{naan}` | `GET` | Check NAAN authorization |
 | `/api/v1/worker/status` | `GET` | Read compact worker, queue, error, and ARK state summary |
+| `/api/v1/worker/errors` | `GET` | Read compact worker error report or filtered error list |
+| `/api/v1/worker/errors/rescue` | `POST` | Retry filtered permanent chain errors for the authenticated authority |
 | `/health` | `GET` | Check database, blockchain, and storage wiring |
 
 ## Authentication and Authorization
@@ -627,16 +640,23 @@ The app prefers `.env.integration` over `.env`.
 | `METADATA_WORKER_ENABLED` | Enable metadata persistence worker | `true` |
 | `METADATA_WORKER_PAGE_SIZE` | ARKs per metadata cycle | `100` |
 | `METADATA_WORKER_SLEEP_SECONDS` | Metadata sleep after an empty or partial page | `2` |
+| `METADATA_WORKER_STORAGE_RETRY_SECONDS` | Sleep while metadata worker is paused for unavailable storage | `10` |
 | `METADATA_WORKER_MAX_RETRIES` | Metadata retry attempts before permanent failure | `5` |
 | `METADATA_WORKER_RUNTIME_NAME` | Metadata worker identity | `metadata-publisher` |
 | `CHAIN_WORKER_ENABLED` | Enable blockchain publication worker | `true` |
 | `CHAIN_WORKER_PAGE_SIZE` | ARKs per chain cycle and max in-flight core-lib transaction window | `20` |
 | `CHAIN_WORKER_SLEEP_SECONDS` | Chain sleep after an empty or partial page | `5` |
 | `CHAIN_WORKER_RPC_RETRY_SECONDS` | Sleep while chain worker is paused for unavailable RPC | `10` |
+| `CHAIN_WORKER_CONGESTION_RETRY_SECONDS` | Sleep while chain worker is paused for stalled/congested chain conditions | `30` |
+| `CHAIN_WORKER_BLOCK_STALL_SECONDS` | Seconds without block progress before pausing chain worker | `120` |
+| `CHAIN_WORKER_ADAPTIVE_PAGE_ENABLED` | Enable core-lib chain-capacity based effective page size | `true` |
+| `CHAIN_WORKER_MIN_PAGE_SIZE` | Minimum effective chain page size during adaptive throttling | `1` |
+| `CHAIN_WORKER_RECOVERY_SUCCESS_CYCLES` | Healthy capacity cycles before increasing effective page size | `3` |
 | `CHAIN_WORKER_MAX_RETRIES` | Chain retry attempts before permanent failure | `5` |
 | `CHAIN_WORKER_RUNTIME_NAME` | Chain worker identity | `chain-publisher` |
 | `WORKER_HEARTBEAT_INTERVAL_SECONDS` | DB heartbeat interval for both workers | `10` |
 | `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` | Stale heartbeat threshold | `180` |
+| `PERMANENT_RESCUE_MAX_ITEMS` | Max ARKs rescued in one filtered rescue request | `50` |
 
 Legacy `WORKER_*` variables are still accepted as aliases for `CHAIN_WORKER_*`.
 
@@ -653,6 +673,7 @@ Backward compatibility aliases still accepted:
 | `DARK_RPC_CONNECT_RETRY_SECONDS` | Max retry window when initializing dark-core-lib |
 | `DARK_RPC_CONNECT_RETRY_INTERVAL_SECONDS` | Delay between dark-core-lib connection retries |
 | `DARK_CHAIN_ID` | Chain id |
+| `DARK_GAS_LIMIT` | Normal chain worker gas limit; rescue uses double this value |
 | `DARK_AUTHORITY_ADDRESS` | Authority contract address |
 | `DARK_CONTRACT_ADDRESS` | dARK contract address |
 | `DARK_ADMIN_PRIVATE_KEY` | Admin signer private key |

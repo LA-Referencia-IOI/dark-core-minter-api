@@ -50,6 +50,7 @@ os.environ["DATABASE_URL"] = _test_db_url
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
+from dark_core_lib.models import ChainCapacityInfo
 
 from app.main import app
 import app.dependencies as dependencies_module
@@ -64,6 +65,15 @@ def mock_corelib():
     mock = MagicMock()
     mock.is_connected.return_value = True
     mock.get_block_number.return_value = 12345
+    mock.get_chain_capacity.return_value = ChainCapacityInfo(
+        available=True,
+        state="healthy",
+        recommended_page_size=20,
+        max_page_size=20,
+        reason="healthy",
+        block_number=12345,
+        txpool_pending=0,
+    )
     mock.is_authorized_for_naan.return_value = True  # Always authorized in tests
     mock.ark_exists.return_value = False
     return mock
@@ -152,6 +162,17 @@ def client(mock_corelib, override_get_db):
         "last_error": None,
         "block_number": 12345,
     }
+    mock_storage_health = {
+        "available": True,
+        "state": "available",
+        "checked_at": "2026-01-21T12:00:00",
+        "last_ok_at": "2026-01-21T12:00:00",
+        "last_error": None,
+        "backend": "filesystem",
+        "backend_healthy": True,
+        "available_peers": None,
+        "min_peers": None,
+    }
     
     # Mock startup and RPC health to keep tests offline.
     with patch("app.main.init_corelib_client", return_value=mock_corelib):
@@ -159,9 +180,10 @@ def client(mock_corelib, override_get_db):
             with patch("app.dependencies.init_metadata_storage", return_value=mock_metadata_storage):
                 with patch("app.main.check_rpc_health", return_value=mock_rpc_health):
                     with patch("app.api.worker.check_rpc_health", return_value=mock_rpc_health):
-                        with TestClient(app) as test_client:
-                            test_client.headers.update({"X-Authority-Id": "test-uuid"})
-                            yield test_client
+                        with patch("app.api.worker.check_metadata_storage_health", return_value=mock_storage_health):
+                            with TestClient(app) as test_client:
+                                test_client.headers.update({"X-Authority-Id": "test-uuid"})
+                                yield test_client
     
     # Clear overrides after test
     app.dependency_overrides.clear()

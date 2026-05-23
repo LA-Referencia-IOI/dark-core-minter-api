@@ -48,6 +48,7 @@ def _build_corelib_config() -> CoreConfig:
         dark_contract_address=settings.dark_contract_address,
         admin_private_key=settings.dark_admin_private_key,
         read_only=False,
+        default_gas_limit=settings.dark_gas_limit,
     )
 
 

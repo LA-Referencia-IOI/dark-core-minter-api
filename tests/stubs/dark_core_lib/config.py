@@ -13,7 +13,7 @@ class CoreConfig:
         admin_private_key: str = None,
         read_only: bool = False,
         validate_chain_id: bool = True,
-        default_gas_limit: int = 500000,
+        default_gas_limit: int = 550000,
         tx_timeout_seconds: int = 120,
     ) -> None:
         self.rpc_url = rpc_url
@@ -25,4 +25,3 @@ class CoreConfig:
         self.validate_chain_id = validate_chain_id
         self.default_gas_limit = default_gas_limit
         self.tx_timeout_seconds = tx_timeout_seconds
-

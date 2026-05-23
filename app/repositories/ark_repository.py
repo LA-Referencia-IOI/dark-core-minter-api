@@ -5,7 +5,7 @@ ARK repository for database operations.
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 
-from sqlalchemy import or_, update
+from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import Session
 
 from app.database.models import ARKRecord, ARKMetadata
@@ -52,6 +52,31 @@ def _is_ready_for_publish(draft: ARKRecord, now: datetime, backoff_base: float, 
     backoff_seconds = (backoff_base ** draft.publish_retry_count) * 60
     next_attempt_time = draft.publish_last_attempt_at + timedelta(seconds=backoff_seconds)
     return now >= next_attempt_time
+
+
+def _ready_for_publish_filter(now: datetime, backoff_base: float, max_retries: int):
+    """Return a SQL filter matching the publish backoff readiness rule."""
+    retry_clauses = []
+    for retry_count in range(max(int(max_retries), 0)):
+        backoff_seconds = (backoff_base ** retry_count) * 60
+        retry_clauses.append(
+            and_(
+                ARKRecord.publish_retry_count == retry_count,
+                or_(
+                    ARKRecord.publish_last_attempt_at.is_(None),
+                    ARKRecord.publish_last_attempt_at
+                    <= now - timedelta(seconds=backoff_seconds),
+                ),
+            )
+        )
+
+    if not retry_clauses:
+        return ARKRecord.id.is_(None)
+
+    return and_(
+        ARKRecord.publish_permanently_failed == 0,
+        or_(*retry_clauses),
+    )
 
 
 class ARKRepository:
@@ -362,13 +387,13 @@ class ARKRepository:
     ) -> List[ARKRecord]:
         """Apply backoff and claim ready records for a worker cycle."""
         now = _utc_now()
+        query = query.filter(_ready_for_publish_filter(now, backoff_base, max_retries))
 
         dialect_name = self.db.get_bind().dialect.name
         if dialect_name == "postgresql":
-            fetch_limit = max(limit * 5, limit)
             candidates = (
                 query.order_by(ARKRecord.authority_id.asc(), ARKRecord.created_at.asc())
-                .limit(fetch_limit)
+                .limit(limit)
                 .with_for_update(skip_locked=True)
                 .all()
             )
@@ -519,6 +544,10 @@ class ARKRepository:
             )
             .values(
                 state=ARKState.PUBLISHED.value,
+                publish_retry_count=0,
+                publish_last_error=None,
+                publish_last_attempt_at=None,
+                publish_permanently_failed=0,
                 updated_at=now,
             )
         )

@@ -32,7 +32,7 @@ from app.dependencies import (
     shutdown_metadata_storage,
 )
 from app.repositories import WorkerRuntimeRepository
-from app.utils.rpc_health import check_rpc_health
+from app.utils.storage_health import check_metadata_storage_health
 from app.workers.publisher import ChainPublisherWorker, MetadataPersistenceWorker
 
 
@@ -160,12 +160,14 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
             "total_processed": 0,
             "total_succeeded": 0,
             "total_failed": 0,
+            "total_deferred": 0,
             "total_permanent_failures": 0,
             "last_cycle_at": None,
             "last_cycle_duration_seconds": None,
             "last_cycle_processed": None,
             "last_cycle_succeeded": None,
             "last_cycle_failed": None,
+            "last_cycle_deferred": None,
         }
 
     raw_stats = publisher.stats
@@ -173,12 +175,14 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
         "total_processed": int(raw_stats.get("total_processed", 0) or 0),
         "total_succeeded": int(raw_stats.get("total_succeeded", 0) or 0),
         "total_failed": int(raw_stats.get("total_failed", 0) or 0),
+        "total_deferred": int(raw_stats.get("total_deferred", 0) or 0),
         "total_permanent_failures": int(raw_stats.get("total_permanent_failures", 0) or 0),
         "last_cycle_at": raw_stats.get("last_run_at"),
         "last_cycle_duration_seconds": raw_stats.get("last_run_duration"),
         "last_cycle_processed": raw_stats.get("last_run_processed"),
         "last_cycle_succeeded": raw_stats.get("last_run_succeeded"),
         "last_cycle_failed": raw_stats.get("last_run_failed"),
+        "last_cycle_deferred": raw_stats.get("last_run_deferred"),
     }
 
 
@@ -291,6 +295,7 @@ def _worker_runtime_config(worker_kind: str):
             "worker_name": settings.metadata_worker_runtime_name,
             "page_size": settings.metadata_worker_page_size,
             "sleep_seconds": settings.metadata_worker_sleep_seconds,
+            "storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
             "max_retries": settings.metadata_worker_max_retries,
             "backoff_base": settings.metadata_worker_retry_backoff_base,
         }
@@ -301,6 +306,11 @@ def _worker_runtime_config(worker_kind: str):
             "page_size": settings.chain_worker_page_size,
             "sleep_seconds": settings.chain_worker_sleep_seconds,
             "rpc_retry_seconds": settings.chain_worker_rpc_retry_seconds,
+            "congestion_retry_seconds": settings.chain_worker_congestion_retry_seconds,
+            "block_stall_seconds": settings.chain_worker_block_stall_seconds,
+            "adaptive_page_enabled": settings.chain_worker_adaptive_page_enabled,
+            "min_page_size": settings.chain_worker_min_page_size,
+            "recovery_success_cycles": settings.chain_worker_recovery_success_cycles,
             "max_retries": settings.chain_worker_max_retries,
             "backoff_base": settings.chain_worker_retry_backoff_base,
         }
@@ -316,7 +326,7 @@ def _last_cycle_processed(publisher: Optional[Any]) -> int:
 
 def _select_next_sleep_seconds(publisher: Optional[Any], runtime: Dict[str, Any]) -> tuple[int, str]:
     """Choose whether to continue immediately or sleep after a worker page."""
-    page_size = max(int(runtime["page_size"]), 1)
+    page_size = _last_cycle_page_size(publisher, runtime)
     if _last_cycle_processed(publisher) >= page_size:
         return 0, "continue"
     return max(int(runtime["sleep_seconds"]), 0), "sleep"
@@ -325,6 +335,72 @@ def _select_next_sleep_seconds(publisher: Optional[Any], runtime: Dict[str, Any]
 def _rpc_pause_sleep_seconds(runtime: Dict[str, Any]) -> int:
     """Return sleep duration used while chain worker waits for RPC recovery."""
     return max(int(runtime.get("rpc_retry_seconds", 10) or 0), 1)
+
+
+def _congestion_pause_sleep_seconds(runtime: Dict[str, Any]) -> int:
+    """Return sleep duration used while chain worker waits for chain recovery."""
+    return max(int(runtime.get("congestion_retry_seconds", 30) or 0), 1)
+
+
+def _storage_pause_sleep_seconds(runtime: Dict[str, Any]) -> int:
+    """Return sleep duration used while metadata worker waits for storage recovery."""
+    return max(int(runtime.get("storage_retry_seconds", 10) or 0), 1)
+
+
+def _last_cycle_failed(publisher: Optional[Any]) -> int:
+    """Return how many records failed in the publisher's last cycle."""
+    if publisher is None:
+        return 0
+    return int((publisher.stats or {}).get("last_run_failed") or 0)
+
+
+def _last_cycle_deferred(publisher: Optional[Any]) -> int:
+    """Return how many records were deferred for infrastructure in the last cycle."""
+    if publisher is None:
+        return 0
+    return int((publisher.stats or {}).get("last_run_deferred") or 0)
+
+
+def _last_cycle_page_size(publisher: Optional[Any], runtime: Dict[str, Any]) -> int:
+    """Return the effective page size used for the last cycle."""
+    if publisher is not None:
+        page_size = int((publisher.stats or {}).get("last_run_page_size") or 0)
+        if page_size > 0:
+            return page_size
+    return max(int(runtime["page_size"]), 1)
+
+
+def _last_cycle_congestion_saturated(publisher: Optional[Any], runtime: Dict[str, Any]) -> bool:
+    """Return True when a full chain page failed only because of infrastructure."""
+    page_size = _last_cycle_page_size(publisher, runtime)
+    return (
+        _last_cycle_processed(publisher) >= page_size
+        and _last_cycle_failed(publisher) >= page_size
+        and _last_cycle_deferred(publisher) >= page_size
+    )
+
+
+def _page_size_levels(min_page_size: int, max_page_size: int) -> list[int]:
+    """Return conservative adaptive page-size levels up to the nominal maximum."""
+    safe_min = max(int(min_page_size or 1), 1)
+    safe_max = max(int(max_page_size or safe_min), safe_min)
+    levels = {safe_min, safe_max}
+    for level in (5, 10):
+        if safe_min <= level <= safe_max:
+            levels.add(level)
+    return sorted(levels)
+
+
+def _clamp_page_size(value: int, min_page_size: int, max_page_size: int) -> int:
+    return max(min(int(value or 0), max_page_size), min_page_size)
+
+
+def _next_higher_page_size(current: int, min_page_size: int, max_page_size: int) -> int:
+    levels = _page_size_levels(min_page_size, max_page_size)
+    for level in levels:
+        if level > current:
+            return level
+    return levels[-1]
 
 
 def _wait_with_heartbeats(
@@ -421,6 +497,8 @@ def run_worker(worker_kind: str = "chain") -> None:
     publisher: Optional[Any] = None
     advisory_lock: Optional[_WorkerAdvisoryLock] = None
     heartbeat_supervisor: Optional[_HeartbeatSupervisor] = None
+    effective_chain_page_size = max(int(runtime.get("page_size", 1)), 1)
+    healthy_capacity_cycles = 0
 
     logger.info(f"Starting dARK Core {worker_kind} worker...")
 
@@ -520,28 +598,118 @@ def run_worker(worker_kind: str = "chain") -> None:
         heartbeat_supervisor.start()
 
         while not _shutdown_event.is_set():
+            cycle_page_size = None
             if worker_kind == "chain":
-                rpc_health = check_rpc_health()
-                if not rpc_health["available"]:
-                    error = f"RPC unavailable: {rpc_health['last_error']}"
-                    set_heartbeat_state("PAUSED_RPC_UNAVAILABLE", error[:1000])
-                    persist_current_heartbeat()
-                    sleep_seconds = _rpc_pause_sleep_seconds(runtime)
-                    logger.warning(
-                        "Chain worker paused because RPC is unavailable; retrying in %ss",
-                        sleep_seconds,
-                    )
-                    _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
-                    continue
-
-                set_heartbeat_state("RUNNING", None)
                 if not ensure_chain_publisher():
                     sleep_seconds = _rpc_pause_sleep_seconds(runtime)
                     _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
                     continue
 
+                capacity = publisher.corelib_client.get_chain_capacity(
+                    max_page_size=runtime["page_size"],
+                )
+                recommended_page_size = int(getattr(capacity, "recommended_page_size", 0) or 0)
+                capacity_state = str(getattr(capacity, "state", "unknown") or "unknown")
+                capacity_reason = str(getattr(capacity, "reason", "") or "")
+                capacity_available = bool(getattr(capacity, "available", False))
+
+                if (
+                    not capacity_available
+                    or capacity_state in {"unavailable", "stalled"}
+                    or recommended_page_size <= 0
+                ):
+                    if not capacity_available or capacity_state == "unavailable":
+                        status = "PAUSED_RPC_UNAVAILABLE"
+                        sleep_seconds = _rpc_pause_sleep_seconds(runtime)
+                    elif capacity_state == "stalled":
+                        status = "PAUSED_CHAIN_STALLED"
+                        sleep_seconds = _congestion_pause_sleep_seconds(runtime)
+                    else:
+                        status = "PAUSED_CHAIN_CONGESTED"
+                        sleep_seconds = _congestion_pause_sleep_seconds(runtime)
+
+                    error = f"Chain capacity {capacity_state}: {capacity_reason}"
+                    set_heartbeat_state(status, error[:1000])
+                    persist_current_heartbeat()
+                    logger.warning(
+                        "Chain worker paused because core-lib capacity is %s; retrying in %ss: %s",
+                        capacity_state,
+                        sleep_seconds,
+                        capacity_reason,
+                    )
+                    _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
+                    continue
+
+                if runtime.get("adaptive_page_enabled", True):
+                    min_page_size = max(int(runtime.get("min_page_size", 1) or 1), 1)
+                    max_page_size = max(int(runtime.get("page_size", 1) or 1), min_page_size)
+                    target_page_size = _clamp_page_size(
+                        recommended_page_size,
+                        min_page_size,
+                        max_page_size,
+                    )
+
+                    if capacity_state == "healthy":
+                        healthy_capacity_cycles += 1
+                        if (
+                            effective_chain_page_size < target_page_size
+                            and healthy_capacity_cycles
+                            >= max(int(runtime.get("recovery_success_cycles", 3) or 1), 1)
+                        ):
+                            effective_chain_page_size = min(
+                                target_page_size,
+                                _next_higher_page_size(
+                                    effective_chain_page_size,
+                                    min_page_size,
+                                    max_page_size,
+                                ),
+                            )
+                            healthy_capacity_cycles = 0
+                    else:
+                        healthy_capacity_cycles = 0
+                        effective_chain_page_size = min(effective_chain_page_size, target_page_size)
+
+                    cycle_page_size = effective_chain_page_size
+                else:
+                    cycle_page_size = max(int(runtime["page_size"]), 1)
+
+            if worker_kind == "metadata":
+                storage_health = check_metadata_storage_health(metadata_storage)
+                if not storage_health["available"]:
+                    error = f"Metadata storage unavailable: {storage_health['last_error']}"
+                    set_heartbeat_state("PAUSED_STORAGE_UNAVAILABLE", error[:1000])
+                    persist_current_heartbeat()
+                    sleep_seconds = _storage_pause_sleep_seconds(runtime)
+                    logger.warning(
+                        "Metadata worker paused because storage is unavailable; retrying in %ss",
+                        sleep_seconds,
+                    )
+                    _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
+                    continue
+
             set_heartbeat_state("RUNNING", None)
-            publisher.run_publish_cycle()
+            if worker_kind == "chain":
+                publisher.run_publish_cycle(effective_page_size=cycle_page_size)
+            else:
+                publisher.run_publish_cycle()
+
+            if worker_kind == "chain" and _last_cycle_congestion_saturated(publisher, runtime):
+                effective_chain_page_size = max(int(runtime.get("min_page_size", 1) or 1), 1)
+                healthy_capacity_cycles = 0
+                error = (
+                    "Chain congestion suspected: full page deferred for infrastructure "
+                    f"({_last_cycle_page_size(publisher, runtime)} ARKs)"
+                )
+                set_heartbeat_state("PAUSED_CHAIN_CONGESTED", error[:1000])
+                persist_current_heartbeat()
+                sleep_seconds = _congestion_pause_sleep_seconds(runtime)
+                logger.warning(
+                    "Chain worker paused after a full infrastructure-failed page; retrying in %ss",
+                    sleep_seconds,
+                )
+                _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
+                continue
+
             persist_current_heartbeat()
 
             sleep_seconds, sleep_reason = _select_next_sleep_seconds(publisher, runtime)

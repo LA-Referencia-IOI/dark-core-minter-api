@@ -10,9 +10,16 @@ from app.main_worker import (
     _HeartbeatSupervisor,
     _WorkerAdvisoryLock,
     _build_advisory_lock_key,
+    _clamp_page_size,
+    _congestion_pause_sleep_seconds,
+    _last_cycle_congestion_saturated,
+    _last_cycle_page_size,
+    _next_higher_page_size,
+    _page_size_levels,
     _rpc_pause_sleep_seconds,
     _select_next_sleep_seconds,
     _shutdown_event,
+    _storage_pause_sleep_seconds,
     _wait_with_heartbeats,
 )
 
@@ -90,6 +97,60 @@ def test_select_next_sleep_continues_for_full_page():
 def test_rpc_pause_sleep_uses_chain_retry_seconds():
     """Chain worker should use explicit RPC retry sleep while paused."""
     assert _rpc_pause_sleep_seconds({"rpc_retry_seconds": 12}) == 12
+
+
+def test_storage_pause_sleep_uses_metadata_retry_seconds():
+    """Metadata worker should use explicit storage retry sleep while paused."""
+    assert _storage_pause_sleep_seconds({"storage_retry_seconds": 14}) == 14
+
+
+def test_congestion_pause_sleep_uses_chain_retry_seconds():
+    """Chain worker should use explicit congestion retry sleep while paused."""
+    assert _congestion_pause_sleep_seconds({"congestion_retry_seconds": 45}) == 45
+
+
+def test_last_cycle_congestion_saturated_requires_full_deferred_page():
+    """A full page of infrastructure deferrals should pause the chain worker."""
+    publisher = Mock()
+    publisher.stats = {
+        "last_run_processed": 20,
+        "last_run_failed": 20,
+        "last_run_deferred": 20,
+    }
+
+    assert _last_cycle_congestion_saturated(publisher, {"page_size": 20}) is True
+
+
+def test_last_cycle_congestion_saturated_ignores_partial_page():
+    """Partial deferred pages should not trigger the chain congestion pause."""
+    publisher = Mock()
+    publisher.stats = {
+        "last_run_processed": 10,
+        "last_run_failed": 10,
+        "last_run_deferred": 10,
+    }
+
+    assert _last_cycle_congestion_saturated(publisher, {"page_size": 20}) is False
+
+
+def test_last_cycle_congestion_saturated_uses_effective_page_size():
+    """Adaptive pages should be evaluated against the effective page size."""
+    publisher = Mock()
+    publisher.stats = {
+        "last_run_page_size": 5,
+        "last_run_processed": 5,
+        "last_run_failed": 5,
+        "last_run_deferred": 5,
+    }
+
+    assert _last_cycle_page_size(publisher, {"page_size": 20}) == 5
+    assert _last_cycle_congestion_saturated(publisher, {"page_size": 20}) is True
+
+
+def test_adaptive_page_size_levels_are_conservative():
+    assert _page_size_levels(1, 20) == [1, 5, 10, 20]
+    assert _clamp_page_size(50, 1, 20) == 20
+    assert _next_higher_page_size(5, 1, 20) == 10
 
 
 def test_wait_with_heartbeats_stops_cleanly_when_shutdown_is_set():

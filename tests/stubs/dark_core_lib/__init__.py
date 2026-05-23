@@ -13,7 +13,7 @@ from .metadata import (
     StoredDocument,
     get_metadata_storage,
 )
-from .models import ARKInfo, ARKPublishOperation, ARKPublishResult, AuthorityInfo, TxReceiptInfo
+from .models import ARKInfo, ARKPublishOperation, ARKPublishResult, AuthorityInfo, ChainCapacityInfo, TxReceiptInfo
 from .exceptions import (
     DarkCoreError,
     ConfigurationError,

@@ -6,19 +6,51 @@ from datetime import datetime, timezone
 from math import ceil
 from typing import Any, Dict
 
+from dark_core_lib import ARKPublishOperation, DARKCoreClient
 from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.database.models import ARKMetadata, ARKRecord
-from app.dependencies import get_db
+from app.dependencies import get_corelib_client, get_db
+from app.middleware.auth import enforce_authority_match, require_authority_identity
 from app.models.states import ARKState
 from app.repositories import WorkerRuntimeRepository
+from app.repositories.ark_repository import ARKRepository
 from app.repositories.ark_repository import _is_ready_for_publish
 from app.utils.rpc_health import check_rpc_health
+from app.utils.storage_health import check_metadata_storage_health
+from app.workers.publisher import ChainPublisherWorker
 
 router = APIRouter(tags=["Worker"])
+
+ERROR_TYPES = (
+    "transaction_reverted",
+    "gas_limit",
+    "authority",
+    "metadata_storage",
+    "infrastructure",
+    "reconcile_conflict",
+    "max_retries",
+    "unknown",
+)
+
+
+class RescueErrorsRequest(BaseModel):
+    """Request body for filtered permanent-error rescue."""
+
+    authority_id: str = Field(..., min_length=1)
+    stage: str = Field(default="chain", pattern="^(all|metadata|chain)$")
+    error_type: str = Field(
+        default="all",
+        pattern=(
+            "^(all|transaction_reverted|gas_limit|authority|metadata_storage|"
+            "infrastructure|reconcile_conflict|max_retries|unknown)$"
+        ),
+    )
+    limit: int | None = Field(default=None, ge=1)
 
 
 def _utc_now() -> datetime:
@@ -41,12 +73,93 @@ def _metadata_stage(metadata: ARKMetadata | None) -> str:
     return "chain" if _metadata_complete(metadata) else "metadata"
 
 
+def _state_label(state: str | None) -> str | None:
+    """Return a readable state label from the compact DB state code."""
+    labels = {
+        ARKState.RESERVED.value: "reserved",
+        ARKState.DRAFT.value: "draft",
+        ARKState.UPDATE.value: "update",
+        ARKState.PUBLISHED.value: "published",
+        ARKState.TOMBSTONE.value: "tombstone",
+    }
+    return labels.get(state) if state else None
+
+
+def _error_status(record: ARKRecord) -> str:
+    """Return the operational error status for an ARK record."""
+    if record.publish_permanently_failed == 1:
+        return "permanent"
+    if record.publish_retry_count > 0:
+        return "retrying"
+    return "none"
+
+
+def _classify_error_type(record: ARKRecord, metadata: ARKMetadata | None = None) -> str:
+    """Classify an ARK publish error from persisted error text."""
+    message = (record.publish_last_error or "").lower()
+    if not message:
+        return "unknown"
+
+    if "gas limit" in message or "out of gas" in message or "gas x2" in message:
+        return "gas_limit"
+    if "reconcile conflict" in message or "on-chain ark differs" in message:
+        return "reconcile_conflict"
+    if "max retries exceeded, permanent" in message:
+        return "max_retries"
+    if "metadata storage" in message:
+        return "metadata_storage"
+    if "authority error" in message or "authorization" in message or "not authorized" in message:
+        return "authority"
+    if any(
+        token in message
+        for token in (
+            "infrastructure",
+            "ambiguous",
+            "send_failed",
+            "not_sent",
+            "rpc",
+            "timeout",
+            "timed out",
+            "connection",
+            "transport",
+            "unavailable",
+            "connect",
+            "refused",
+        )
+    ):
+        return "infrastructure"
+    if "reverted" in message or "transaction error" in message:
+        return "transaction_reverted"
+    return "unknown"
+
+
+def _is_infrastructure_error_message(message: str) -> bool:
+    """Return True when an error message looks like RPC/transport failure."""
+    lowered = message.lower()
+    return any(
+        token in lowered
+        for token in (
+            "infrastructure",
+            "ambiguous",
+            "rpc",
+            "timeout",
+            "timed out",
+            "connection",
+            "transport",
+            "unavailable",
+            "connect",
+            "refused",
+        )
+    )
+
+
 def _build_worker_config(settings) -> Dict[str, Any]:
     """Return effective worker settings relevant for publication cycles."""
     return {
         "metadata": {
             "worker_page_size": settings.metadata_worker_page_size,
             "worker_sleep_seconds": settings.metadata_worker_sleep_seconds,
+            "worker_storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
             "worker_max_retries": settings.metadata_worker_max_retries,
             "worker_retry_backoff_base": settings.metadata_worker_retry_backoff_base,
             "worker_runtime_name": settings.metadata_worker_runtime_name,
@@ -55,6 +168,11 @@ def _build_worker_config(settings) -> Dict[str, Any]:
             "worker_page_size": settings.chain_worker_page_size,
             "worker_sleep_seconds": settings.chain_worker_sleep_seconds,
             "worker_rpc_retry_seconds": settings.chain_worker_rpc_retry_seconds,
+            "worker_congestion_retry_seconds": settings.chain_worker_congestion_retry_seconds,
+            "worker_block_stall_seconds": settings.chain_worker_block_stall_seconds,
+            "worker_adaptive_page_enabled": settings.chain_worker_adaptive_page_enabled,
+            "worker_min_page_size": settings.chain_worker_min_page_size,
+            "worker_recovery_success_cycles": settings.chain_worker_recovery_success_cycles,
             "worker_max_retries": settings.chain_worker_max_retries,
             "worker_retry_backoff_base": settings.chain_worker_retry_backoff_base,
             "worker_runtime_name": settings.chain_worker_runtime_name,
@@ -82,6 +200,37 @@ def _empty_errors() -> Dict[str, Any]:
         "permanent": 0,
         "oldest_error_at": None,
     }
+
+
+def _chain_capacity_to_dict(capacity, max_page_size: int) -> Dict[str, Any]:
+    """Return a JSON-safe chain capacity snapshot."""
+    return {
+        "available": bool(getattr(capacity, "available", False)),
+        "state": str(getattr(capacity, "state", "unknown") or "unknown"),
+        "recommended_page_size": int(getattr(capacity, "recommended_page_size", 0) or 0),
+        "max_page_size": int(getattr(capacity, "max_page_size", max_page_size) or max_page_size),
+        "reason": str(getattr(capacity, "reason", "") or ""),
+        "block_number": getattr(capacity, "block_number", None),
+        "txpool_pending": getattr(capacity, "txpool_pending", None),
+    }
+
+
+def _build_chain_capacity_summary(settings) -> Dict[str, Any]:
+    """Build chain capacity through dark-core-lib, without direct txpool RPC calls."""
+    max_page_size = settings.chain_worker_page_size
+    try:
+        capacity = get_corelib_client().get_chain_capacity(max_page_size=max_page_size)
+        return _chain_capacity_to_dict(capacity, max_page_size)
+    except Exception as exc:
+        return {
+            "available": False,
+            "state": "unknown",
+            "recommended_page_size": 0,
+            "max_page_size": max_page_size,
+            "reason": f"Failed to read chain capacity from core-lib: {exc}",
+            "block_number": None,
+            "txpool_pending": None,
+        }
 
 
 def _build_queue_summary(db: Session, settings, now: datetime) -> Dict[str, Any]:
@@ -178,20 +327,22 @@ def _build_queue_summary(db: Session, settings, now: datetime) -> Dict[str, Any]
     }
 
 
-def _serialize_permanent_error(record: ARKRecord, metadata: ARKMetadata | None) -> Dict[str, Any]:
-    """Serialize one permanently failed ARK for operational review."""
+def _serialize_worker_error(record: ARKRecord, metadata: ARKMetadata | None) -> Dict[str, Any]:
+    """Serialize one ARK worker error for operational review."""
     return {
         "ark": record.ark,
         "naan": record.naan,
         "name": record.name,
         "state": record.state,
+        "status": _error_status(record),
         "stage": _metadata_stage(metadata),
+        "error_type": _classify_error_type(record, metadata),
         "authority_id": record.authority_id,
         "target": record.target,
-        "publish_retry_count": record.publish_retry_count,
-        "publish_permanently_failed": bool(record.publish_permanently_failed),
-        "publish_last_error": record.publish_last_error,
-        "publish_last_attempt_at": _isoformat_or_none(record.publish_last_attempt_at),
+        "retry_count": record.publish_retry_count,
+        "permanent": bool(record.publish_permanently_failed),
+        "error": record.publish_last_error,
+        "last_attempt_at": _isoformat_or_none(record.publish_last_attempt_at),
         "created_at": _isoformat_or_none(record.created_at),
         "updated_at": _isoformat_or_none(record.updated_at),
         "metadata": {
@@ -200,6 +351,125 @@ def _serialize_permanent_error(record: ARKRecord, metadata: ARKMetadata | None) 
             "original_schema": metadata.original_schema if metadata else None,
             "original_media_type": metadata.original_media_type if metadata else None,
         },
+    }
+
+
+def _error_base_query(db: Session):
+    """Return the base query for active ARK rows that currently have worker errors."""
+    return (
+        db.query(ARKRecord, ARKMetadata)
+        .outerjoin(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+        .filter(
+            ARKRecord.state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value]),
+            (ARKRecord.publish_permanently_failed == 1)
+            | (
+                (ARKRecord.publish_retry_count > 0)
+                & (ARKRecord.publish_permanently_failed == 0)
+            )
+        )
+    )
+
+
+def _apply_error_sql_filters(
+    query,
+    *,
+    list_type: str,
+    stage: str,
+    authority_id: str | None,
+):
+    """Apply DB-native filters shared by error listing and rescue."""
+    if list_type == "permanent":
+        query = query.filter(ARKRecord.publish_permanently_failed == 1)
+    elif list_type == "retrying":
+        query = query.filter(
+            ARKRecord.publish_retry_count > 0,
+            ARKRecord.publish_permanently_failed == 0,
+        )
+
+    if authority_id:
+        query = query.filter(ARKRecord.authority_id == authority_id)
+
+    if stage == "metadata":
+        query = query.filter(
+            (ARKMetadata.id.is_(None))
+            | (ARKMetadata.level1_cid.is_(None))
+            | (ARKMetadata.original_cid.is_(None))
+        )
+    elif stage == "chain":
+        query = query.filter(
+            ARKMetadata.level1_cid.is_not(None),
+            ARKMetadata.original_cid.is_not(None),
+        )
+
+    return query
+
+
+def _select_error_rows(
+    db: Session,
+    *,
+    list_type: str = "all",
+    stage: str = "all",
+    authority_id: str | None = None,
+    error_type: str = "all",
+) -> list[tuple[ARKRecord, ARKMetadata | None]]:
+    """Select error rows and apply derived error type filtering."""
+    rows = (
+        _apply_error_sql_filters(
+            _error_base_query(db),
+            list_type=list_type,
+            stage=stage,
+            authority_id=authority_id,
+        )
+        .order_by(ARKRecord.updated_at.desc(), ARKRecord.id.desc())
+        .all()
+    )
+
+    if error_type != "all":
+        rows = [
+            (record, metadata)
+            for record, metadata in rows
+            if _classify_error_type(record, metadata) == error_type
+        ]
+
+    return rows
+
+
+def _build_errors_summary(rows: list[tuple[ARKRecord, ARKMetadata | None]]) -> Dict[str, Any]:
+    """Build a compact errors report from selected rows."""
+    summary = {"total": 0, "permanent": 0, "retrying": 0}
+    by_stage = {
+        "metadata": {"total": 0, "permanent": 0, "retrying": 0},
+        "chain": {"total": 0, "permanent": 0, "retrying": 0},
+    }
+    by_type = {error_type: 0 for error_type in ERROR_TYPES}
+    by_authority: dict[str, int] = {}
+    oldest_error_at = None
+
+    for record, metadata in rows:
+        status = _error_status(record)
+        if status == "none":
+            continue
+
+        stage = _metadata_stage(metadata)
+        error_type = _classify_error_type(record, metadata)
+        summary["total"] += 1
+        summary[status] += 1
+        by_stage[stage]["total"] += 1
+        by_stage[stage][status] += 1
+        by_type[error_type] = by_type.get(error_type, 0) + 1
+        by_authority[record.authority_id] = by_authority.get(record.authority_id, 0) + 1
+
+        if record.publish_last_attempt_at and (
+            oldest_error_at is None or record.publish_last_attempt_at < oldest_error_at
+        ):
+            oldest_error_at = record.publish_last_attempt_at
+
+    return {
+        "summary": summary,
+        "by_stage": by_stage,
+        "by_type": by_type,
+        "by_authority": by_authority,
+        "oldest_error_at": _isoformat_or_none(oldest_error_at),
     }
 
 
@@ -214,6 +484,8 @@ def _build_cadence_metrics(
     page_size: int,
     sleep_seconds: int,
     rpc_retry_seconds: int | None = None,
+    congestion_retry_seconds: int | None = None,
+    storage_retry_seconds: int | None = None,
     queue: Dict[str, Any],
     running: bool,
     stale: bool,
@@ -240,9 +512,17 @@ def _build_cadence_metrics(
         and last_cycle_processed >= page_size
     )
     paused_rpc = bool(record and record.status == "PAUSED_RPC_UNAVAILABLE")
+    paused_chain = bool(record and record.status in {"PAUSED_CHAIN_STALLED", "PAUSED_CHAIN_CONGESTED"})
+    paused_storage = bool(record and record.status == "PAUSED_STORAGE_UNAVAILABLE")
     if paused_rpc:
         next_action = "pause_rpc"
         sleep_seconds_next = int(rpc_retry_seconds or sleep_seconds)
+    elif paused_chain:
+        next_action = "pause_chain"
+        sleep_seconds_next = int(congestion_retry_seconds or rpc_retry_seconds or sleep_seconds)
+    elif paused_storage:
+        next_action = "pause_storage"
+        sleep_seconds_next = int(storage_retry_seconds or sleep_seconds)
     elif running and last_cycle_full_page:
         next_action = "continue"
         sleep_seconds_next = 0
@@ -256,6 +536,10 @@ def _build_cadence_metrics(
         pressure = "stale"
     elif paused_rpc:
         pressure = "rpc_unavailable"
+    elif paused_chain:
+        pressure = "chain_congested"
+    elif paused_storage:
+        pressure = "storage_unavailable"
     elif not running:
         pressure = "stopped"
     elif last_cycle_full_page:
@@ -271,6 +555,8 @@ def _build_cadence_metrics(
         "page_size": page_size,
         "sleep_seconds": sleep_seconds,
         "rpc_retry_seconds": rpc_retry_seconds,
+        "congestion_retry_seconds": congestion_retry_seconds,
+        "storage_retry_seconds": storage_retry_seconds,
         "last_cycle_duration_seconds": _round_or_none(duration),
         "last_cycle_processed": last_cycle_processed,
         "last_cycle_succeeded": record.last_cycle_succeeded if record else None,
@@ -296,6 +582,8 @@ def _build_runtime_status(
     page_size: int,
     sleep_seconds: int,
     rpc_retry_seconds: int | None = None,
+    congestion_retry_seconds: int | None = None,
+    storage_retry_seconds: int | None = None,
     queue: Dict[str, Any],
 ) -> Dict[str, Any]:
     """Build one worker runtime status block from DB heartbeat."""
@@ -312,6 +600,8 @@ def _build_runtime_status(
                 page_size=page_size,
                 sleep_seconds=sleep_seconds,
                 rpc_retry_seconds=rpc_retry_seconds,
+                congestion_retry_seconds=congestion_retry_seconds,
+                storage_retry_seconds=storage_retry_seconds,
                 queue=queue,
                 running=False,
                 stale=False,
@@ -322,6 +612,8 @@ def _build_runtime_status(
     age_seconds = max((now - record.last_heartbeat_at).total_seconds(), 0.0)
     stale = age_seconds > stale_after
     active_states = {"STARTING", "RUNNING", "IDLE", "PAUSED_RPC_UNAVAILABLE"}
+    active_states.add("PAUSED_STORAGE_UNAVAILABLE")
+    active_states.update({"PAUSED_CHAIN_STALLED", "PAUSED_CHAIN_CONGESTED"})
     running = (record.status in active_states) and (not stale)
 
     return {
@@ -343,6 +635,8 @@ def _build_runtime_status(
             page_size=page_size,
             sleep_seconds=sleep_seconds,
             rpc_retry_seconds=rpc_retry_seconds,
+            congestion_retry_seconds=congestion_retry_seconds,
+            storage_retry_seconds=storage_retry_seconds,
             queue=queue,
             running=running,
             stale=stale,
@@ -365,6 +659,7 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
     now = _utc_now()
     queue_summary = _build_queue_summary(db, settings, now)
     config_summary = _build_worker_config(settings)
+    chain_capacity = _build_chain_capacity_summary(settings)
     repo = WorkerRuntimeRepository(db)
     stale_after = settings.worker_heartbeat_stale_after_seconds
 
@@ -378,6 +673,7 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
         now,
         page_size=settings.metadata_worker_page_size,
         sleep_seconds=settings.metadata_worker_sleep_seconds,
+        storage_retry_seconds=settings.metadata_worker_storage_retry_seconds,
         queue=queue_summary["queues"]["metadata"],
     )
     chain_status = _build_runtime_status(
@@ -389,8 +685,12 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
         page_size=settings.chain_worker_page_size,
         sleep_seconds=settings.chain_worker_sleep_seconds,
         rpc_retry_seconds=settings.chain_worker_rpc_retry_seconds,
+        congestion_retry_seconds=settings.chain_worker_congestion_retry_seconds,
         queue=queue_summary["queues"]["chain"],
     )
+    chain_status["cadence"]["effective_page_size_recommended"] = chain_capacity[
+        "recommended_page_size"
+    ]
 
     metadata_state = _state_from_worker_status(metadata_status, queue_summary["queues"]["metadata"])
     chain_state = _state_from_worker_status(chain_status, queue_summary["queues"]["chain"])
@@ -400,10 +700,11 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
     chain_status["activity"] = chain_state if chain_state in {"idle", "working", "backlogged", "delayed"} else None
 
     rpc_status = check_rpc_health()
+    storage_status = check_metadata_storage_health()
     error_totals = _build_error_totals(queue_summary["errors"])
     queue_totals = _build_queue_totals(queue_summary["queues"])
     worker_states = {metadata_state, chain_state}
-    overall = _derive_overall_status(worker_states, error_totals, rpc_status)
+    overall = _derive_overall_status(worker_states, error_totals, rpc_status, storage_status)
 
     response = {
         "overall": overall,
@@ -412,8 +713,11 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
              "chain": _simple_worker_status(chain_status, queue_summary["queues"]["chain"])},
             error_totals,
             rpc_status,
+            storage_status,
         ),
         "rpc": rpc_status,
+        "storage": storage_status,
+        "chain_capacity": chain_capacity,
         "workers": {
             "metadata": metadata_status,
             "chain": chain_status,
@@ -444,6 +748,12 @@ def _state_from_worker_status(status: Dict[str, Any], queue: Dict[str, Any]) -> 
         return "error"
     if status.get("status") == "PAUSED_RPC_UNAVAILABLE":
         return "paused_rpc_unavailable"
+    if status.get("status") == "PAUSED_CHAIN_STALLED":
+        return "paused_chain_stalled"
+    if status.get("status") == "PAUSED_CHAIN_CONGESTED":
+        return "paused_chain_congested"
+    if status.get("status") == "PAUSED_STORAGE_UNAVAILABLE":
+        return "paused_storage_unavailable"
     if not status.get("running", False):
         return "stopped"
 
@@ -522,10 +832,17 @@ def _derive_overall_status(
     worker_states: set[str],
     error_summary: Dict[str, int],
     rpc: Dict[str, Any],
+    storage: Dict[str, Any],
 ) -> str:
     """Derive overall health from workers, RPC, and blocked ARKs."""
     hard_failure_states = {"unknown", "stale", "error", "stopped"}
-    degraded_states = {"paused_rpc_unavailable", "backlogged"}
+    degraded_states = {
+        "paused_rpc_unavailable",
+        "paused_storage_unavailable",
+        "paused_chain_stalled",
+        "paused_chain_congested",
+        "backlogged",
+    }
     if worker_states and worker_states.issubset(hard_failure_states | {"disabled"}):
         return "down"
     if (
@@ -533,6 +850,7 @@ def _derive_overall_status(
         or worker_states & degraded_states
         or error_summary["permanent"] > 0
         or not rpc["available"]
+        or not storage["available"]
     ):
         return "degraded"
     return "ok"
@@ -542,6 +860,7 @@ def _build_status_message(
     workers: Dict[str, Any],
     error_summary: Dict[str, int],
     rpc: Dict[str, Any],
+    storage: Dict[str, Any],
 ) -> str:
     """Build a compact operational message from worker and error blocks."""
     labels = {"metadata": "Metadata worker", "chain": "Chain worker"}
@@ -552,6 +871,12 @@ def _build_status_message(
         pending = worker["queue"]["pending"]
         if state == "paused_rpc_unavailable":
             parts.append(f"{labels[key]} is paused because RPC is unavailable")
+        elif state == "paused_chain_stalled":
+            parts.append(f"{labels[key]} is paused because block production is stalled")
+        elif state == "paused_chain_congested":
+            parts.append(f"{labels[key]} is paused because chain congestion is suspected")
+        elif state == "paused_storage_unavailable":
+            parts.append(f"{labels[key]} is paused because metadata storage is unavailable")
         elif state in {"unknown", "stale", "error", "stopped", "disabled"}:
             parts.append(f"{labels[key]} is {state}")
         elif pending > 0:
@@ -564,6 +889,8 @@ def _build_status_message(
         parts.append(f"{error_summary['retrying']} ARKs are retrying")
     if not rpc["available"]:
         parts.append("RPC is unavailable")
+    if not storage["available"]:
+        parts.append("metadata storage is unavailable")
     return "; ".join(parts) + "."
 
 
@@ -581,12 +908,19 @@ def _build_simple_status(full_status: Dict[str, Any]) -> Dict[str, Any]:
 
     error_summary = _build_error_totals(full_status["errors"])
     worker_states = {metadata["state"], chain["state"]}
-    overall = _derive_overall_status(worker_states, error_summary, full_status["rpc"])
+    overall = _derive_overall_status(
+        worker_states,
+        error_summary,
+        full_status["rpc"],
+        full_status["storage"],
+    )
 
     return {
         "overall": overall,
-        "message": _build_status_message(workers, error_summary, full_status["rpc"]),
+        "message": _build_status_message(workers, error_summary, full_status["rpc"], full_status["storage"]),
         "rpc": full_status["rpc"],
+        "storage": full_status["storage"],
+        "chain_capacity": full_status["chain_capacity"],
         "workers": workers,
         "errors": error_summary,
         "arks": full_status["by_state"],
@@ -615,12 +949,30 @@ async def get_worker_status(
     return _build_simple_status(full_status)
 
 
-@router.get("/errors/permanent", response_model=Dict[str, Any])
-async def list_permanent_worker_errors(
+@router.get("/errors", response_model=Dict[str, Any])
+async def get_worker_errors(
+    list_type: str | None = Query(
+        default=None,
+        alias="list",
+        pattern="^(permanent|retrying|all)$",
+        description="When omitted, return a compact summary. Use permanent/retrying/all to list rows.",
+    ),
     stage: str = Query(
         default="all",
         pattern="^(all|metadata|chain)$",
         description="Filter by inferred failed stage.",
+    ),
+    authority_id: str | None = Query(
+        default=None,
+        description="Filter errors by authority UUID.",
+    ),
+    error_type: str = Query(
+        default="all",
+        pattern=(
+            "^(all|transaction_reverted|gas_limit|authority|metadata_storage|"
+            "infrastructure|reconcile_conflict|max_retries|unknown)$"
+        ),
+        description="Filter by derived operational error type.",
     ),
     page: int = Query(
         default=1,
@@ -636,44 +988,40 @@ async def list_permanent_worker_errors(
     db: Session = Depends(get_db),
 ) -> Dict[str, Any]:
     """
-    List permanently failed ARKs for operational review.
+    Summarize or list ARK worker errors for operational review.
 
-    Stage is inferred from metadata CIDs:
-    - `metadata`: Level-1 or original CID is missing.
-    - `chain`: both CIDs exist, so the ARK reached blockchain publication.
+    By default this endpoint returns a compact report. Use `list=permanent`,
+    `list=retrying`, or `list=all` to request paginated rows.
     """
-    query = (
-        db.query(ARKRecord, ARKMetadata)
-        .outerjoin(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
-        .filter(ARKRecord.publish_permanently_failed == 1)
+    resolved_list_type = list_type or "all"
+    rows = _select_error_rows(
+        db,
+        list_type=resolved_list_type,
+        stage=stage,
+        authority_id=authority_id,
+        error_type=error_type,
     )
 
-    if stage == "metadata":
-        query = query.filter(
-            (ARKMetadata.id.is_(None))
-            | (ARKMetadata.level1_cid.is_(None))
-            | (ARKMetadata.original_cid.is_(None))
-        )
-    elif stage == "chain":
-        query = query.filter(
-            ARKMetadata.level1_cid.is_not(None),
-            ARKMetadata.original_cid.is_not(None),
-        )
+    filters = {
+        "list": list_type,
+        "stage": stage,
+        "authority_id": authority_id,
+        "error_type": error_type,
+    }
 
-    total = int(query.count())
+    if list_type is None:
+        return {
+            "filters": filters,
+            **_build_errors_summary(rows),
+        }
+
+    total = len(rows)
     total_pages = ceil(total / page_size) if total else 0
     offset = (page - 1) * page_size
-    rows = (
-        query.order_by(ARKRecord.updated_at.desc(), ARKRecord.id.desc())
-        .offset(offset)
-        .limit(page_size)
-        .all()
-    )
+    page_rows = rows[offset : offset + page_size]
 
     return {
-        "filters": {
-            "stage": stage,
-        },
+        "filters": filters,
         "pagination": {
             "page": page,
             "page_size": page_size,
@@ -683,7 +1031,250 @@ async def list_permanent_worker_errors(
             "has_previous": page > 1 and total > 0,
         },
         "items": [
-            _serialize_permanent_error(record, metadata)
-            for record, metadata in rows
+            _serialize_worker_error(record, metadata)
+            for record, metadata in page_rows
         ],
+    }
+
+
+def _rescue_operation_for_row(record: ARKRecord, metadata: ARKMetadata) -> ARKPublishOperation:
+    """Build the semantic core-lib operation used by rescue."""
+    action = "create" if record.state == ARKState.DRAFT.value else "update"
+    return ARKPublishOperation(
+        ref=record.ark,
+        action=action,
+        naan=record.naan,
+        name=record.name,
+        url=record.target,
+        cid=metadata.level1_cid,
+    )
+
+
+def _rescue_item(
+    record: ARKRecord,
+    metadata: ARKMetadata | None,
+    *,
+    status: str,
+    gas_limit: int,
+    error_type: str | None = None,
+    gas_estimate: int | None = None,
+    gas_used: int | None = None,
+    error: str | None = None,
+) -> Dict[str, Any]:
+    """Serialize one rescue result item."""
+    return {
+        "ark": record.ark,
+        "error_type": error_type or _classify_error_type(record, metadata),
+        "status": status,
+        "final_state": _state_label(record.state),
+        "gas_limit": gas_limit,
+        "gas_estimate": gas_estimate,
+        "gas_used": gas_used,
+        "error": error,
+    }
+
+
+@router.post("/errors/rescue", response_model=Dict[str, Any])
+async def rescue_worker_errors(
+    request: RescueErrorsRequest,
+    identity: dict = Depends(require_authority_identity),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """Rescue permanent chain errors selected by the same filters as /errors."""
+    enforce_authority_match(identity, request.authority_id)
+
+    settings = get_settings()
+    max_items = int(settings.permanent_rescue_max_items)
+    limit = min(int(request.limit or max_items), max_items)
+    rescue_gas_limit = int(corelib_client.config.default_gas_limit) * 2
+    filters = {
+        "authority_id": request.authority_id,
+        "stage": request.stage,
+        "error_type": request.error_type,
+    }
+
+    if request.stage == "metadata":
+        return {
+            "filters": filters,
+            "selected": 0,
+            "processed": 0,
+            "limit": limit,
+            "gas": {
+                "current_limit": int(corelib_client.config.default_gas_limit),
+                "rescue_limit": rescue_gas_limit,
+            },
+            "items": [],
+        }
+
+    rows = _select_error_rows(
+        db,
+        list_type="permanent",
+        stage="chain",
+        authority_id=request.authority_id,
+        error_type=request.error_type,
+    )
+    selected = len(rows)
+    rows = rows[:limit]
+    repo = ARKRepository(db)
+    chain_worker = ChainPublisherWorker(
+        corelib_client,
+        page_size=settings.chain_worker_page_size,
+        max_retries=settings.chain_worker_max_retries,
+        backoff_base=settings.chain_worker_retry_backoff_base,
+    )
+
+    items: list[Dict[str, Any]] = []
+    stopped = False
+    stop_reason = None
+
+    for record, metadata in rows:
+        if metadata is None or not metadata.level1_cid or not metadata.original_cid:
+            continue
+
+        original_error_type = _classify_error_type(record, metadata)
+        operation = _rescue_operation_for_row(record, metadata)
+        try:
+            gas_estimate = corelib_client.estimate_ark_operation_gas(
+                request.authority_id,
+                operation,
+            )
+        except Exception as exc:
+            error_msg = f"Gas estimate failed during rescue: {exc}"
+            repo.mark_publish_failed(record.ark, error_msg, is_permanent=True)
+            db.commit()
+            db.refresh(record)
+            item = _rescue_item(
+                record,
+                metadata,
+                status="estimate_failed",
+                gas_limit=rescue_gas_limit,
+                error=error_msg,
+            )
+            items.append(item)
+            if _is_infrastructure_error_message(str(exc)):
+                stopped = True
+                stop_reason = "estimate_unavailable"
+                break
+            continue
+
+        if int(gas_estimate) > rescue_gas_limit:
+            error_msg = (
+                "Gas limit too low during rescue: "
+                f"estimate {gas_estimate} exceeds rescue gas limit {rescue_gas_limit}"
+            )
+            repo.mark_publish_failed(record.ark, error_msg, is_permanent=True)
+            db.commit()
+            db.refresh(record)
+            items.append(
+                _rescue_item(
+                    record,
+                    metadata,
+                    status="skipped_gas_x2_insufficient",
+                    gas_limit=rescue_gas_limit,
+                    gas_estimate=int(gas_estimate),
+                    error=error_msg,
+                )
+            )
+            continue
+
+        result = corelib_client.publish_ark_operation(
+            request.authority_id,
+            operation,
+            gas_limit=rescue_gas_limit,
+            gas_estimate=int(gas_estimate),
+        )
+
+        if result.status == "confirmed":
+            try:
+                repo.update_to_published(record.ark)
+                repo.reset_publish_tracking(record.ark)
+                db.commit()
+                db.refresh(record)
+                items.append(
+                    _rescue_item(
+                        record,
+                        metadata,
+                        status="confirmed",
+                        gas_limit=rescue_gas_limit,
+                        error_type=original_error_type,
+                        gas_estimate=int(gas_estimate),
+                        gas_used=result.gas_used,
+                    )
+                )
+            except ValueError as exc:
+                db.rollback()
+                db.refresh(record)
+                items.append(
+                    _rescue_item(
+                        record,
+                        metadata,
+                        status="finalize_failed",
+                        gas_limit=rescue_gas_limit,
+                        gas_estimate=int(gas_estimate),
+                        gas_used=result.gas_used,
+                        error=str(exc),
+                    )
+                )
+            continue
+
+        if result.status == "reverted":
+            error_msg = f"Rescue transaction reverted (permanent): {result.error or result.status}"
+            chain_worker._handle_publish_error(
+                repo=repo,
+                db=db,
+                ark_record=record,
+                ark_id=record.ark,
+                naan=record.naan,
+                name=record.name,
+                expected_cid=metadata.level1_cid,
+                error_msg=error_msg,
+                original_is_permanent=True,
+                original_is_infrastructure=False,
+            )
+            latest = repo.get_by_ark(record.ark)
+            items.append(
+                _rescue_item(
+                    latest or record,
+                    metadata,
+                    status="reverted",
+                    gas_limit=rescue_gas_limit,
+                    gas_estimate=int(gas_estimate),
+                    gas_used=result.gas_used,
+                    error=error_msg,
+                )
+            )
+            continue
+
+        error_msg = f"Rescue transaction {result.status} (infrastructure): {result.error or result.status}"
+        repo.mark_publish_failed(record.ark, error_msg, is_permanent=True)
+        db.commit()
+        db.refresh(record)
+        items.append(
+            _rescue_item(
+                record,
+                metadata,
+                status=result.status,
+                gas_limit=rescue_gas_limit,
+                gas_estimate=int(gas_estimate),
+                gas_used=result.gas_used,
+                error=error_msg,
+            )
+        )
+        stopped = True
+        stop_reason = result.status
+        break
+
+    return {
+        "filters": filters,
+        "selected": selected,
+        "processed": len(items),
+        "limit": limit,
+        "stopped": stopped,
+        "stop_reason": stop_reason,
+        "gas": {
+            "current_limit": int(corelib_client.config.default_gas_limit),
+            "rescue_limit": rescue_gas_limit,
+        },
+        "items": items,
     }

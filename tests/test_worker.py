@@ -18,6 +18,7 @@ from dark_core_lib.models import ARKInfo, ARKPublishResult
 
 from app.database.models import ARKMetadata, ARKRecord
 from app.models.states import ARKState
+from app.repositories.ark_repository import ARKRepository
 from app.workers.publisher import ARKPublisher, ChainPublisherWorker, MetadataPersistenceWorker
 
 
@@ -454,6 +455,34 @@ class TestSplitWorkers:
         assert ark_record.publish_last_attempt_at is None
         assert ark_record.publish_permanently_failed == 0
 
+    def test_metadata_worker_storage_infrastructure_failure_does_not_consume_retry(self, db_session):
+        ark_record, _ = _create_ark_with_metadata(db_session, name="metadata-storage-infra")
+
+        failing_storage = MockMetadataStorage()
+        failing_storage.store_document = Mock(
+            side_effect=StorageError(
+                "Store API store failed (500): Storage failed: "
+                "Cluster pin registration failed: not enough peers to allocate CID"
+            )
+        )
+        worker = MetadataPersistenceWorker(
+            metadata_storage=failing_storage,
+            page_size=10,
+            max_retries=5,
+            backoff_base=2.0,
+        )
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            success = worker.persist_single_ark("ark:12345/metadata-storage-infra")
+
+        assert success is False
+        db_session.refresh(ark_record)
+        assert ark_record.publish_retry_count == 0
+        assert ark_record.publish_last_attempt_at is None
+        assert ark_record.publish_permanently_failed == 0
+        assert "Metadata storage unavailable (infrastructure)" in ark_record.publish_last_error
+
     def test_chain_worker_publishes_with_purged_metadata(self, db_session):
         ark_record, metadata_record = _create_ark_with_metadata(
             db_session,
@@ -562,7 +591,63 @@ class TestSplitWorkers:
         assert call.kwargs["pipeline_size"] == 2
         assert worker.stats["total_processed"] == 2
 
-    def test_chain_worker_pipeline_ambiguous_result_reconciles_retryable(self, db_session):
+    def test_chain_worker_effective_page_size_overrides_nominal_page(self, db_session):
+        for i in range(3):
+            _create_ark_with_metadata(db_session, name=f"effective-page-{i}", metadata_complete=True)
+
+        mock_corelib = Mock()
+        mock_corelib.publish_ark_operations.return_value = [
+            ARKPublishResult(ref="ark:12345/effective-page-0", action="create", status="confirmed")
+        ]
+        worker = ChainPublisherWorker(mock_corelib, page_size=20, max_retries=5, backoff_base=2.0)
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            worker.run_publish_cycle(effective_page_size=1)
+
+        call = mock_corelib.publish_ark_operations.call_args
+        assert len(call.kwargs["operations"]) == 1
+        assert call.kwargs["pipeline_size"] == 1
+        assert worker.stats["last_run_page_size"] == 1
+        assert worker.stats["total_processed"] == 1
+
+    def test_chain_claim_skips_delayed_records_before_limit(self, db_session, monkeypatch):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        old_created_at = now - timedelta(hours=1)
+
+        for i in range(10):
+            ark_record, _ = _create_ark_with_metadata(
+                db_session,
+                name=f"delayed-{i}",
+                publish_retry_count=1,
+                publish_last_attempt_at=now,
+                metadata_complete=True,
+            )
+            ark_record.created_at = old_created_at + timedelta(seconds=i)
+
+        for i in range(2):
+            ark_record, _ = _create_ark_with_metadata(
+                db_session,
+                name=f"ready-after-delay-{i}",
+                metadata_complete=True,
+            )
+            ark_record.created_at = old_created_at + timedelta(minutes=10, seconds=i)
+
+        db_session.commit()
+        monkeypatch.setattr(db_session.get_bind().dialect, "name", "postgresql")
+
+        records = ARKRepository(db_session).get_chain_pending_publish(
+            limit=2,
+            max_retries=5,
+            backoff_base=2.0,
+        )
+
+        assert [record.name for record in records] == [
+            "ready-after-delay-0",
+            "ready-after-delay-1",
+        ]
+
+    def test_chain_worker_pipeline_ambiguous_result_defers_without_retry(self, db_session):
         ark_record, _ = _create_ark_with_metadata(
             db_session,
             name="pipeline-ambiguous",
@@ -587,8 +672,35 @@ class TestSplitWorkers:
 
         db_session.refresh(ark_record)
         assert ark_record.state == ARKState.DRAFT
-        assert ark_record.publish_retry_count == 1
+        assert ark_record.publish_retry_count == 0
+        assert ark_record.publish_last_attempt_at is None
         assert ark_record.publish_permanently_failed == 0
+        assert "reconcile result: missing" in ark_record.publish_last_error
+
+    def test_chain_worker_full_infrastructure_page_records_deferred_count(self, db_session):
+        for i in range(2):
+            _create_ark_with_metadata(db_session, name=f"infra-page-{i}", metadata_complete=True)
+
+        mock_corelib = Mock()
+        mock_corelib.publish_ark_operations.return_value = [
+            ARKPublishResult(
+                ref=f"ark:12345/infra-page-{i}",
+                action="create",
+                status="ambiguous",
+                error="Failed waiting for receipt: timeout",
+            )
+            for i in range(2)
+        ]
+        mock_corelib.get_ark = Mock(side_effect=ARKNotFoundError("not found"))
+        worker = ChainPublisherWorker(mock_corelib, page_size=2, max_retries=5, backoff_base=2.0)
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            worker.run_publish_cycle()
+
+        assert worker.stats["last_run_processed"] == 2
+        assert worker.stats["last_run_failed"] == 2
+        assert worker.stats["last_run_deferred"] == 2
 
     def test_chain_worker_pipeline_infrastructure_failure_defers_without_retry(self, db_session):
         ark_record, _ = _create_ark_with_metadata(
@@ -703,7 +815,7 @@ class TestSplitWorkers:
         assert ark_record.publish_permanently_failed == 1
         assert "reconcile conflict" in ark_record.publish_last_error
 
-    def test_chain_worker_create_not_found_after_ambiguous_error_is_retryable(self, db_session):
+    def test_chain_worker_create_not_found_after_infrastructure_error_defers(self, db_session):
         ark_record, _ = _create_ark_with_metadata(
             db_session,
             name="create-missing",
@@ -720,8 +832,10 @@ class TestSplitWorkers:
 
         assert success is False
         db_session.refresh(ark_record)
-        assert ark_record.publish_retry_count == 1
+        assert ark_record.publish_retry_count == 0
+        assert ark_record.publish_last_attempt_at is None
         assert ark_record.publish_permanently_failed == 0
+        assert "reconcile result: missing" in ark_record.publish_last_error
 
     def test_chain_worker_create_not_found_after_revert_is_permanent(self, db_session):
         ark_record, _ = _create_ark_with_metadata(

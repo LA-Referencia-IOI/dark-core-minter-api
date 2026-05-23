@@ -39,6 +39,19 @@ class TxReceiptInfo:
 
 
 @dataclass
+class ChainCapacityInfo:
+    """Minimal chain capacity structure used in tests."""
+
+    available: bool
+    state: str
+    recommended_page_size: int
+    max_page_size: int
+    reason: str
+    block_number: Optional[int]
+    txpool_pending: Optional[int] = None
+
+
+@dataclass
 class ARKPublishOperation:
     """Minimal semantic ARK publish operation used in tests."""
 
@@ -58,3 +71,6 @@ class ARKPublishResult:
     action: str
     status: str
     error: Optional[str] = None
+    gas_limit: Optional[int] = None
+    gas_used: Optional[int] = None
+    gas_estimate: Optional[int] = None
