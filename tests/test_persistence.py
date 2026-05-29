@@ -100,6 +100,27 @@ def test_reserve_ark_uses_counter_sequence(client, mock_corelib):
     assert second_name == expected_second
 
 
+def test_reserve_ark_normalizes_authority_and_naan(client, test_db, mock_corelib):
+    """Whitespace in identity fields should not leak into auth checks or persisted rows."""
+    mock_corelib.is_authorized_for_naan.return_value = True
+
+    response = client.post(
+        "/api/v1/arks",
+        json={"authority_id": " test-uuid\t", "naan": " 24680 "},
+    )
+
+    assert response.status_code == 201
+    mock_corelib.is_authorized_for_naan.assert_called_once_with("test-uuid", "24680")
+
+    ark = response.json()["ark"]
+    from app.repositories.ark_repository import parse_ark
+
+    naan, name = parse_ark(ark)
+    db_ark = test_db.query(ARKRecord).filter_by(naan=naan, name=name).first()
+    assert db_ark.authority_id == "test-uuid"
+    assert db_ark.naan == "24680"
+
+
 def test_reserve_ark_skips_collided_counter_value(client, test_db, mock_corelib):
     """If a generated name already exists, reservation should advance to next counter."""
     mock_corelib.is_authorized_for_naan.return_value = True
@@ -140,6 +161,47 @@ def test_reserve_ark_unauthorized_naan(client, mock_corelib):
     
     assert response.status_code == 403
     assert "not authorized" in response.json()["detail"].lower()
+    assert response.headers["X-DARK-Error-Code"] == "AUTHORIZATION_FAILED"
+    assert response.headers["X-DARK-Retryable"] == "false"
+
+
+def test_reserve_ark_authorization_check_unavailable_is_retriable(client, mock_corelib):
+    """Authorization read failures should not be reported as permission denial."""
+    mock_corelib.is_authorized_for_naan.side_effect = Exception("RPC timeout")
+
+    response = client.post(
+        "/api/v1/arks",
+        json={
+            "authority_id": "test-uuid",
+            "naan": "55555",
+        },
+    )
+
+    assert response.status_code == 503
+    assert "authorization check unavailable" in response.json()["detail"].lower()
+    assert "not authorized" not in response.json()["detail"].lower()
+    assert response.headers["X-DARK-Error-Code"] == "AUTHORIZATION_CHECK_UNAVAILABLE"
+    assert response.headers["X-DARK-Retryable"] == "true"
+
+
+def test_batch_reserve_authorization_check_unavailable_is_retriable(client, mock_corelib):
+    """Batch authorization read failures should return a retriable error."""
+    mock_corelib.is_authorized_for_naan.side_effect = Exception("RPC timeout")
+
+    response = client.post(
+        "/api/v1/arks/batch",
+        json={
+            "authority_id": "test-uuid",
+            "naan": "77777",
+            "items": [{"client_item_id": "item-1"}],
+        },
+    )
+
+    assert response.status_code == 503
+    assert "authorization check unavailable" in response.json()["detail"].lower()
+    assert "not authorized" not in response.json()["detail"].lower()
+    assert response.headers["X-DARK-Error-Code"] == "AUTHORIZATION_CHECK_UNAVAILABLE"
+    assert response.headers["X-DARK-Retryable"] == "true"
 
 
 def test_reserve_rejects_mismatched_authority_header(client):
@@ -155,6 +217,8 @@ def test_reserve_rejects_mismatched_authority_header(client):
 
     assert response.status_code == 403
     assert "does not match" in response.json()["detail"].lower()
+    assert response.headers["X-DARK-Error-Code"] == "AUTHORITY_MISMATCH"
+    assert response.headers["X-DARK-Retryable"] == "false"
 
 
 def test_reserve_requires_authority_header_when_mtls_disabled(client):
@@ -170,6 +234,8 @@ def test_reserve_requires_authority_header_when_mtls_disabled(client):
 
     assert response.status_code == 401
     assert "authority identity required" in response.json()["detail"].lower()
+    assert response.headers["X-DARK-Error-Code"] == "AUTHORITY_IDENTITY_REQUIRED"
+    assert response.headers["X-DARK-Retryable"] == "false"
 
 
 def test_update_ark_to_draft(client, test_db, mock_corelib):

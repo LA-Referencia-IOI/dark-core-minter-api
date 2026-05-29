@@ -21,7 +21,12 @@ from app.middleware.auth import (
     require_mtls,
 )
 from app.utils.noid import mint_ark_id, validate_name_checkdigit
-from app.utils.auth_cache import check_authorization_cached
+from app.utils.auth_cache import AuthorizationCheckUnavailable, check_authorization_cached
+from app.utils.error_headers import (
+    AUTHORIZATION_CHECK_UNAVAILABLE,
+    AUTHORIZATION_FAILED,
+    dark_http_exception,
+)
 from app.models.states import ARKState
 from app.repositories import ARKRepository, NoidCounterRepository
 from app.models.requests import (
@@ -108,6 +113,31 @@ def _resolve_minimal_metadata(
     return _load_minimal_metadata_from_storage(level1_cid or fallback_level1_cid, storage)
 
 
+def _ensure_authorized_for_naan(
+    corelib_client: DARKCoreClient,
+    authority_id: str,
+    naan: str,
+) -> None:
+    """Validate authority/NAAN authorization without masking read failures."""
+    try:
+        is_authorized = check_authorization_cached(corelib_client, authority_id, naan)
+    except AuthorizationCheckUnavailable as exc:
+        raise dark_http_exception(
+            status_code=503,
+            detail=str(exc),
+            error_code=AUTHORIZATION_CHECK_UNAVAILABLE,
+            retryable=True,
+        ) from exc
+
+    if not is_authorized:
+        raise dark_http_exception(
+            status_code=403,
+            detail=f"Authority {authority_id} not authorized for NAAN {naan}",
+            error_code=AUTHORIZATION_FAILED,
+            retryable=False,
+        )
+
+
 @router.post(
     "",
     response_model=ARKResponse,
@@ -127,20 +157,17 @@ async def reserve_ark(
     
     Generates a unique ID and persists in database.
     """
-    enforce_authority_match(identity, request.authority_id)
+    authority_id = enforce_authority_match(identity, request.authority_id)
+    naan = request.naan.strip()
 
     # 1. Validate authorization (with cache)
-    if not check_authorization_cached(corelib_client, request.authority_id, request.naan):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Authority {request.authority_id} not authorized for NAAN {request.naan}"
-        )
+    _ensure_authorized_for_naan(corelib_client, authority_id, naan)
     
     # 2. Allocate deterministic counter and persist reservation
     settings = get_settings()
     ark_repo = ARKRepository(db)
     counter_repo = NoidCounterRepository(db)
-    namespace_key = counter_repo.build_namespace_key(request.naan, settings.minter_shoulder)
+    namespace_key = counter_repo.build_namespace_key(naan, settings.minter_shoulder)
 
     max_retries = 8
     full_ark = ""
@@ -151,7 +178,7 @@ async def reserve_ark(
 
             # Build deterministic ARK from allocated counter.
             full_ark = mint_ark_id(
-                naan=request.naan,
+                naan=naan,
                 counter=counter_value,
                 shoulder=settings.minter_shoulder,
                 min_length=settings.minter_noid_length,
@@ -164,9 +191,9 @@ async def reserve_ark(
             # Savepoint isolates ARK insert errors without rolling back allocated counter.
             with db.begin_nested():
                 db_ark = ark_repo.create_reserved(
-                    naan=request.naan,
+                    naan=naan,
                     name=name,
-                    authority_id=request.authority_id,
+                    authority_id=authority_id,
                     client_item_id=None,
                 )
                 db.flush()
@@ -174,7 +201,7 @@ async def reserve_ark(
             db.commit()
             db.refresh(db_ark)
 
-            logger.info(f"Reserved ARK: {db_ark.ark} for {request.authority_id}")
+            logger.info(f"Reserved ARK: {db_ark.ark} for {authority_id}")
 
             return ARKResponse(
                 ark=db_ark.ark,
@@ -225,19 +252,16 @@ async def batch_reserve_ark(
     """
     Reserve multiple ARKs with individual error handling.
     """
-    enforce_authority_match(identity, request.authority_id)
+    authority_id = enforce_authority_match(identity, request.authority_id)
+    naan = request.naan.strip()
 
     # Validate authorization once for the batch (with cache)
-    if not check_authorization_cached(corelib_client, request.authority_id, request.naan):
-        raise HTTPException(
-            status_code=403,
-            detail=f"Authority {request.authority_id} not authorized for NAAN {request.naan}"
-        )
+    _ensure_authorized_for_naan(corelib_client, authority_id, naan)
     
     settings = get_settings()
     ark_repo = ARKRepository(db)
     counter_repo = NoidCounterRepository(db)
-    namespace_key = counter_repo.build_namespace_key(request.naan, settings.minter_shoulder)
+    namespace_key = counter_repo.build_namespace_key(naan, settings.minter_shoulder)
     results = []
     errors = []
 
@@ -251,7 +275,7 @@ async def batch_reserve_ark(
             try:
                 counter_value = counter_repo.allocate_next(namespace_key)
                 full_ark = mint_ark_id(
-                    naan=request.naan,
+                    naan=naan,
                     counter=counter_value,
                     shoulder=settings.minter_shoulder,
                     min_length=settings.minter_noid_length,
@@ -262,9 +286,9 @@ async def batch_reserve_ark(
 
                 with db.begin_nested():
                     db_ark = ark_repo.create_reserved(
-                        naan=request.naan,
+                        naan=naan,
                         name=name,
-                        authority_id=request.authority_id,
+                        authority_id=authority_id,
                         client_item_id=item.client_item_id,
                     )
                     db.flush()
@@ -304,7 +328,7 @@ async def batch_reserve_ark(
 
     try:
         db.commit()
-        logger.info(f"Batch reserved {len(results)} ARKs for {request.authority_id} ({len(errors)} errors)")
+        logger.info(f"Batch reserved {len(results)} ARKs for {authority_id} ({len(errors)} errors)")
     except Exception as e:
         db.rollback()
         logger.error(f"Error committing batch: {e}")
@@ -449,7 +473,7 @@ async def update_ark_metadata(
     Does NOT publish to blockchain. That happens in a separate background process.
     """
     del storage
-    enforce_authority_match(identity, request.authority_id)
+    authority_id = enforce_authority_match(identity, request.authority_id)
 
     # Parse ARK using repository helper
     from app.repositories.ark_repository import parse_ark
@@ -477,15 +501,15 @@ async def update_ark_metadata(
             raise HTTPException(status_code=502, detail="Failed to read ARK from blockchain")
 
         try:
-            authority_info = corelib_client.get_authority_by_uuid(request.authority_id)
+            authority_info = corelib_client.get_authority_by_uuid(authority_id)
         except Exception as e:
-            logger.error(f"Failed to resolve authority {request.authority_id} during import of {ark}: {e}")
+            logger.error(f"Failed to resolve authority {authority_id} during import of {ark}: {e}")
             raise HTTPException(status_code=502, detail="Failed to verify importing authority")
 
         if not getattr(authority_info, "active", False):
             raise HTTPException(
                 status_code=403,
-                detail=f"Authority {request.authority_id} is not active",
+                detail=f"Authority {authority_id} is not active",
             )
 
         chain_owner = _normalize_wallet(getattr(chain_info, "owner", None))
@@ -494,7 +518,7 @@ async def update_ark_metadata(
             raise HTTPException(
                 status_code=403,
                 detail=(
-                    f"Authority {request.authority_id} does not own on-chain ARK {ark}"
+                    f"Authority {authority_id} does not own on-chain ARK {ark}"
                 ),
             )
 
@@ -503,7 +527,7 @@ async def update_ark_metadata(
                 db_ark = ark_repo.create_published_import(
                     naan=naan,
                     name=name,
-                    authority_id=request.authority_id,
+                    authority_id=authority_id,
                     target=getattr(chain_info, "url", None),
                 )
                 db.flush()
@@ -519,10 +543,10 @@ async def update_ark_metadata(
         raise HTTPException(status_code=409, detail="ARK is tombstoned and cannot be updated")
 
     # 4. Validate ownership
-    if db_ark.authority_id != request.authority_id:
+    if db_ark.authority_id != authority_id:
         raise HTTPException(
             status_code=403,
-            detail=f"Authority {request.authority_id} does not own this ARK"
+            detail=f"Authority {authority_id} does not own this ARK"
         )
 
     # Pending create/update payloads are worker-owned. Do not allow API overwrites

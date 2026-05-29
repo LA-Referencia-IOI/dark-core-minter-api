@@ -12,6 +12,11 @@ from typing import Optional
 from fastapi import Request, HTTPException, Depends
 
 from app.config import get_settings, Settings
+from app.utils.error_headers import (
+    AUTHORITY_IDENTITY_REQUIRED,
+    AUTHORITY_MISMATCH,
+    dark_http_exception,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -199,18 +204,22 @@ async def require_authority_identity(
         }
 
     if authenticator.enabled:
-        raise HTTPException(
+        raise dark_http_exception(
             status_code=401,
             detail=(
                 "Authority identity required. Provide a trusted authority header "
                 "or include it in the certificate subject."
             ),
+            error_code=AUTHORITY_IDENTITY_REQUIRED,
+            retryable=False,
         )
 
     header_names = ", ".join(AUTHORITY_ID_HEADER_CANDIDATES)
-    raise HTTPException(
+    raise dark_http_exception(
         status_code=401,
         detail=f"Authority identity required. Set one of: {header_names}",
+        error_code=AUTHORITY_IDENTITY_REQUIRED,
+        retryable=False,
     )
 
 
@@ -220,15 +229,22 @@ def enforce_authority_match(identity: dict, authority_id: str) -> str:
     authenticated = _clean_authority_id(identity.get("authority_id") if identity else None)
 
     if not authenticated:
-        raise HTTPException(status_code=401, detail="Missing authenticated authority identity")
+        raise dark_http_exception(
+            status_code=401,
+            detail="Missing authenticated authority identity",
+            error_code=AUTHORITY_IDENTITY_REQUIRED,
+            retryable=False,
+        )
 
     if requested != authenticated:
-        raise HTTPException(
+        raise dark_http_exception(
             status_code=403,
             detail=(
                 f"Authenticated authority '{authenticated}' does not match "
                 f"requested authority '{requested}'"
             ),
+            error_code=AUTHORITY_MISMATCH,
+            retryable=False,
         )
 
     return authenticated

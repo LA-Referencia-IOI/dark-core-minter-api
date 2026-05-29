@@ -18,8 +18,41 @@ from dark_core_lib.exceptions import (
 )
 
 from app.models.responses import ErrorResponse
+from app.utils.error_headers import (
+    ALREADY_EXISTS,
+    ARK_ERROR,
+    ARK_NOT_FOUND,
+    AUTHORITY_ERROR,
+    AUTHORITY_NOT_FOUND,
+    AUTHORIZATION_FAILED,
+    BLOCKCHAIN_ERROR,
+    BLOCKCHAIN_UNAVAILABLE,
+    CONFIGURATION_ERROR,
+    INTERNAL_ERROR,
+    dark_error_headers,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _error_response(
+    status_code: int,
+    error_code: str,
+    message: str,
+    retryable: bool,
+    details: dict | None = None,
+) -> JSONResponse:
+    """Build a standard error body plus stable dARK error headers."""
+    return JSONResponse(
+        status_code=status_code,
+        content=ErrorResponse(
+            error=error_code,
+            message=message,
+            retryable=retryable,
+            details=details,
+        ).model_dump(),
+        headers=dark_error_headers(error_code, retryable),
+    )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
@@ -37,32 +70,26 @@ def register_exception_handlers(app: FastAPI) -> None:
         message = str(exc)
         
         if "not found" in message.lower():
-            return JSONResponse(
+            return _error_response(
                 status_code=404,
-                content=ErrorResponse(
-                    error="AUTHORITY_NOT_FOUND",
-                    message=message,
-                    retryable=False,
-                ).model_dump(),
+                error_code=AUTHORITY_NOT_FOUND,
+                message=message,
+                retryable=False,
             )
         
         if "not authorized" in message.lower() or "not allowed" in message.lower():
-            return JSONResponse(
+            return _error_response(
                 status_code=403,
-                content=ErrorResponse(
-                    error="AUTHORIZATION_FAILED",
-                    message=message,
-                    retryable=False,
-                ).model_dump(),
-            )
-        
-        return JSONResponse(
-            status_code=400,
-            content=ErrorResponse(
-                error="AUTHORITY_ERROR",
+                error_code=AUTHORIZATION_FAILED,
                 message=message,
                 retryable=False,
-            ).model_dump(),
+            )
+        
+        return _error_response(
+            status_code=400,
+            error_code=AUTHORITY_ERROR,
+            message=message,
+            retryable=False,
         )
     
     @app.exception_handler(ARKError)
@@ -71,32 +98,26 @@ def register_exception_handlers(app: FastAPI) -> None:
         message = str(exc)
         
         if "not found" in message.lower():
-            return JSONResponse(
+            return _error_response(
                 status_code=404,
-                content=ErrorResponse(
-                    error="ARK_NOT_FOUND",
-                    message=message,
-                    retryable=False,
-                ).model_dump(),
+                error_code=ARK_NOT_FOUND,
+                message=message,
+                retryable=False,
             )
         
         if "already exists" in message.lower():
-            return JSONResponse(
+            return _error_response(
                 status_code=409,
-                content=ErrorResponse(
-                    error="ALREADY_EXISTS",
-                    message=message,
-                    retryable=False,
-                ).model_dump(),
-            )
-        
-        return JSONResponse(
-            status_code=400,
-            content=ErrorResponse(
-                error="ARK_ERROR",
+                error_code=ALREADY_EXISTS,
                 message=message,
                 retryable=False,
-            ).model_dump(),
+            )
+        
+        return _error_response(
+            status_code=400,
+            error_code=ARK_ERROR,
+            message=message,
+            retryable=False,
         )
     
     @app.exception_handler(TransactionError)
@@ -108,17 +129,15 @@ def register_exception_handlers(app: FastAPI) -> None:
         """
         logger.error(f"Transaction error: {exc}")
         
-        return JSONResponse(
+        return _error_response(
             status_code=503,
-            content=ErrorResponse(
-                error="BLOCKCHAIN_ERROR",
-                message=str(exc),
-                retryable=True,
-                details={
-                    "tx_hash": getattr(exc, "tx_hash", None),
-                    "gas_used": getattr(exc, "gas_used", None),
-                },
-            ).model_dump(),
+            error_code=BLOCKCHAIN_ERROR,
+            message=str(exc),
+            retryable=True,
+            details={
+                "tx_hash": getattr(exc, "tx_hash", None),
+                "gas_used": getattr(exc, "gas_used", None),
+            },
         )
     
     @app.exception_handler(ConfigurationError)
@@ -126,13 +145,11 @@ def register_exception_handlers(app: FastAPI) -> None:
         """Handle ConfigurationError exceptions."""
         logger.error(f"Configuration error: {exc}")
         
-        return JSONResponse(
+        return _error_response(
             status_code=500,
-            content=ErrorResponse(
-                error="CONFIGURATION_ERROR",
-                message="Internal configuration error",
-                retryable=False,
-            ).model_dump(),
+            error_code=CONFIGURATION_ERROR,
+            message="Internal configuration error",
+            retryable=False,
         )
 
     @app.exception_handler(CoreConnectionError)
@@ -140,13 +157,11 @@ def register_exception_handlers(app: FastAPI) -> None:
         """Handle unavailable blockchain RPC/connection failures."""
         logger.error(f"Blockchain connection error: {exc}")
 
-        return JSONResponse(
+        return _error_response(
             status_code=503,
-            content=ErrorResponse(
-                error="BLOCKCHAIN_UNAVAILABLE",
-                message=str(exc),
-                retryable=True,
-            ).model_dump(),
+            error_code=BLOCKCHAIN_UNAVAILABLE,
+            message=str(exc),
+            retryable=True,
         )
     
     @app.exception_handler(DarkCoreError)
@@ -154,13 +169,11 @@ def register_exception_handlers(app: FastAPI) -> None:
         """Handle generic DarkCoreError exceptions."""
         logger.error(f"dARK core error: {exc}")
         
-        return JSONResponse(
+        return _error_response(
             status_code=500,
-            content=ErrorResponse(
-                error="INTERNAL_ERROR",
-                message=str(exc),
-                retryable=False,
-            ).model_dump(),
+            error_code=INTERNAL_ERROR,
+            message=str(exc),
+            retryable=False,
         )
     
     @app.exception_handler(Exception)
@@ -168,11 +181,9 @@ def register_exception_handlers(app: FastAPI) -> None:
         """Handle unexpected exceptions."""
         logger.exception(f"Unexpected error: {exc}")
         
-        return JSONResponse(
+        return _error_response(
             status_code=500,
-            content=ErrorResponse(
-                error="INTERNAL_ERROR",
-                message="An unexpected error occurred",
-                retryable=False,
-            ).model_dump(),
+            error_code=INTERNAL_ERROR,
+            message="An unexpected error occurred",
+            retryable=False,
         )

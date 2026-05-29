@@ -1,0 +1,53 @@
+"""Tests for stable dARK error headers."""
+
+from dark_core_lib.exceptions import (
+    AuthorizationError,
+    ConnectionError as CoreConnectionError,
+    TransactionError,
+)
+
+
+def test_authority_error_handler_sets_dark_headers(client, mock_corelib):
+    """Authority errors should expose stable non-retryable headers."""
+    mock_corelib.get_authority_by_uuid.side_effect = AuthorizationError("not authorized")
+
+    response = client.get("/api/v1/authority/test-uuid")
+
+    assert response.status_code == 403
+    assert response.json()["error"] == "AUTHORIZATION_FAILED"
+    assert response.json()["retryable"] is False
+    assert response.headers["X-DARK-Error-Code"] == "AUTHORIZATION_FAILED"
+    assert response.headers["X-DARK-Retryable"] == "false"
+
+
+def test_core_connection_error_handler_sets_dark_headers(client, mock_corelib):
+    """Connection errors should expose stable retryable headers."""
+    mock_corelib.ark_exists.side_effect = CoreConnectionError("Cannot connect to RPC")
+
+    response = client.get("/api/v1/arks/ark:12345/x0000000")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "BLOCKCHAIN_UNAVAILABLE"
+    assert response.json()["retryable"] is True
+    assert response.headers["X-DARK-Error-Code"] == "BLOCKCHAIN_UNAVAILABLE"
+    assert response.headers["X-DARK-Retryable"] == "true"
+
+
+def test_transaction_error_handler_sets_dark_headers(client, mock_corelib):
+    """Transaction errors should expose stable retryable headers and details."""
+    mock_corelib.ark_exists.return_value = True
+    mock_corelib.get_ark.side_effect = TransactionError(
+        "Receipt timeout",
+        tx_hash="0xabc",
+        gas_used=42,
+    )
+
+    response = client.get("/api/v1/arks/ark:12345/x0000000")
+
+    assert response.status_code == 503
+    assert response.json()["error"] == "BLOCKCHAIN_ERROR"
+    assert response.json()["retryable"] is True
+    assert response.json()["details"]["tx_hash"] == "0xabc"
+    assert response.json()["details"]["gas_used"] == 42
+    assert response.headers["X-DARK-Error-Code"] == "BLOCKCHAIN_ERROR"
+    assert response.headers["X-DARK-Retryable"] == "true"

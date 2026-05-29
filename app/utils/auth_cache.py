@@ -18,6 +18,10 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+class AuthorizationCheckUnavailable(RuntimeError):
+    """Raised when authorization cannot be checked reliably."""
+
+
 class AuthorizationCache:
     """
     LRU cache with TTL for authorization checks.
@@ -145,7 +149,12 @@ def check_authorization_cached(
     
     Returns:
         True if authorized, False otherwise
+
+    Raises:
+        AuthorizationCheckUnavailable: if the authorization source cannot be read
     """
+    authority_id = authority_id.strip()
+    naan = naan.strip()
     cache = get_auth_cache()
     
     # Try cache first
@@ -156,9 +165,15 @@ def check_authorization_cached(
     # Cache miss, query blockchain
     try:
         result = corelib_client.is_authorized_for_naan(authority_id, naan)
-        cache.set(authority_id, naan, result)
+        if result:
+            cache.set(authority_id, naan, result)
+        else:
+            logger.debug(f"Authorization negative result not cached: {authority_id} for NAAN {naan}")
         return result
     except Exception as e:
-        logger.error(f"Error checking authorization: {e}")
-        # Don't cache errors
-        return False
+        logger.error(f"Error checking authorization for {authority_id} / NAAN {naan}: {e}")
+        # Do not convert infrastructure/read errors into "not authorized".
+        # The caller should return a retriable response instead of a misleading 403.
+        raise AuthorizationCheckUnavailable(
+            f"Authorization check unavailable for authority {authority_id} and NAAN {naan}"
+        ) from e

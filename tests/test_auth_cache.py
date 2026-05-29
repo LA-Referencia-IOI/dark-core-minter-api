@@ -8,7 +8,12 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from unittest.mock import MagicMock, patch
 
-from app.utils.auth_cache import AuthorizationCache, get_auth_cache, check_authorization_cached
+from app.utils.auth_cache import (
+    AuthorizationCache,
+    AuthorizationCheckUnavailable,
+    get_auth_cache,
+    check_authorization_cached,
+)
 
 
 class TestAuthorizationCache:
@@ -315,8 +320,8 @@ class TestCheckAuthorizationCached:
             # Should only be called once (first time)
             assert mock_corelib.is_authorized_for_naan.call_count == 1
     
-    def test_blockchain_error_returns_false(self, mock_corelib):
-        """Test that blockchain errors return False (not cached)."""
+    def test_blockchain_error_raises_unavailable(self, mock_corelib):
+        """Test that blockchain errors are not converted to negative authorization."""
         mock_corelib.is_authorized_for_naan.side_effect = Exception("Connection error")
         
         with patch('app.utils.auth_cache.get_settings') as mock_settings:
@@ -325,12 +330,15 @@ class TestCheckAuthorizationCached:
                 auth_cache_maxsize=1000
             )
             
-            result = check_authorization_cached(mock_corelib, "auth_1", "12345")
-            
-            assert result is False
+            with pytest.raises(AuthorizationCheckUnavailable):
+                check_authorization_cached(mock_corelib, "auth_1", "12345")
+
+            cache = get_auth_cache()
+            is_cached, _ = cache.get("auth_1", "12345")
+            assert is_cached is False
     
-    def test_negative_result_is_cached(self, mock_corelib):
-        """Test that negative authorization results are cached."""
+    def test_negative_result_is_not_cached(self, mock_corelib):
+        """Test that negative authorization results do not poison the cache."""
         mock_corelib.is_authorized_for_naan.return_value = False
         
         with patch('app.utils.auth_cache.get_settings') as mock_settings:
@@ -342,9 +350,9 @@ class TestCheckAuthorizationCached:
             # First call
             result1 = check_authorization_cached(mock_corelib, "auth_1", "12345")
             
-            # Second call - should be cached
+            # Second call - should query again because negative results are not cached
             result2 = check_authorization_cached(mock_corelib, "auth_1", "12345")
             
             assert result1 is False
             assert result2 is False
-            assert mock_corelib.is_authorized_for_naan.call_count == 1
+            assert mock_corelib.is_authorized_for_naan.call_count == 2
