@@ -40,7 +40,7 @@ class Settings(BaseSettings):
         default=8001,
         validation_alias=AliasChoices("MINTER_API_PORT", "CORE_API_PORT"),
     )
-    minter_api_workers: int = 1
+    minter_api_workers: int = 2
     
     # Batch processing
     batch_size_limit: int = 100

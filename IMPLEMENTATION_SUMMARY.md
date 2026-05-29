@@ -17,7 +17,7 @@ Active implementation with separated runtime architecture:
 
 - Entry point: `app/main.py`
 - CLI: `dark-core-api`
-- Direct Uvicorn: `uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers ${MINTER_API_WORKERS:-1}`
+- Direct Uvicorn: `uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers ${MINTER_API_WORKERS:-2}`
 - Exposes ARK and Authority endpoints
 - Does not run internal publisher loop
 - Does not require RPC during startup; blockchain endpoints initialize `dark-core-lib` lazily

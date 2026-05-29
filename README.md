@@ -594,7 +594,7 @@ docker compose up -d --build
 - `minter-api` and `minter-metadata-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage` when `METADATA_STORAGE_TYPE=filesystem`.
 - `.env.integration` is preferred automatically when present.
 - Alembic migrations are explicit: run `docker compose run --rm minter-api migrate` after schema changes or a fresh database.
-- `minter-api` defaults to one Uvicorn worker. Increase `MINTER_API_WORKERS` only when HTTP concurrency requires it.
+- `minter-api` defaults to two Uvicorn workers. `MINTER_API_WORKERS` only affects the API process; it does not create extra metadata or chain worker processes.
 - The API starts without requiring RPC. The chain worker pauses as `PAUSED_RPC_UNAVAILABLE` while RPC is unavailable and resumes after recovery.
 
 ## Metadata Backends
@@ -635,7 +635,7 @@ The app prefers `.env.integration` over `.env`.
 |----------|-------------|---------|
 | `MINTER_API_HOST` | API bind host | `0.0.0.0` |
 | `MINTER_API_PORT` | API bind port | `8001` |
-| `MINTER_API_WORKERS` | Uvicorn worker processes | `1` |
+| `MINTER_API_WORKERS` | Uvicorn worker processes for `minter-api` only | `2` |
 | `BATCH_SIZE_LIMIT` | Max items per batch reserve request | `100` |
 | `METADATA_WORKER_ENABLED` | Enable metadata persistence worker | `true` |
 | `METADATA_WORKER_PAGE_SIZE` | ARKs per metadata cycle | `100` |
