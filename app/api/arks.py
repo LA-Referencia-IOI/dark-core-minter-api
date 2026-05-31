@@ -60,6 +60,16 @@ def _is_unique_violation(exc: IntegrityError) -> bool:
     return "unique" in lowered or "duplicate" in lowered
 
 
+def _ark_batch_response_item(db_ark) -> ARKResponse:
+    """Build the compact batch response item for a persisted ARK."""
+    return ARKResponse(
+        ark=db_ark.ark,
+        state=db_ark.state,
+        target=db_ark.target,
+        client_item_id=db_ark.client_item_id,
+    )
+
+
 def _validate_ark_checkdigit_if_enabled(naan: str, name: str) -> None:
     """Validate ARK name checkdigit when MINTER_NOID_CHECKDIGIT is enabled."""
     settings = get_settings()
@@ -264,10 +274,24 @@ async def batch_reserve_ark(
     namespace_key = counter_repo.build_namespace_key(naan, settings.minter_shoulder)
     results = []
     errors = []
+    active_by_client_item_id = ark_repo.get_active_by_client_item_ids(
+        authority_id=authority_id,
+        naan=naan,
+        client_item_ids=[item.client_item_id for item in request.items],
+    )
 
     max_retries_per_item = 8
 
     for idx, item in enumerate(request.items):
+        existing_ark = (
+            active_by_client_item_id.get(item.client_item_id)
+            if item.client_item_id is not None
+            else None
+        )
+        if existing_ark is not None:
+            results.append(_ark_batch_response_item(existing_ark))
+            continue
+
         item_saved = False
         last_error = None
 
@@ -293,18 +317,25 @@ async def batch_reserve_ark(
                     )
                     db.flush()
 
-                results.append(
-                    ARKResponse(
-                        ark=db_ark.ark,
-                        state=db_ark.state,
-                        target=db_ark.target,
-                        client_item_id=db_ark.client_item_id,
-                    )
-                )
+                if item.client_item_id is not None:
+                    active_by_client_item_id[item.client_item_id] = db_ark
+                results.append(_ark_batch_response_item(db_ark))
                 item_saved = True
                 break
             except IntegrityError as e:
                 last_error = e
+                existing_ark = ark_repo.get_active_by_client_item_id(
+                    authority_id=authority_id,
+                    naan=naan,
+                    client_item_id=item.client_item_id,
+                )
+                if existing_ark is not None:
+                    if item.client_item_id is not None:
+                        active_by_client_item_id[item.client_item_id] = existing_ark
+                    results.append(_ark_batch_response_item(existing_ark))
+                    item_saved = True
+                    break
+
                 if _is_unique_violation(e):
                     logger.warning(
                         f"Batch ARK unique collision for item {idx} "

@@ -6,6 +6,7 @@ from datetime import datetime
 from typing import Optional
 
 from sqlalchemy import (
+    and_,
     Column,
     Float,
     Integer,
@@ -76,6 +77,15 @@ class ARKRecord(Base):
         Index("ix_naan_name", "naan", "name"),
         Index("ix_state_authority", "state", "authority_id"),
         Index("ix_state_permanently_failed_created", "state", "publish_permanently_failed", "created_at"),
+        Index(
+            "uq_ark_records_active_client_item",
+            "authority_id",
+            "naan",
+            "client_item_id",
+            unique=True,
+            postgresql_where=and_(client_item_id.isnot(None), state != ARKState.TOMBSTONE.value),
+            sqlite_where=and_(client_item_id.isnot(None), state != ARKState.TOMBSTONE.value),
+        ),
     )
     
     @property

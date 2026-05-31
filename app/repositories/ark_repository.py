@@ -3,7 +3,7 @@ ARK repository for database operations.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import Session
@@ -122,6 +122,64 @@ class ARKRepository:
         )
         self.db.add(db_ark)
         return db_ark
+
+    def get_active_by_client_item_id(
+        self,
+        authority_id: str,
+        naan: str,
+        client_item_id: Optional[str],
+    ) -> Optional[ARKRecord]:
+        """
+        Return the active ARK for a client item idempotency key, if any.
+
+        Tombstoned records intentionally do not block new reservations for the
+        same client item ID.
+        """
+        if client_item_id is None:
+            return None
+
+        return (
+            self.db.query(ARKRecord)
+            .filter(
+                ARKRecord.authority_id == authority_id,
+                ARKRecord.naan == naan,
+                ARKRecord.client_item_id == client_item_id,
+                ARKRecord.state != ARKState.TOMBSTONE.value,
+            )
+            .order_by(ARKRecord.id.asc())
+            .first()
+        )
+
+    def get_active_by_client_item_ids(
+        self,
+        authority_id: str,
+        naan: str,
+        client_item_ids: List[str],
+    ) -> Dict[str, ARKRecord]:
+        """
+        Return active ARKs keyed by client item ID for a batch request.
+        """
+        unique_ids = list(dict.fromkeys(item_id for item_id in client_item_ids if item_id is not None))
+        if not unique_ids:
+            return {}
+
+        rows = (
+            self.db.query(ARKRecord)
+            .filter(
+                ARKRecord.authority_id == authority_id,
+                ARKRecord.naan == naan,
+                ARKRecord.client_item_id.in_(unique_ids),
+                ARKRecord.state != ARKState.TOMBSTONE.value,
+            )
+            .order_by(ARKRecord.id.asc())
+            .all()
+        )
+
+        result: Dict[str, ARKRecord] = {}
+        for row in rows:
+            if row.client_item_id is not None and row.client_item_id not in result:
+                result[row.client_item_id] = row
+        return result
 
     def create_published_import(
         self,
