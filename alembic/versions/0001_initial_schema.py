@@ -1,4 +1,4 @@
-"""Initial schema - consolidated baseline.
+"""Initial schema - consolidated baseline (includes all migrations).
 
 Revision ID: 0001_initial_schema
 Revises: None
@@ -60,6 +60,16 @@ def upgrade() -> None:
         ["state", "publish_permanently_failed", "created_at"],
         unique=False,
     )
+    # Unique partial index for active client_item_id idempotency (from 0003)
+    predicate = sa.text("client_item_id IS NOT NULL AND state != 'T'")
+    op.create_index(
+        "uq_ark_records_active_client_item",
+        "ark_records",
+        ["authority_id", "naan", "client_item_id"],
+        unique=True,
+        postgresql_where=predicate,
+        sqlite_where=predicate,
+    )
 
     # noid_counters table
     op.create_table(
@@ -110,7 +120,7 @@ def upgrade() -> None:
         unique=False,
     )
 
-    # ark_metadata table
+    # ark_metadata table (includes original_media_type from 0002)
     op.create_table(
         "ark_metadata",
         sa.Column("id", sa.Integer(), autoincrement=True, nullable=False),
@@ -119,6 +129,7 @@ def upgrade() -> None:
         sa.Column("level1_cid", sa.String(length=100), nullable=True),
         sa.Column("original_content", sa.Text(), nullable=True),
         sa.Column("original_schema", sa.String(length=50), nullable=False),
+        sa.Column("original_media_type", sa.String(length=255), nullable=True),
         sa.Column("original_cid", sa.String(length=100), nullable=True),
         sa.Column(
             "created_at",
@@ -145,6 +156,7 @@ def downgrade() -> None:
     op.drop_index(op.f("ix_worker_runtime_status_last_heartbeat_at"), table_name="worker_runtime_status")
     op.drop_table("worker_runtime_status")
     op.drop_table("noid_counters")
+    op.drop_index("uq_ark_records_active_client_item", table_name="ark_records")
     op.drop_index("ix_state_permanently_failed_created", table_name="ark_records")
     op.drop_index("ix_state_authority", table_name="ark_records")
     op.drop_index("ix_naan_name", table_name="ark_records")
