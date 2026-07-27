@@ -35,7 +35,6 @@ services:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
-      - DARK_RPC_URL=http://rpc01:8545
     restart: unless-stopped
     networks:
       - minter-net
@@ -53,7 +52,6 @@ services:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
-      - DARK_RPC_URL=http://rpc01:8545
     restart: unless-stopped
     networks:
       - minter-net
@@ -71,7 +69,6 @@ services:
         condition: service_healthy
     environment:
       - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
-      - DARK_RPC_URL=http://rpc01:8545
     restart: unless-stopped
     networks:
       - minter-net
