@@ -8,7 +8,9 @@ to the blockchain.
 
 import logging
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import threading
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -26,6 +28,7 @@ from dark_core_lib.metadata import MetadataService, MetadataStorage, StorageErro
 
 from app.database.connection import SessionLocal
 from app.models.states import ARKState
+from app.database.models import ARKMetadata
 from app.repositories.ark_repository import ARKRepository, parse_ark
 
 
@@ -61,6 +64,7 @@ class _WorkerStatsMixin:
     """Shared in-process counters exposed through DB heartbeat."""
 
     def _init_stats(self) -> None:
+        self._stats_lock = threading.Lock()
         self.stats = {
             "total_processed": 0,
             "total_succeeded": 0,
@@ -75,22 +79,33 @@ class _WorkerStatsMixin:
             "last_run_deferred": None,
             "last_run_page_size": None,
             "recent_errors": [],
+            "last_reconciliation_at": None,
+            "last_reconciliation_checked": 0,
+            "last_reconciliation_repaired": 0,
+            "last_reconciliation_purged": 0,
+            "last_reconciliation_failed": 0,
         }
 
     def _add_recent_error(self, ark_id: str, error_msg: str) -> None:
         """Add error to recent errors list (keep last 10)."""
-        self.stats["recent_errors"].insert(0, {
-            "ark": ark_id,
-            "error": error_msg,
-            "timestamp": _utc_now().isoformat(),
-        })
-        self.stats["recent_errors"] = self.stats["recent_errors"][:10]
+        with self._stats_lock:
+            self.stats["recent_errors"].insert(0, {
+                "ark": ark_id,
+                "error": error_msg,
+                "timestamp": _utc_now().isoformat(),
+            })
+            self.stats["recent_errors"] = self.stats["recent_errors"][:10]
 
     def get_stats(self) -> dict:
         """Get worker statistics."""
         return {
             **self.stats,
             "last_run_at": self.stats["last_run_at"].isoformat() if self.stats["last_run_at"] else None,
+            "last_reconciliation_at": (
+                self.stats["last_reconciliation_at"].isoformat()
+                if self.stats["last_reconciliation_at"]
+                else None
+            ),
         }
 
     def _snapshot_cycle_totals(self) -> dict:
@@ -121,18 +136,27 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
         self,
         metadata_storage: MetadataStorage,
         page_size: int = 100,
+        concurrency: int = 4,
         max_retries: int = 5,
         backoff_base: float = 2.0,
     ):
         self.metadata_storage = metadata_storage
         self.metadata_service = MetadataService(metadata_storage)
         self.page_size = page_size
+        self.concurrency = max(int(concurrency), 1)
         self.max_retries = max_retries
         self.backoff_base = backoff_base
+        self.reconciliation_batch_size = 50
+        self.reconciliation_max_interval_seconds = 300
         self._init_stats()
 
     def persist_single_ark(self, ark_id: str) -> bool:
-        """Persist one ARK metadata payload and purge local JSON/content."""
+        """Persist one ARK while retaining local payload for reconciliation."""
+        succeeded, _ = self._persist_single_ark(ark_id)
+        return succeeded
+
+    def _persist_single_ark(self, ark_id: str) -> tuple[bool, bool]:
+        """Return success and permanent-failure flags without mutating counters."""
         session_factory = SessionLocal()
         db: Session = session_factory()
 
@@ -142,11 +166,11 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
 
             if not ark_record:
                 logger.warning(f"ARK not found during metadata persistence: {ark_id}")
-                return False
+                return False, False
 
             if ark_record.state not in (ARKState.DRAFT, ARKState.UPDATE):
                 logger.warning(f"ARK {ark_id} not in metadata-persistable state: {ark_record.state}")
-                return False
+                return False, False
 
             metadata_record = repo.get_metadata_by_ark_id(ark_record.id)
             if not metadata_record:
@@ -154,9 +178,8 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
                 logger.error(f"{error_msg} for ARK {ark_id}")
                 repo.mark_publish_failed(ark_id, error_msg, is_permanent=True)
                 db.commit()
-                self.stats["total_permanent_failures"] += 1
                 self._add_recent_error(ark_id, error_msg)
-                return False
+                return False, True
 
             l1_cid = metadata_record.level1_cid
             l2_cid = metadata_record.original_cid
@@ -191,9 +214,13 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
                     ark_record.id,
                     level1_cid=l1_cid,
                     level2_cid=l2_cid,
-                    purge_local=True,
+                    level1_replica_count=1,
+                    level2_replica_count=1,
+                    purge_local=False,
                     reset_publish_tracking=True,
                 )
+                metadata_record.replication_checked_at = _utc_now()
+                metadata_record.replication_last_error = None
                 db.commit()
 
             except StorageError as e:
@@ -205,7 +232,7 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
                     repo.defer_publish_retry(ark_id, error_msg)
                     db.commit()
                     self._add_recent_error(ark_id, error_msg)
-                    return False
+                    return False, False
 
                 is_permanent = (
                     "is required" in str(e)
@@ -220,26 +247,179 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
                 repo.mark_publish_failed(ark_id, error_msg, is_permanent=is_permanent)
                 db.commit()
 
-                if is_permanent:
-                    self.stats["total_permanent_failures"] += 1
                 self._add_recent_error(ark_id, error_msg)
-                return False
+                return False, is_permanent
 
             logger.info(f"Successfully persisted metadata for ARK: {ark_id}")
-            self.stats["total_succeeded"] += 1
-            return True
+            return True, False
 
         except Exception as e:
             logger.error(f"Unexpected error persisting metadata for {ark_id}: {e}")
             db.rollback()
             self._add_recent_error(ark_id, f"Unexpected error: {e}")
-            return False
+            return False, False
 
         finally:
             db.close()
 
+    def _process_ark_batch(self, ark_ids: list[str]) -> None:
+        """Persist a bounded ARK batch with one DB session per task."""
+        if not ark_ids:
+            return
+        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+            futures = {executor.submit(self._persist_single_ark, ark_id): ark_id for ark_id in ark_ids}
+            for future in as_completed(futures):
+                self.stats["total_processed"] += 1
+                try:
+                    succeeded, permanent = future.result()
+                except Exception as exc:
+                    succeeded = False
+                    permanent = False
+                    self._add_recent_error(futures[future], f"Unexpected task error: {exc}")
+                if succeeded:
+                    self.stats["total_succeeded"] += 1
+                else:
+                    self.stats["total_failed"] += 1
+                if permanent:
+                    self.stats["total_permanent_failures"] += 1
+
+    def _reconcile_single_ark(self, ark_id: str) -> dict[str, int]:
+        """Refresh both CID counts, repair zero-copy content and purge atomically."""
+        result = {"checked": 1, "repaired": 0, "purged": 0, "failed": 0}
+        session_factory = SessionLocal()
+        read_db: Session = session_factory()
+        try:
+            repo = ARKRepository(read_db)
+            ark_record = repo.get_by_ark(ark_id)
+            if not ark_record:
+                return {**result, "failed": 1}
+            metadata = repo.get_metadata_by_ark_id(ark_record.id)
+            if not metadata or not metadata.level1_cid or not metadata.original_cid:
+                return {**result, "failed": 1}
+            metadata_id = metadata.id
+            expected_l1 = metadata.level1_cid
+            expected_l2 = metadata.original_cid
+            level1_json = metadata.level1_json
+            original_content = metadata.original_content
+            original_media_type = metadata.original_media_type
+            original_schema = metadata.original_schema
+        finally:
+            read_db.close()
+
+        try:
+            l2_status = self.metadata_storage.get_replication_status(expected_l2)
+            if l2_status.total_replicas == 0:
+                if original_content is None or not original_media_type:
+                    raise StorageError("Level 2 payload is unavailable for repair")
+                repaired_l2 = self.metadata_service.store_level2(
+                    original_content.encode("utf-8"),
+                    original_media_type,
+                    original_schema,
+                )
+                if repaired_l2 != expected_l2:
+                    raise StorageError(
+                        f"Level 2 repair CID mismatch: expected {expected_l2}, got {repaired_l2}"
+                    )
+                result["repaired"] += 1
+                l2_status = self.metadata_storage.get_replication_status(expected_l2)
+
+            l1_status = self.metadata_storage.get_replication_status(expected_l1)
+            if l1_status.total_replicas == 0:
+                if level1_json is None:
+                    raise StorageError("Level 1 payload is unavailable for repair")
+                _, repaired_l1 = self.metadata_service.store_level1_with_level2_reference(
+                    level1_json,
+                    expected_l2,
+                )
+                if repaired_l1 != expected_l1:
+                    raise StorageError(
+                        f"Level 1 repair CID mismatch: expected {expected_l1}, got {repaired_l1}"
+                    )
+                result["repaired"] += 1
+                l1_status = self.metadata_storage.get_replication_status(expected_l1)
+
+            write_db: Session = session_factory()
+            try:
+                current = (
+                    write_db.query(ARKMetadata)
+                    .filter(ARKMetadata.id == metadata_id)
+                    .with_for_update()
+                    .one_or_none()
+                )
+                if not current or current.level1_cid != expected_l1 or current.original_cid != expected_l2:
+                    write_db.rollback()
+                    return {**result, "failed": 1}
+                current.level1_replica_count = l1_status.total_replicas
+                current.level2_replica_count = l2_status.total_replicas
+                current.replication_checked_at = _utc_now()
+                current.replication_last_error = None
+                if l1_status.purge_target_met and l2_status.purge_target_met:
+                    current.level1_json = None
+                    current.original_content = None
+                    result["purged"] = 1
+                write_db.commit()
+            finally:
+                write_db.close()
+            return result
+        except Exception as exc:
+            error_db: Session = session_factory()
+            try:
+                current = (
+                    error_db.query(ARKMetadata)
+                    .filter(ARKMetadata.id == metadata_id)
+                    .with_for_update()
+                    .one_or_none()
+                )
+                if current and current.level1_cid == expected_l1 and current.original_cid == expected_l2:
+                    current.replication_checked_at = _utc_now()
+                    current.replication_last_error = str(exc)[:2000]
+                    error_db.commit()
+                else:
+                    error_db.rollback()
+            finally:
+                error_db.close()
+            self._add_recent_error(ark_id, f"Replication reconciliation failed: {exc}")
+            result["failed"] = 1
+            return result
+
+    def _run_reconciliation_cycle(self) -> None:
+        """Reconcile the oldest retained payloads with bounded concurrency."""
+        session_factory = SessionLocal()
+        db: Session = session_factory()
+        try:
+            records = ARKRepository(db).get_metadata_pending_reconciliation(
+                limit=self.reconciliation_batch_size
+            )
+            ark_ids = [record.ark for record in records]
+        finally:
+            db.close()
+
+        totals = {"checked": 0, "repaired": 0, "purged": 0, "failed": 0}
+        if ark_ids:
+            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                futures = [executor.submit(self._reconcile_single_ark, ark_id) for ark_id in ark_ids]
+                for future in as_completed(futures):
+                    try:
+                        item = future.result()
+                    except Exception:
+                        item = {"checked": 1, "repaired": 0, "purged": 0, "failed": 1}
+                    for key in totals:
+                        totals[key] += int(item.get(key, 0))
+        checked_at = _utc_now()
+        self.stats["last_reconciliation_at"] = checked_at
+        self.stats["last_reconciliation_checked"] = totals["checked"]
+        self.stats["last_reconciliation_repaired"] = totals["repaired"]
+        self.stats["last_reconciliation_purged"] = totals["purged"]
+        self.stats["last_reconciliation_failed"] = totals["failed"]
+
+    def _reconciliation_due(self) -> bool:
+        last_run = self.stats.get("last_reconciliation_at")
+        if last_run is None:
+            return True
+        return (_utc_now() - last_run).total_seconds() >= self.reconciliation_max_interval_seconds
+
     def run_publish_cycle(self) -> None:
-        """Run one metadata persistence cycle."""
+        """Run ingestion first and opportunistic replication reconciliation second."""
         start_time = _utc_now()
         before = self._snapshot_cycle_totals()
 
@@ -256,20 +436,19 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
                 )
                 db.commit()
 
-                if not records:
-                    logger.debug("No ARKs pending metadata persistence")
-                    return
-
                 ark_ids = [record.ark for record in records]
-                logger.info(f"Persisting metadata for {len(ark_ids)} ARKs")
+                if ark_ids:
+                    logger.info(f"Persisting metadata for {len(ark_ids)} ARKs")
+                else:
+                    logger.debug("No ARKs pending metadata persistence")
 
             finally:
                 db.close()
 
-            for ark_id in ark_ids:
-                self.stats["total_processed"] += 1
-                if not self.persist_single_ark(ark_id):
-                    self.stats["total_failed"] += 1
+            self.stats["last_run_page_size"] = self.page_size
+            self._process_ark_batch(ark_ids)
+            if not ark_ids or self._reconciliation_due():
+                self._run_reconciliation_cycle()
 
         except Exception as e:
             logger.error(f"Error in metadata persistence cycle: {e}")
@@ -811,6 +990,7 @@ class ARKPublisher(_WorkerStatsMixin):
         self.metadata_worker = MetadataPersistenceWorker(
             metadata_storage=metadata_storage,
             page_size=page_size,
+            concurrency=1,
             max_retries=max_retries,
             backoff_base=backoff_base,
         )

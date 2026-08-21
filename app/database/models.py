@@ -136,6 +136,11 @@ class WorkerRuntimeStatus(Base):
     last_cycle_processed = Column(Integer, nullable=True)
     last_cycle_succeeded = Column(Integer, nullable=True)
     last_cycle_failed = Column(Integer, nullable=True)
+    last_reconciliation_at = Column(DateTime, nullable=True)
+    last_reconciliation_checked = Column(Integer, nullable=False, default=0, server_default="0")
+    last_reconciliation_repaired = Column(Integer, nullable=False, default=0, server_default="0")
+    last_reconciliation_purged = Column(Integer, nullable=False, default=0, server_default="0")
+    last_reconciliation_failed = Column(Integer, nullable=False, default=0, server_default="0")
     last_error = Column(Text, nullable=True)
 
     total_processed = Column(Integer, nullable=False, default=0, server_default="0")
@@ -174,6 +179,12 @@ class ARKMetadata(Base):
     original_schema = Column(String(50), nullable=False)  # "dublin_core", etc.
     original_media_type = Column(String(255), nullable=True)
     original_cid = Column(String(100), nullable=True)     # Set by worker after IPFS store
+
+    # Last replication counts observed by the metadata reconciler.
+    level1_replica_count = Column(Integer, nullable=False, default=0, server_default="0")
+    level2_replica_count = Column(Integer, nullable=False, default=0, server_default="0")
+    replication_checked_at = Column(DateTime, nullable=True, index=True)
+    replication_last_error = Column(Text, nullable=True)
     
     # Timestamps
     created_at = Column(DateTime, server_default=func.now(), nullable=False)

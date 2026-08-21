@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     # Worker Configuration
     metadata_worker_enabled: bool = True
     metadata_worker_page_size: int = 100
+    metadata_worker_concurrency: int = 4
     metadata_worker_sleep_seconds: int = 2
     metadata_worker_storage_retry_seconds: int = 10
     metadata_worker_max_retries: int = 5

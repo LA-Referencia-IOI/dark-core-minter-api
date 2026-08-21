@@ -168,6 +168,11 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
             "last_cycle_succeeded": None,
             "last_cycle_failed": None,
             "last_cycle_deferred": None,
+            "last_reconciliation_at": None,
+            "last_reconciliation_checked": 0,
+            "last_reconciliation_repaired": 0,
+            "last_reconciliation_purged": 0,
+            "last_reconciliation_failed": 0,
         }
 
     raw_stats = publisher.stats
@@ -183,6 +188,11 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
         "last_cycle_succeeded": raw_stats.get("last_run_succeeded"),
         "last_cycle_failed": raw_stats.get("last_run_failed"),
         "last_cycle_deferred": raw_stats.get("last_run_deferred"),
+        "last_reconciliation_at": raw_stats.get("last_reconciliation_at"),
+        "last_reconciliation_checked": int(raw_stats.get("last_reconciliation_checked", 0) or 0),
+        "last_reconciliation_repaired": int(raw_stats.get("last_reconciliation_repaired", 0) or 0),
+        "last_reconciliation_purged": int(raw_stats.get("last_reconciliation_purged", 0) or 0),
+        "last_reconciliation_failed": int(raw_stats.get("last_reconciliation_failed", 0) or 0),
     }
 
 
@@ -272,6 +282,11 @@ def _persist_worker_heartbeat(
             last_cycle_processed=stats["last_cycle_processed"],
             last_cycle_succeeded=stats["last_cycle_succeeded"],
             last_cycle_failed=stats["last_cycle_failed"],
+            last_reconciliation_at=stats["last_reconciliation_at"],
+            last_reconciliation_checked=stats["last_reconciliation_checked"],
+            last_reconciliation_repaired=stats["last_reconciliation_repaired"],
+            last_reconciliation_purged=stats["last_reconciliation_purged"],
+            last_reconciliation_failed=stats["last_reconciliation_failed"],
             last_error=last_error,
             total_processed=stats["total_processed"],
             total_succeeded=stats["total_succeeded"],
@@ -294,6 +309,7 @@ def _worker_runtime_config(worker_kind: str):
             "enabled": settings.metadata_worker_enabled,
             "worker_name": settings.metadata_worker_runtime_name,
             "page_size": settings.metadata_worker_page_size,
+            "concurrency": settings.metadata_worker_concurrency,
             "sleep_seconds": settings.metadata_worker_sleep_seconds,
             "storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
             "max_retries": settings.metadata_worker_max_retries,
@@ -527,6 +543,7 @@ def run_worker(worker_kind: str = "chain") -> None:
             publisher = MetadataPersistenceWorker(
                 metadata_storage=metadata_storage,
                 page_size=runtime["page_size"],
+                concurrency=runtime["concurrency"],
                 max_retries=runtime["max_retries"],
                 backoff_base=runtime["backoff_base"],
             )

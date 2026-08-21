@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import hashlib
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
@@ -39,6 +40,18 @@ class StoredDocument:
         return "text"
 
 
+@dataclass(frozen=True)
+class ReplicationStatus:
+    cid: str
+    status: str
+    total_replicas: int
+    local_replicas: int
+    remote_replicas: int
+    sites: dict[str, int] = field(default_factory=dict)
+    purge_target_met: bool = False
+    checked_at: Optional[datetime] = None
+
+
 class MetadataStorage(ABC):
     @abstractmethod
     def store_document(self, content: bytes, content_type: str, schema: Optional[str] = None) -> str:
@@ -59,6 +72,13 @@ class MetadataStorage(ABC):
     def get_metadata(self, cid: str) -> tuple[str, str]:
         document = self.get_document(cid)
         return document.text, document.format
+
+    def get_replication_status(self, cid: str) -> ReplicationStatus:
+        self.get_document(cid)
+        return ReplicationStatus(cid, "pinned", 1, 1, 0, {"local": 1}, True)
+
+    def close(self) -> None:
+        return None
 
 
 class FileSystemMetadataStorage(MetadataStorage):
@@ -113,15 +133,15 @@ class StoreApiMetadataStorage(MetadataStorage):
     def __init__(self, base_url: str, timeout_seconds: float = 10.0):
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self.client = httpx.Client(timeout=timeout_seconds)
 
     def store_document(self, content: bytes, content_type: str, schema: Optional[str] = None) -> str:
         headers = {"Content-Type": content_type}
         try:
-            response = httpx.post(
+            response = self.client.post(
                 f"{self.base_url}/v1/store",
                 content=content,
                 headers=headers,
-                timeout=self.timeout_seconds,
             )
         except httpx.RequestError as exc:
             raise StorageError(f"Store API request failed: {exc}") from exc
@@ -137,7 +157,7 @@ class StoreApiMetadataStorage(MetadataStorage):
 
     def get_document(self, cid: str) -> StoredDocument:
         try:
-            response = httpx.get(f"{self.base_url}/v1/retrieve/{cid}", timeout=self.timeout_seconds)
+            response = self.client.get(f"{self.base_url}/v1/retrieve/{cid}")
         except httpx.RequestError as exc:
             raise StorageError(f"Store API request failed: {exc}") from exc
 
@@ -151,7 +171,7 @@ class StoreApiMetadataStorage(MetadataStorage):
 
     def health_check(self) -> bool:
         try:
-            response = httpx.get(f"{self.base_url}/health", timeout=self.timeout_seconds)
+            response = self.client.get(f"{self.base_url}/health")
         except httpx.RequestError:
             return False
         if response.status_code != 200:
@@ -160,6 +180,30 @@ class StoreApiMetadataStorage(MetadataStorage):
         if "backend_healthy" in payload:
             return bool(payload["backend_healthy"])
         return payload.get("status") == "healthy"
+
+    def get_replication_status(self, cid: str) -> ReplicationStatus:
+        try:
+            response = self.client.get(f"{self.base_url}/v1/status/{cid}")
+        except httpx.RequestError as exc:
+            raise StorageError(f"Store API request failed: {exc}") from exc
+        if response.status_code == 404:
+            return ReplicationStatus(cid, "unpinned", 0, 0, 0)
+        if response.status_code != 200:
+            raise StorageError(f"Store API status failed ({response.status_code})")
+        payload = response.json()
+        replication = payload["replication"]
+        return ReplicationStatus(
+            cid=payload["cid"],
+            status=payload["status"],
+            total_replicas=replication["total_replicas"],
+            local_replicas=replication["local_replicas"],
+            remote_replicas=replication["remote_replicas"],
+            sites=replication.get("sites", {}),
+            purge_target_met=replication["purge_target_met"],
+        )
+
+    def close(self) -> None:
+        self.client.close()
 
 
 class OriginalMetadataRef(BaseModel):

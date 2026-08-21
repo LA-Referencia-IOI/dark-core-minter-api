@@ -100,6 +100,11 @@ def upgrade() -> None:
         sa.Column("last_cycle_processed", sa.Integer(), nullable=True),
         sa.Column("last_cycle_succeeded", sa.Integer(), nullable=True),
         sa.Column("last_cycle_failed", sa.Integer(), nullable=True),
+        sa.Column("last_reconciliation_at", sa.DateTime(), nullable=True),
+        sa.Column("last_reconciliation_checked", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("last_reconciliation_repaired", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("last_reconciliation_purged", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("last_reconciliation_failed", sa.Integer(), server_default="0", nullable=False),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("total_processed", sa.Integer(), server_default="0", nullable=False),
         sa.Column("total_succeeded", sa.Integer(), server_default="0", nullable=False),
@@ -131,6 +136,10 @@ def upgrade() -> None:
         sa.Column("original_schema", sa.String(length=50), nullable=False),
         sa.Column("original_media_type", sa.String(length=255), nullable=True),
         sa.Column("original_cid", sa.String(length=100), nullable=True),
+        sa.Column("level1_replica_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("level2_replica_count", sa.Integer(), server_default="0", nullable=False),
+        sa.Column("replication_checked_at", sa.DateTime(), nullable=True),
+        sa.Column("replication_last_error", sa.Text(), nullable=True),
         sa.Column(
             "created_at",
             sa.DateTime(),
@@ -148,9 +157,16 @@ def upgrade() -> None:
         sa.UniqueConstraint("ark_record_id"),
     )
     op.create_index(op.f("ix_ark_metadata_ark_record_id"), "ark_metadata", ["ark_record_id"], unique=False)
+    op.create_index(
+        op.f("ix_ark_metadata_replication_checked_at"),
+        "ark_metadata",
+        ["replication_checked_at"],
+        unique=False,
+    )
 
 
 def downgrade() -> None:
+    op.drop_index(op.f("ix_ark_metadata_replication_checked_at"), table_name="ark_metadata")
     op.drop_index(op.f("ix_ark_metadata_ark_record_id"), table_name="ark_metadata")
     op.drop_table("ark_metadata")
     op.drop_index(op.f("ix_worker_runtime_status_last_heartbeat_at"), table_name="worker_runtime_status")

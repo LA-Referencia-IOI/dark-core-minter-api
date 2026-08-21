@@ -10,7 +10,7 @@ from dark_core_lib.metadata import StorageError, StoredDocument
 from dark_core_lib.models import ARKPublishResult
 
 from app.models.states import ARKState
-from app.workers.publisher import ARKPublisher
+from app.workers.publisher import ARKPublisher, MetadataPersistenceWorker, _utc_now
 
 
 class MockMetadataStorage:
@@ -89,6 +89,10 @@ class MockMetadataRecord:
         self.original_media_type = original_media_type
         self.level1_cid = level1_cid
         self.original_cid = original_cid
+        self.level1_replica_count = 0
+        self.level2_replica_count = 0
+        self.replication_checked_at = None
+        self.replication_last_error = None
 
 
 def _build_repo(ark_record, metadata_record):
@@ -100,6 +104,8 @@ def _build_repo(ark_record, metadata_record):
         ark_record_id,
         level1_cid=None,
         level2_cid=None,
+        level1_replica_count=None,
+        level2_replica_count=None,
         purge_local=False,
         reset_publish_tracking=False,
     ):
@@ -109,6 +115,10 @@ def _build_repo(ark_record, metadata_record):
             metadata_record.level1_cid = level1_cid
         if level2_cid is not None:
             metadata_record.original_cid = level2_cid
+        if level1_replica_count is not None:
+            metadata_record.level1_replica_count = level1_replica_count
+        if level2_replica_count is not None:
+            metadata_record.level2_replica_count = level2_replica_count
         if purge_local:
             metadata_record.level1_json = None
             metadata_record.original_content = None
@@ -395,6 +405,8 @@ class TestARKPublisherUnit:
             ark_record_id,
             level1_cid=None,
             level2_cid=None,
+            level1_replica_count=None,
+            level2_replica_count=None,
             purge_local=False,
             reset_publish_tracking=False,
         ):
@@ -405,6 +417,10 @@ class TestARKPublisherUnit:
                 metadata.level1_cid = level1_cid
             if level2_cid is not None:
                 metadata.original_cid = level2_cid
+            if level1_replica_count is not None:
+                metadata.level1_replica_count = level1_replica_count
+            if level2_replica_count is not None:
+                metadata.level2_replica_count = level2_replica_count
             if purge_local:
                 metadata.level1_json = None
                 metadata.original_content = None
@@ -457,3 +473,34 @@ class TestARKPublisherUnit:
         assert publisher.stats["total_succeeded"] == 0
         assert publisher.stats["total_failed"] == 0
         assert publisher.stats["total_permanent_failures"] == 0
+
+
+class TestMetadataReconciliationScheduling:
+    def _run_cycle(self, records, last_reconciliation_at=None):
+        worker = MetadataPersistenceWorker(MockMetadataStorage(), concurrency=1)
+        worker.stats["last_reconciliation_at"] = last_reconciliation_at
+        repo = Mock()
+        repo.get_metadata_pending_persist.return_value = records
+        db = Mock()
+        session_factory = Mock(return_value=db)
+        with patch("app.workers.publisher.SessionLocal", return_value=session_factory):
+            with patch("app.workers.publisher.ARKRepository", return_value=repo):
+                with patch.object(worker, "_process_ark_batch") as process:
+                    with patch.object(worker, "_run_reconciliation_cycle") as reconcile:
+                        worker.run_publish_cycle()
+        return process, reconcile
+
+    def test_reconciles_immediately_when_ingestion_is_idle(self):
+        process, reconcile = self._run_cycle([], last_reconciliation_at=_utc_now())
+        process.assert_called_once_with([])
+        reconcile.assert_called_once_with()
+
+    def test_reconciles_after_five_minutes_under_continuous_load(self):
+        from datetime import timedelta
+
+        process, reconcile = self._run_cycle(
+            [SimpleNamespace(ark="ark:12345/pending")],
+            last_reconciliation_at=_utc_now() - timedelta(seconds=301),
+        )
+        process.assert_called_once_with(["ark:12345/pending"])
+        reconcile.assert_called_once_with()

@@ -9,7 +9,7 @@ from typing import Any, Dict
 from dark_core_lib import ARKPublishOperation, DARKCoreClient
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import and_, case, func, or_
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -158,6 +158,7 @@ def _build_worker_config(settings) -> Dict[str, Any]:
     return {
         "metadata": {
             "worker_page_size": settings.metadata_worker_page_size,
+            "worker_concurrency": settings.metadata_worker_concurrency,
             "worker_sleep_seconds": settings.metadata_worker_sleep_seconds,
             "worker_storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
             "worker_max_retries": settings.metadata_worker_max_retries,
@@ -595,6 +596,13 @@ def _build_runtime_status(
             "worker_name": worker_name,
             "source": "db_heartbeat",
             "message": "No worker heartbeat found",
+            "reconciliation": {
+                "last_run_at": None,
+                "checked": 0,
+                "repaired": 0,
+                "purged": 0,
+                "failed": 0,
+            },
             "cadence": _build_cadence_metrics(
                 record,
                 page_size=page_size,
@@ -647,6 +655,13 @@ def _build_runtime_status(
             "total_succeeded": record.total_succeeded,
             "total_failed": record.total_failed,
             "total_permanent_failures": record.total_permanent_failures,
+        },
+        "reconciliation": {
+            "last_run_at": _isoformat_or_none(record.last_reconciliation_at),
+            "checked": record.last_reconciliation_checked,
+            "repaired": record.last_reconciliation_repaired,
+            "purged": record.last_reconciliation_purged,
+            "failed": record.last_reconciliation_failed,
         },
         "last_error": record.last_error,
         "source": "db_heartbeat",
@@ -705,6 +720,7 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
     queue_totals = _build_queue_totals(queue_summary["queues"])
     worker_states = {metadata_state, chain_state}
     overall = _derive_overall_status(worker_states, error_totals, rpc_status, storage_status)
+    replication = _build_replication_summary(db, metadata_record)
 
     response = {
         "overall": overall,
@@ -732,6 +748,7 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
         },
         "by_state": queue_summary["by_state"],
         "config": config_summary,
+        "replication": replication,
     }
     return response
 
@@ -924,6 +941,70 @@ def _build_simple_status(full_status: Dict[str, Any]) -> Dict[str, Any]:
         "workers": workers,
         "errors": error_summary,
         "arks": full_status["by_state"],
+        "replication": full_status["replication"],
+    }
+
+
+def _replication_state(metadata: ARKMetadata) -> str:
+    """Derive the operational state without persisting a state machine."""
+    retained = metadata.level1_json is not None or metadata.original_content is not None
+    if not retained:
+        return "complete"
+    if metadata.replication_last_error:
+        return "error"
+    if metadata.level1_replica_count <= 0 or metadata.level2_replica_count <= 0:
+        return "degraded"
+    return "pending"
+
+
+def _build_replication_summary(db: Session, metadata_runtime) -> Dict[str, Any]:
+    """Aggregate the minimal persisted reconciliation state."""
+    eligible = and_(
+        ARKMetadata.level1_cid.isnot(None),
+        ARKMetadata.original_cid.isnot(None),
+    )
+    retained = or_(
+        ARKMetadata.level1_json.isnot(None),
+        ARKMetadata.original_content.isnot(None),
+    )
+    has_error = ARKMetadata.replication_last_error.isnot(None)
+    degraded = or_(
+        ARKMetadata.level1_replica_count <= 0,
+        ARKMetadata.level2_replica_count <= 0,
+    )
+    aggregate = db.query(
+        func.sum(case((and_(eligible, ~retained), 1), else_=0)),
+        func.sum(case((and_(eligible, retained, has_error), 1), else_=0)),
+        func.sum(case((and_(eligible, retained, ~has_error, degraded), 1), else_=0)),
+        func.sum(case((and_(eligible, retained, ~has_error, ~degraded), 1), else_=0)),
+        func.sum(case((and_(eligible, retained), 1), else_=0)),
+        func.min(
+            case(
+                (and_(eligible, retained), func.coalesce(
+                    ARKMetadata.replication_checked_at,
+                    ARKMetadata.created_at,
+                )),
+                else_=None,
+            )
+        ),
+    ).one()
+    complete_count, error_count, degraded_count, pending_count, retained_count, oldest_pending = aggregate
+    return {
+        "pending": int(pending_count or 0),
+        "complete": int(complete_count or 0),
+        "degraded": int(degraded_count or 0),
+        "error": int(error_count or 0),
+        "retained_payloads": int(retained_count or 0),
+        "oldest_pending_at": _isoformat_or_none(oldest_pending),
+        "last_cycle": {
+            "at": _isoformat_or_none(
+                metadata_runtime.last_reconciliation_at if metadata_runtime else None
+            ),
+            "checked": metadata_runtime.last_reconciliation_checked if metadata_runtime else 0,
+            "repaired": metadata_runtime.last_reconciliation_repaired if metadata_runtime else 0,
+            "purged": metadata_runtime.last_reconciliation_purged if metadata_runtime else 0,
+            "failed": metadata_runtime.last_reconciliation_failed if metadata_runtime else 0,
+        },
     }
 
 
@@ -947,6 +1028,47 @@ async def get_worker_status(
     if detail == "full":
         return full_status
     return _build_simple_status(full_status)
+
+
+@router.get("/replication", response_model=Dict[str, Any])
+async def get_replication_queue(
+    state: str = Query(default="all", pattern="^(all|pending|complete|degraded|error)$"),
+    limit: int = Query(default=100, ge=1, le=500),
+    db: Session = Depends(get_db),
+) -> Dict[str, Any]:
+    """List the last observed L1/L2 replica counts for operational inspection."""
+    rows = (
+        db.query(ARKRecord, ARKMetadata)
+        .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+        .filter(ARKMetadata.level1_cid.isnot(None), ARKMetadata.original_cid.isnot(None))
+        .order_by(ARKMetadata.replication_checked_at.asc().nullsfirst(), ARKMetadata.id.asc())
+        .all()
+    )
+    items = []
+    for record, metadata in rows:
+        item_state = _replication_state(metadata)
+        if state != "all" and item_state != state:
+            continue
+        items.append({
+            "ark": record.ark,
+            "state": item_state,
+            "payload_retained": (
+                metadata.level1_json is not None or metadata.original_content is not None
+            ),
+            "level1": {
+                "cid": metadata.level1_cid,
+                "replicas": metadata.level1_replica_count,
+            },
+            "level2": {
+                "cid": metadata.original_cid,
+                "replicas": metadata.level2_replica_count,
+            },
+            "checked_at": _isoformat_or_none(metadata.replication_checked_at),
+            "last_error": metadata.replication_last_error,
+        })
+        if len(items) >= limit:
+            break
+    return {"items": items, "count": len(items), "limit": limit, "state": state}
 
 
 @router.get("/errors", response_model=Dict[str, Any])
