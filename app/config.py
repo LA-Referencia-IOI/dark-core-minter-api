@@ -7,7 +7,7 @@ Uses pydantic-settings for environment variable loading and validation.
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -88,7 +88,7 @@ class Settings(BaseSettings):
     metadata_store_api_timeout_seconds: float = 10.0
     
     # Minter Configuration
-    minter_shoulder: str = ""
+    minter_shoulder: str = "200"
     minter_noid_length: int = 7
     minter_noid_checkdigit: bool = True
     
@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     dark_authority_address: str = ""
     dark_contract_address: str = ""
     dark_admin_private_key: str = ""
+
+    @field_validator("minter_shoulder")
+    @classmethod
+    def validate_minter_shoulder(cls, value: str) -> str:
+        """Require the DARK 2 shoulder format: version ``2`` plus minter code."""
+        if len(value) != 3 or not value.isascii() or not value.isdigit() or not value.startswith("2"):
+            raise ValueError(
+                "MINTER_SHOULDER must be exactly three digits in the format 2MM "
+                "(2 = DARK version; MM = minter code)"
+            )
+        return value
 
     def validate_blockchain_config(self) -> None:
         """Validate that blockchain configuration is complete."""

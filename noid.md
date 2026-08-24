@@ -29,14 +29,14 @@ Current `name`:
 
 Where:
 
-- `shoulder`: optional minter prefix
+- `shoulder`: DARK 2 minter prefix (`2MM`)
 - `counter_part`: base29-encoded counter with fixed length `7`
 - `checkdigit`: character computed over `"{naan}/{shoulder}{counter_part}"`
 
 Examples:
 
-- `ark:12345/x0000000d`
-- `ark:12345/x0000001w`
+- `ark:12345/2000000000c`
+- `ark:12345/2000000001x`
 
 ## 3. Alphabet and Base
 
@@ -57,13 +57,18 @@ Implemented in:
 
 Variables:
 
-- `MINTER_SHOULDER` (default `""`)
+- `MINTER_SHOULDER` (default `"200"`)
 - `MINTER_NOID_LENGTH` (default `7`)
 - `MINTER_NOID_CHECKDIGIT` (default `true`)
 
 Important note:
 
 - Current policy operates it as fixed length (recommended `7`).
+- The shoulder is exactly three decimal digits in the form `2MM`: `2` denotes
+  DARK 2 and `MM` is the minter code. The historical `00*` prefix space is
+  reserved for DARK 1 and is rejected by the minter configuration.
+- Assign each `MM` code uniquely among minters that can issue under the same
+  NAAN. `200` is the default allocation.
 
 ## 5. Namespace Capacity
 
