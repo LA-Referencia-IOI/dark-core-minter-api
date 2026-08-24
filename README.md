@@ -34,6 +34,53 @@ Use the docs in this order, depending on what you need:
 - [noid.md](./noid.md)
   - detailed NOID generation rules and rationale
 
+## Direct Import and NAAN Audit Commands
+
+`dark-import-arks` imports ARK identifiers and target URLs directly to the
+blockchain without metadata, IPFS storage, or a Minter API request. It creates
+records with an empty CID and uses the same `dark-core-lib` configuration as
+the Minter.
+
+The input is a UTF-8 CSV with, at minimum, these columns:
+
+```csv
+darkidentifier,itemurl
+ark:/41046/001300001kq89,https://repositorio.example/handle/123/1
+```
+
+Run its non-writing preflight first, then pass `--execute` to submit
+transactions:
+
+```bash
+dark-import-arks records.csv \
+  --authority-id authority-uuid \
+  --env-file /opt/dark/minter/.env
+
+dark-import-arks records.csv \
+  --authority-id authority-uuid \
+  --env-file /opt/dark/minter/.env \
+  --execute
+```
+
+Before writing, it verifies that the authority is active and is authorized for
+every NAAN in the valid input. Existing ARKs with the same owner and URL are
+skipped; different owner or URL values are reported as conflicts. The result
+CSV is flushed after each row and can be reused as a checkpoint.
+
+`dark-check-naans` is read-only: without an authority it lists the unique NAANs
+in a CSV, and with one it verifies assignments. To list only missing NAANs:
+
+```bash
+dark-check-naans records.csv \
+  --authority-id authority-uuid \
+  --env-file /opt/dark/minter/.env \
+  --only-missing \
+  --format csv
+```
+
+It exits with status `1` when there is an invalid ARK, inactive authority, or a
+missing NAAN assignment.
+
 ## Runtime Architecture
 
 If you want the implementation-oriented view behind this diagram, continue with [minter-architecture.md](./minter-architecture.md).

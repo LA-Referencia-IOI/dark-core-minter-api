@@ -62,6 +62,8 @@ Issues = "https://github.com/lareferencia/dark-core-api/issues"
 dark-core-api = "app.main:run_server"
 dark-core-worker = "app.main_worker:run_worker"
 dark-core-worker-status = "app.main_worker:run_worker_status"
+dark-import-arks = "app.cli.import_arks:main"
+dark-check-naans = "app.cli.check_naans:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
