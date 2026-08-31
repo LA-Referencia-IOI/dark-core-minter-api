@@ -23,7 +23,7 @@ def test_reserve_ark(client, mock_corelib):
     assert response.status_code == 201
     data = response.json()
     assert data["state"] == ARKState.RESERVED
-    # Default shoulder in config is empty string unless mocked
+    # Default shoulder in config is DARK 2 minter code 200 unless mocked
     assert data["ark"].startswith("ark:12345/")
     assert data.get("target") is None
     assert data.get("minimal_metadata") is None

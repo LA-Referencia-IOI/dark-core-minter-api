@@ -25,7 +25,7 @@ services:
   minter-api:
     build: *minter-build
     ports:
-      - "8001:8001"
+      - "${APPS_BIND_ADDRESS:-127.0.0.1}:8001:8001"
     volumes:
       - metadata-storage:/app/metadata_storage
     env_file:

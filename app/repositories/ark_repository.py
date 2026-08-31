@@ -342,6 +342,10 @@ class ARKRepository:
             # CIDs are reset on update because content changed (worker will re-publish)
             metadata.level1_cid = None
             metadata.original_cid = None
+            metadata.level1_replica_count = 0
+            metadata.level2_replica_count = 0
+            metadata.replication_checked_at = None
+            metadata.replication_last_error = None
             metadata.updated_at = _utc_now()
         else:
             metadata = ARKMetadata(
@@ -371,6 +375,8 @@ class ARKRepository:
         ark_record_id: int,
         level1_cid: Optional[str] = None,
         level2_cid: Optional[str] = None,
+        level1_replica_count: Optional[int] = None,
+        level2_replica_count: Optional[int] = None,
         purge_local: bool = False,
         reset_publish_tracking: bool = False,
     ) -> None:
@@ -383,6 +389,10 @@ class ARKRepository:
             metadata.level1_cid = level1_cid
         if level2_cid is not None:
             metadata.original_cid = level2_cid
+        if level1_replica_count is not None:
+            metadata.level1_replica_count = max(int(level1_replica_count), 0)
+        if level2_replica_count is not None:
+            metadata.level2_replica_count = max(int(level2_replica_count), 0)
         if purge_local:
             metadata.level1_json = None
             metadata.original_content = None
@@ -396,6 +406,27 @@ class ARKRepository:
                 ark_record.publish_last_attempt_at = None
                 ark_record.publish_permanently_failed = 0
                 ark_record.updated_at = _utc_now()
+
+    def get_metadata_pending_reconciliation(self, limit: int = 50) -> List[ARKRecord]:
+        """Return ARKs that still retain payload after both CIDs were stored."""
+        return (
+            self.db.query(ARKRecord)
+            .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+            .filter(
+                ARKMetadata.level1_cid.isnot(None),
+                ARKMetadata.original_cid.isnot(None),
+                or_(
+                    ARKMetadata.level1_json.isnot(None),
+                    ARKMetadata.original_content.isnot(None),
+                ),
+            )
+            .order_by(
+                ARKMetadata.replication_checked_at.asc().nullsfirst(),
+                ARKMetadata.updated_at.asc(),
+            )
+            .limit(max(int(limit), 1))
+            .all()
+        )
 
     def get_metadata_pending_persist(
         self,

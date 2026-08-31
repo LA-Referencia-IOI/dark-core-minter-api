@@ -80,6 +80,21 @@ def test_worker_status_simple_unknown_when_no_heartbeat(client):
         "published": 0,
         "tombstone": 0,
     }
+    assert data["replication"] == {
+        "pending": 0,
+        "complete": 0,
+        "degraded": 0,
+        "error": 0,
+        "retained_payloads": 0,
+        "oldest_pending_at": None,
+        "last_cycle": {
+            "at": None,
+            "checked": 0,
+            "repaired": 0,
+            "purged": 0,
+            "failed": 0,
+        },
+    }
     assert "config" not in data
     assert "cadence" not in data
     assert "running" not in data
@@ -120,6 +135,7 @@ def test_worker_status_full_unknown_when_no_heartbeat(client):
     }
     assert data["config"]["metadata"]["worker_page_size"] == 100
     assert data["config"]["metadata"]["worker_sleep_seconds"] == 2
+    assert data["config"]["metadata"]["worker_concurrency"] == 4
     assert data["config"]["chain"]["worker_page_size"] == 20
     assert data["config"]["chain"]["worker_sleep_seconds"] == 5
     assert data["workers"]["chain"]["cadence"]["pressure"] == "unknown"
@@ -139,6 +155,28 @@ def test_worker_status_full_unknown_when_no_heartbeat(client):
     assert "running" not in data
     assert "queue" not in data
     assert "cadence" not in data
+
+
+def test_replication_endpoint_lists_retained_payload_and_counts(client, test_db):
+    ark = _add_ark(test_db, name="replication-pending", state=ARKState.DRAFT)
+    test_db.flush()
+    metadata = test_db.query(ARKMetadata).filter_by(ark_record_id=ark.id).one()
+    metadata.level1_cid = "bafy-l1"
+    metadata.original_cid = "bafy-l2"
+    metadata.level1_replica_count = 2
+    metadata.level2_replica_count = 1
+    metadata.replication_checked_at = _utc_now()
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/replication?state=pending")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["count"] == 1
+    assert data["items"][0]["ark"] == "ark:12345/replication-pending"
+    assert data["items"][0]["payload_retained"] is True
+    assert data["items"][0]["level1"] == {"cid": "bafy-l1", "replicas": 2}
+    assert data["items"][0]["level2"] == {"cid": "bafy-l2", "replicas": 1}
 
 
 def test_worker_status_simple_summarizes_live_workers_and_queues(client, test_db):

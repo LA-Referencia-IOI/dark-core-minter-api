@@ -15,7 +15,7 @@ REST API and background workers for ARK reservation, metadata staging, metadata 
    - move ARKs into `DRAFT` or `UPDATE`
 2. asynchronous worker work
    - persist Level-2 and Level-1 metadata to the configured storage backend
-   - purge local staged metadata payloads after storage persistence
+   - retain staged metadata until the configured topology target is observed
    - publish `create_ark` or `update_ark` on-chain through `dark-core-lib`
    - finalize the ARK as `PUBLISHED`
 
@@ -115,7 +115,9 @@ flowchart LR
   - claims `DRAFT` and `UPDATE` records whose metadata CIDs are incomplete
   - persists metadata through the shared `dark_core_lib.metadata` layer
   - stores `level1_cid` and `original_cid`
-  - purges local `level1_json` and `original_content`
+  - records one initial replica for each CID and keeps `level1_json` and `original_content`
+  - reconciles retained payloads when idle and at least every five minutes under load
+  - repairs zero-copy CIDs and purges only when both L1 and L2 meet Store API's target
   - keeps DB heartbeat fresh during long metadata cycles
 - Chain worker process
   - claims `DRAFT` and `UPDATE` records whose CIDs are complete
@@ -155,12 +157,15 @@ sequenceDiagram
     MetadataWorker->>DB: claim ARKs pending metadata persistence
     MetadataWorker->>Store: store Level-2 metadata
     MetadataWorker->>Store: store Level-1 metadata with embedded L2 reference
-    MetadataWorker->>DB: persist CIDs and purge local payloads
+    MetadataWorker->>DB: persist CIDs and retain local payloads
 
     ChainWorker->>DB: claim ARKs with complete CIDs
     ChainWorker->>Core: create_ark or update_ark
     Core->>Chain: signed transaction
     ChainWorker->>DB: mark ARK as PUBLISHED
+
+    MetadataWorker->>Store: query live L1/L2 replication
+    MetadataWorker->>DB: update counts; purge only when both targets are met
 ```
 
 ## ARK Lifecycle
@@ -282,7 +287,7 @@ sequenceDiagram
         Store-->>MetadataWorker: original_cid
         MetadataWorker->>Store: store Level-1 JSON with schema + media_type + original_cid
         Store-->>MetadataWorker: level1_cid
-        MetadataWorker->>Repo: persist CIDs, purge local payloads, reset publish tracking
+        MetadataWorker->>Repo: persist CIDs, retain payloads, reset publish tracking
     end
 
     ChainWorker->>Repo: get_chain_pending_publish(limit)
@@ -485,6 +490,7 @@ The detailed `config.chain.worker_page_size` field shows the active chain transa
 | `/api/v1/authority/{uuid}/naans` | `GET` | List authorized NAANs |
 | `/api/v1/authority/{uuid}/authorized/{naan}` | `GET` | Check NAAN authorization |
 | `/api/v1/worker/status` | `GET` | Read compact worker, queue, error, and ARK state summary |
+| `/api/v1/worker/replication` | `GET` | List retained ARKs and last observed L1/L2 replica counts |
 | `/api/v1/worker/errors` | `GET` | Read compact worker error report or filtered error list |
 | `/api/v1/worker/errors/rescue` | `POST` | Retry filtered permanent chain errors for the authenticated authority |
 | `/health` | `GET` | Check database, blockchain, and storage wiring |
@@ -686,6 +692,7 @@ The app prefers `.env.integration` over `.env`.
 | `BATCH_SIZE_LIMIT` | Max items per batch reserve request | `100` |
 | `METADATA_WORKER_ENABLED` | Enable metadata persistence worker | `true` |
 | `METADATA_WORKER_PAGE_SIZE` | ARKs per metadata cycle | `100` |
+| `METADATA_WORKER_CONCURRENCY` | Concurrent ARKs; each keeps L2 before L1 | `4` |
 | `METADATA_WORKER_SLEEP_SECONDS` | Metadata sleep after an empty or partial page | `2` |
 | `METADATA_WORKER_STORAGE_RETRY_SECONDS` | Sleep while metadata worker is paused for unavailable storage | `10` |
 | `METADATA_WORKER_MAX_RETRIES` | Metadata retry attempts before permanent failure | `5` |
@@ -749,7 +756,7 @@ These values are required for blockchain operations. DB-only API endpoints and w
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MINTER_SHOULDER` | Prefix for generated names | `""` |
+| `MINTER_SHOULDER` | DARK 2 prefix in format `2MM`; `MM` uniquely identifies the minter per NAAN | `200` |
 | `MINTER_NOID_LENGTH` | Generated-part length | `7` |
 | `MINTER_NOID_CHECKDIGIT` | Append and validate checkdigit | `true` |
 | `AUTH_CACHE_TTL` | NAAN authorization cache TTL | `60` |

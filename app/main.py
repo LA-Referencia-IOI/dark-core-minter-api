@@ -79,6 +79,9 @@ async def lifespan(app: FastAPI):
 
     shutdown_corelib_client()
     
+    from app.dependencies import shutdown_metadata_storage
+    shutdown_metadata_storage()
+
     from app.database import close_db
     close_db()
 

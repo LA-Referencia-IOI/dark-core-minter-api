@@ -201,4 +201,5 @@ def shutdown_metadata_storage() -> None:
     global _metadata_storage
     if _metadata_storage is not None:
         logger.info("Shutting down metadata storage")
+        _metadata_storage.close()
         _metadata_storage = None
