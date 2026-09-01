@@ -2,8 +2,9 @@
 Workers for the asynchronous ARK publication pipeline.
 
 MetadataPersistenceWorker persists local metadata payloads to the configured
-metadata backend. ChainPublisherWorker publishes ARKs with persisted metadata
-to the blockchain.
+metadata backend. ReplicationReconciliationWorker verifies and repairs stored
+CIDs before safe local-payload purge. ChainPublisherWorker publishes ARKs with
+persisted metadata to the blockchain.
 """
 
 import logging
@@ -146,8 +147,6 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
         self.concurrency = max(int(concurrency), 1)
         self.max_retries = max_retries
         self.backoff_base = backoff_base
-        self.reconciliation_batch_size = 50
-        self.reconciliation_max_interval_seconds = 300
         self._init_stats()
 
     def persist_single_ark(self, ark_id: str) -> bool:
@@ -283,6 +282,67 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
                 if permanent:
                     self.stats["total_permanent_failures"] += 1
 
+    def run_publish_cycle(self) -> None:
+        """Persist one bounded page of metadata payloads."""
+        start_time = _utc_now()
+        before = self._snapshot_cycle_totals()
+
+        try:
+            session_factory = SessionLocal()
+            db: Session = session_factory()
+
+            try:
+                repo = ARKRepository(db)
+                records = repo.get_metadata_pending_persist(
+                    limit=self.page_size,
+                    max_retries=self.max_retries,
+                    backoff_base=self.backoff_base,
+                )
+                db.commit()
+
+                ark_ids = [record.ark for record in records]
+                if ark_ids:
+                    logger.info(f"Persisting metadata for {len(ark_ids)} ARKs")
+                else:
+                    logger.debug("No ARKs pending metadata persistence")
+
+            finally:
+                db.close()
+
+            self.stats["last_run_page_size"] = self.page_size
+            self._process_ark_batch(ark_ids)
+
+        except Exception as e:
+            logger.error(f"Error in metadata persistence cycle: {e}")
+            self._add_recent_error("BATCH", f"Cycle error: {e}")
+
+        finally:
+            duration = self._record_cycle_metrics(start_time, before)
+            logger.info(
+                f"Metadata cycle complete. Duration: {duration:.2f}s, "
+                f"Processed: {self.stats['total_processed']}, "
+                f"Success: {self.stats['total_succeeded']}, "
+                f"Failed: {self.stats['total_failed']}"
+            )
+
+
+class ReplicationReconciliationWorker(_WorkerStatsMixin):
+    """Worker that verifies metadata replicas, repairs content, and purges safely."""
+
+    def __init__(
+        self,
+        metadata_storage: MetadataStorage,
+        page_size: int = 50,
+        concurrency: int = 2,
+        recheck_seconds: int = 300,
+    ):
+        self.metadata_storage = metadata_storage
+        self.metadata_service = MetadataService(metadata_storage)
+        self.page_size = max(int(page_size), 1)
+        self.concurrency = max(int(concurrency), 1)
+        self.recheck_seconds = max(int(recheck_seconds), 0)
+        self._init_stats()
+
     def _reconcile_single_ark(self, ark_id: str) -> dict[str, int]:
         """Refresh both CID counts, repair zero-copy content and purge atomically."""
         result = {"checked": 1, "repaired": 0, "purged": 0, "failed": 0}
@@ -382,85 +442,58 @@ class MetadataPersistenceWorker(_WorkerStatsMixin):
             result["failed"] = 1
             return result
 
-    def _run_reconciliation_cycle(self) -> None:
-        """Reconcile the oldest retained payloads with bounded concurrency."""
-        session_factory = SessionLocal()
-        db: Session = session_factory()
-        try:
-            records = ARKRepository(db).get_metadata_pending_reconciliation(
-                limit=self.reconciliation_batch_size
-            )
-            ark_ids = [record.ark for record in records]
-        finally:
-            db.close()
-
-        totals = {"checked": 0, "repaired": 0, "purged": 0, "failed": 0}
-        if ark_ids:
-            with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-                futures = [executor.submit(self._reconcile_single_ark, ark_id) for ark_id in ark_ids]
-                for future in as_completed(futures):
-                    try:
-                        item = future.result()
-                    except Exception:
-                        item = {"checked": 1, "repaired": 0, "purged": 0, "failed": 1}
-                    for key in totals:
-                        totals[key] += int(item.get(key, 0))
-        checked_at = _utc_now()
-        self.stats["last_reconciliation_at"] = checked_at
-        self.stats["last_reconciliation_checked"] = totals["checked"]
-        self.stats["last_reconciliation_repaired"] = totals["repaired"]
-        self.stats["last_reconciliation_purged"] = totals["purged"]
-        self.stats["last_reconciliation_failed"] = totals["failed"]
-
-    def _reconciliation_due(self) -> bool:
-        last_run = self.stats.get("last_reconciliation_at")
-        if last_run is None:
-            return True
-        return (_utc_now() - last_run).total_seconds() >= self.reconciliation_max_interval_seconds
-
     def run_publish_cycle(self) -> None:
-        """Run ingestion first and opportunistic replication reconciliation second."""
+        """Reconcile one bounded page of retained metadata payloads."""
         start_time = _utc_now()
         before = self._snapshot_cycle_totals()
+        totals = {"checked": 0, "repaired": 0, "purged": 0, "failed": 0}
 
         try:
             session_factory = SessionLocal()
             db: Session = session_factory()
-
             try:
-                repo = ARKRepository(db)
-                records = repo.get_metadata_pending_persist(
+                records = ARKRepository(db).get_metadata_pending_reconciliation(
                     limit=self.page_size,
-                    max_retries=self.max_retries,
-                    backoff_base=self.backoff_base,
+                    recheck_seconds=self.recheck_seconds,
                 )
-                db.commit()
-
                 ark_ids = [record.ark for record in records]
-                if ark_ids:
-                    logger.info(f"Persisting metadata for {len(ark_ids)} ARKs")
-                else:
-                    logger.debug("No ARKs pending metadata persistence")
-
             finally:
                 db.close()
 
+            if ark_ids:
+                with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+                    futures = [executor.submit(self._reconcile_single_ark, ark_id) for ark_id in ark_ids]
+                    for future in as_completed(futures):
+                        try:
+                            item = future.result()
+                        except Exception as exc:
+                            item = {"checked": 1, "repaired": 0, "purged": 0, "failed": 1}
+                            self._add_recent_error("REPLICATION", f"Unexpected task error: {exc}")
+                        for key in totals:
+                            totals[key] += int(item.get(key, 0))
+
+            self.stats["total_processed"] += totals["checked"]
+            self.stats["total_succeeded"] += totals["checked"] - totals["failed"]
+            self.stats["total_failed"] += totals["failed"]
             self.stats["last_run_page_size"] = self.page_size
-            self._process_ark_batch(ark_ids)
-            if not ark_ids or self._reconciliation_due():
-                self._run_reconciliation_cycle()
-
-        except Exception as e:
-            logger.error(f"Error in metadata persistence cycle: {e}")
-            self._add_recent_error("BATCH", f"Cycle error: {e}")
-
+            self.stats["last_reconciliation_at"] = _utc_now()
+            self.stats["last_reconciliation_checked"] = totals["checked"]
+            self.stats["last_reconciliation_repaired"] = totals["repaired"]
+            self.stats["last_reconciliation_purged"] = totals["purged"]
+            self.stats["last_reconciliation_failed"] = totals["failed"]
+        except Exception as exc:
+            logger.error(f"Error in replication reconciliation cycle: {exc}")
+            self._add_recent_error("REPLICATION", f"Cycle error: {exc}")
         finally:
             duration = self._record_cycle_metrics(start_time, before)
             logger.info(
-                f"Metadata cycle complete. Duration: {duration:.2f}s, "
-                f"Processed: {self.stats['total_processed']}, "
-                f"Success: {self.stats['total_succeeded']}, "
-                f"Failed: {self.stats['total_failed']}"
+                "Replication cycle complete. Duration: %.2fs, checked: %s, "
+                "repaired: %s, purged: %s, failed: %s",
+                duration,
+                totals["checked"],
+                totals["repaired"],
+                totals["purged"],
+                totals["failed"],
             )
 
 
@@ -973,10 +1006,10 @@ class ChainPublisherWorker(_WorkerStatsMixin):
 
 class ARKPublisher(_WorkerStatsMixin):
     """
-    Backward-compatible facade that runs metadata persistence then chain publish.
+    Backward-compatible facade that runs all three stages sequentially.
 
-    New deployments should run MetadataPersistenceWorker and ChainPublisherWorker
-    as separate processes.
+    New deployments should run metadata, replication, and chain workers as
+    separate processes.
     """
 
     def __init__(
@@ -993,6 +1026,12 @@ class ARKPublisher(_WorkerStatsMixin):
             concurrency=1,
             max_retries=max_retries,
             backoff_base=backoff_base,
+        )
+        self.replication_worker = ReplicationReconciliationWorker(
+            metadata_storage=metadata_storage,
+            page_size=page_size,
+            concurrency=1,
+            recheck_seconds=0,
         )
         self.chain_worker = ChainPublisherWorker(
             corelib_client=corelib_client,
@@ -1030,8 +1069,9 @@ class ARKPublisher(_WorkerStatsMixin):
         return chain_ok
 
     def run_publish_cycle(self) -> None:
-        """Run both stages in sequence for legacy single-worker execution."""
+        """Run all stages in sequence for legacy single-worker execution."""
         self.metadata_worker.run_publish_cycle()
+        self.replication_worker.run_publish_cycle()
         self.chain_worker.run_publish_cycle()
         self._sync_stats()
 
@@ -1044,6 +1084,7 @@ class ARKPublisher(_WorkerStatsMixin):
         self.stats["total_succeeded"] = self.chain_worker.stats["total_succeeded"]
         self.stats["total_failed"] = (
             self.metadata_worker.stats["total_failed"]
+            + self.replication_worker.stats["total_failed"]
             + self.chain_worker.stats["total_failed"]
         )
         self.stats["total_permanent_failures"] = (
@@ -1053,21 +1094,26 @@ class ARKPublisher(_WorkerStatsMixin):
         self.stats["last_run_at"] = self.chain_worker.stats["last_run_at"] or self.metadata_worker.stats["last_run_at"]
         self.stats["last_run_duration"] = (
             (self.metadata_worker.stats["last_run_duration"] or 0)
+            + (self.replication_worker.stats["last_run_duration"] or 0)
             + (self.chain_worker.stats["last_run_duration"] or 0)
         )
         self.stats["last_run_processed"] = (
             (self.metadata_worker.stats["last_run_processed"] or 0)
+            + (self.replication_worker.stats["last_run_processed"] or 0)
             + (self.chain_worker.stats["last_run_processed"] or 0)
         )
         self.stats["last_run_succeeded"] = (
             (self.metadata_worker.stats["last_run_succeeded"] or 0)
+            + (self.replication_worker.stats["last_run_succeeded"] or 0)
             + (self.chain_worker.stats["last_run_succeeded"] or 0)
         )
         self.stats["last_run_failed"] = (
             (self.metadata_worker.stats["last_run_failed"] or 0)
+            + (self.replication_worker.stats["last_run_failed"] or 0)
             + (self.chain_worker.stats["last_run_failed"] or 0)
         )
         self.stats["recent_errors"] = (
             self.metadata_worker.stats["recent_errors"]
+            + self.replication_worker.stats["recent_errors"]
             + self.chain_worker.stats["recent_errors"]
         )[:10]

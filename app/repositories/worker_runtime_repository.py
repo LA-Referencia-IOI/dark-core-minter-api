@@ -3,7 +3,7 @@ Repository for worker runtime heartbeat/status.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Iterable, Optional
 
 from sqlalchemy.orm import Session
 
@@ -23,6 +23,18 @@ class WorkerRuntimeRepository:
             .filter(WorkerRuntimeStatus.worker_name == worker_name)
             .first()
         )
+
+    def get_by_names(self, worker_names: Iterable[str]) -> Dict[str, WorkerRuntimeStatus]:
+        """Return runtime rows keyed by worker name using one small query."""
+        names = list(dict.fromkeys(worker_names))
+        if not names:
+            return {}
+        rows = (
+            self.db.query(WorkerRuntimeStatus)
+            .filter(WorkerRuntimeStatus.worker_name.in_(names))
+            .all()
+        )
+        return {row.worker_name: row for row in rows}
 
     def upsert_status(
         self,

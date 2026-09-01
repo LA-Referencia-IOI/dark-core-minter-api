@@ -57,6 +57,23 @@ services:
       - minter-net
       - dark-net
 
+  minter-replication-worker:
+    build: *minter-build
+    command: ["replication-worker"]
+    volumes:
+      - metadata-storage:/app/metadata_storage
+    env_file:
+      - .env.integration
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://dark:${DB_PASSWORD:-dark_password}@postgres:5432/minter
+    restart: unless-stopped
+    networks:
+      - minter-net
+      - dark-net
+
   minter-chain-worker:
     build: *minter-build
     command: ["chain-worker"]

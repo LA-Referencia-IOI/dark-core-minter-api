@@ -407,14 +407,23 @@ class ARKRepository:
                 ark_record.publish_permanently_failed = 0
                 ark_record.updated_at = _utc_now()
 
-    def get_metadata_pending_reconciliation(self, limit: int = 50) -> List[ARKRecord]:
-        """Return ARKs that still retain payload after both CIDs were stored."""
+    def get_metadata_pending_reconciliation(
+        self,
+        limit: int = 50,
+        recheck_seconds: int = 300,
+    ) -> List[ARKRecord]:
+        """Return retained payloads whose replication check is due."""
+        cutoff = _utc_now() - timedelta(seconds=max(int(recheck_seconds), 0))
         return (
             self.db.query(ARKRecord)
             .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
             .filter(
                 ARKMetadata.level1_cid.isnot(None),
                 ARKMetadata.original_cid.isnot(None),
+                or_(
+                    ARKMetadata.replication_checked_at.is_(None),
+                    ARKMetadata.replication_checked_at <= cutoff,
+                ),
                 or_(
                     ARKMetadata.level1_json.isnot(None),
                     ARKMetadata.original_content.isnot(None),

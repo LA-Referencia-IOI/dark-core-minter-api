@@ -21,7 +21,12 @@ from dark_core_lib.models import ARKInfo, ARKPublishResult
 from app.database.models import ARKMetadata, ARKRecord
 from app.models.states import ARKState
 from app.repositories.ark_repository import ARKRepository
-from app.workers.publisher import ARKPublisher, ChainPublisherWorker, MetadataPersistenceWorker
+from app.workers.publisher import (
+    ARKPublisher,
+    ChainPublisherWorker,
+    MetadataPersistenceWorker,
+    ReplicationReconciliationWorker,
+)
 
 
 class MockMetadataStorage:
@@ -515,6 +520,31 @@ class TestSplitWorkers:
         assert ark_record.publish_permanently_failed == 0
         assert "Metadata storage unavailable (infrastructure)" in ark_record.publish_last_error
 
+    def test_reconciliation_selection_respects_recheck_and_page_size(self, db_session):
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        _, never_checked = _create_ark_with_metadata(
+            db_session, name="recheck-never", metadata_complete=True
+        )
+        _, old_check = _create_ark_with_metadata(
+            db_session, name="recheck-old", metadata_complete=True
+        )
+        _, recent_check = _create_ark_with_metadata(
+            db_session, name="recheck-recent", metadata_complete=True
+        )
+        old_check.replication_checked_at = now - timedelta(seconds=301)
+        recent_check.replication_checked_at = now
+        db_session.commit()
+
+        records = ARKRepository(db_session).get_metadata_pending_reconciliation(
+            limit=2,
+            recheck_seconds=300,
+        )
+
+        assert [record.ark for record in records] == [
+            "ark:12345/recheck-never",
+            "ark:12345/recheck-old",
+        ]
+
     def test_reconciliation_requires_purge_target_for_both_levels(self, db_session):
         _, metadata_record = _create_ark_with_metadata(
             db_session,
@@ -526,7 +556,7 @@ class TestSplitWorkers:
             ReplicationStatus("cid-l2-retain-until-both", "pinned", 2, 2, 0, {"site-a": 2}, False),
             ReplicationStatus("cid-l1-retain-until-both", "pinned", 3, 2, 1, {"site-a": 2, "site-b": 1}, True),
         ]
-        worker = MetadataPersistenceWorker(storage, concurrency=1)
+        worker = ReplicationReconciliationWorker(storage, concurrency=1)
 
         with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
@@ -550,7 +580,7 @@ class TestSplitWorkers:
             ReplicationStatus("cid-l2-purge-both", "pinned", 3, 2, 1, {"site-a": 2, "site-b": 1}, True),
             ReplicationStatus("cid-l1-purge-both", "pinned", 3, 2, 1, {"site-a": 2, "site-b": 1}, True),
         ]
-        worker = MetadataPersistenceWorker(storage, concurrency=1)
+        worker = ReplicationReconciliationWorker(storage, concurrency=1)
 
         with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
@@ -573,7 +603,7 @@ class TestSplitWorkers:
             "cid-l2-repair-mismatch", "unpinned", 0, 0, 0, {}, False
         ))
         storage.store_document = Mock(return_value="different-cid")
-        worker = MetadataPersistenceWorker(storage, concurrency=1)
+        worker = ReplicationReconciliationWorker(storage, concurrency=1)
 
         with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
@@ -599,7 +629,7 @@ class TestSplitWorkers:
             ReplicationStatus("cid-l2-repair-same-cid", "pinned", 1, 1, 0, {"site-a": 1}, False),
             ReplicationStatus("cid-l1-repair-same-cid", "pinned", 1, 1, 0, {"site-a": 1}, False),
         ]
-        worker = MetadataPersistenceWorker(storage, concurrency=1)
+        worker = ReplicationReconciliationWorker(storage, concurrency=1)
 
         with patch("app.workers.publisher.SessionLocal") as mock_session_local:
             mock_session_local.return_value = db_session
@@ -609,6 +639,62 @@ class TestSplitWorkers:
         assert result == {"checked": 1, "repaired": 1, "purged": 0, "failed": 0}
         assert metadata_record.level2_replica_count == 1
         assert metadata_record.replication_last_error is None
+
+    def test_reconciliation_rebuilds_zero_copy_level1_with_same_cid(self, db_session):
+        _, metadata_record = _create_ark_with_metadata(
+            db_session,
+            name="repair-level1",
+            metadata_complete=True,
+        )
+        storage = Mock()
+        storage.store_document.return_value = "cid-l1-repair-level1"
+        storage.get_replication_status.side_effect = [
+            ReplicationStatus("cid-l2-repair-level1", "pinned", 1, 1, 0, {"site-a": 1}, False),
+            ReplicationStatus("cid-l1-repair-level1", "unpinned", 0, 0, 0, {}, False),
+            ReplicationStatus("cid-l1-repair-level1", "pinned", 1, 1, 0, {"site-a": 1}, False),
+        ]
+        worker = ReplicationReconciliationWorker(storage, concurrency=1)
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            result = worker._reconcile_single_ark("ark:12345/repair-level1")
+
+        db_session.refresh(metadata_record)
+        assert result == {"checked": 1, "repaired": 1, "purged": 0, "failed": 0}
+        assert metadata_record.level1_replica_count == 1
+        assert metadata_record.replication_last_error is None
+
+    def test_reconciliation_refuses_update_when_cids_change_during_check(self, db_session):
+        _, metadata_record = _create_ark_with_metadata(
+            db_session,
+            name="cid-race",
+            metadata_complete=True,
+        )
+        statuses = [
+            ReplicationStatus("cid-l2-cid-race", "pinned", 2, 2, 0, {"site-a": 2}, True),
+            ReplicationStatus("cid-l1-cid-race", "pinned", 2, 2, 0, {"site-a": 2}, True),
+        ]
+
+        def replication_status(_cid):
+            status = statuses.pop(0)
+            if not statuses:
+                metadata_record.level1_cid = "cid-l1-replaced"
+                db_session.commit()
+            return status
+
+        storage = Mock()
+        storage.get_replication_status.side_effect = replication_status
+        worker = ReplicationReconciliationWorker(storage, concurrency=1)
+
+        with patch("app.workers.publisher.SessionLocal") as mock_session_local:
+            mock_session_local.return_value = db_session
+            result = worker._reconcile_single_ark("ark:12345/cid-race")
+
+        db_session.refresh(metadata_record)
+        assert result["failed"] == 1
+        assert result["purged"] == 0
+        assert metadata_record.level1_json is not None
+        assert metadata_record.original_content is not None
 
     def test_chain_worker_publishes_with_purged_metadata(self, db_session):
         ark_record, metadata_record = _create_ark_with_metadata(

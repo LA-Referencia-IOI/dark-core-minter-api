@@ -2,6 +2,7 @@
 dARK Core Worker - standalone asynchronous worker processes.
 
 The metadata worker persists ARK metadata to the configured metadata backend.
+The replication worker verifies CID replication and purges retained payloads.
 The chain worker publishes ARKs with persisted metadata to blockchain.
 """
 
@@ -33,7 +34,11 @@ from app.dependencies import (
 )
 from app.repositories import WorkerRuntimeRepository
 from app.utils.storage_health import check_metadata_storage_health
-from app.workers.publisher import ChainPublisherWorker, MetadataPersistenceWorker
+from app.workers.publisher import (
+    ChainPublisherWorker,
+    MetadataPersistenceWorker,
+    ReplicationReconciliationWorker,
+)
 
 
 logging.basicConfig(
@@ -315,6 +320,16 @@ def _worker_runtime_config(worker_kind: str):
             "max_retries": settings.metadata_worker_max_retries,
             "backoff_base": settings.metadata_worker_retry_backoff_base,
         }
+    if worker_kind == "replication":
+        return {
+            "enabled": settings.replication_worker_enabled,
+            "worker_name": settings.replication_worker_runtime_name,
+            "page_size": settings.replication_worker_page_size,
+            "concurrency": settings.replication_worker_concurrency,
+            "sleep_seconds": settings.replication_worker_sleep_seconds,
+            "recheck_seconds": settings.replication_worker_recheck_seconds,
+            "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
+        }
     if worker_kind == "chain":
         return {
             "enabled": settings.chain_worker_enabled,
@@ -492,7 +507,7 @@ def run_worker(worker_kind: str = "chain") -> None:
     """
     Run one worker process.
 
-    Metadata and chain workers are intended to be deployed separately from the API.
+    All three worker kinds are intended to be deployed separately from the API.
     """
     runtime = _worker_runtime_config(worker_kind)
     if not runtime["enabled"]:
@@ -537,16 +552,24 @@ def run_worker(worker_kind: str = "chain") -> None:
             started_at=started_at,
         )
 
-        if worker_kind == "metadata":
+        if worker_kind in {"metadata", "replication"}:
             metadata_storage = init_metadata_storage()
             logger.info("Metadata storage initialized successfully")
-            publisher = MetadataPersistenceWorker(
-                metadata_storage=metadata_storage,
-                page_size=runtime["page_size"],
-                concurrency=runtime["concurrency"],
-                max_retries=runtime["max_retries"],
-                backoff_base=runtime["backoff_base"],
-            )
+            if worker_kind == "metadata":
+                publisher = MetadataPersistenceWorker(
+                    metadata_storage=metadata_storage,
+                    page_size=runtime["page_size"],
+                    concurrency=runtime["concurrency"],
+                    max_retries=runtime["max_retries"],
+                    backoff_base=runtime["backoff_base"],
+                )
+            else:
+                publisher = ReplicationReconciliationWorker(
+                    metadata_storage=metadata_storage,
+                    page_size=runtime["page_size"],
+                    concurrency=runtime["concurrency"],
+                    recheck_seconds=runtime["recheck_seconds"],
+                )
         else:
             logger.info("Chain worker will initialize blockchain client after RPC is available")
 
@@ -690,7 +713,7 @@ def run_worker(worker_kind: str = "chain") -> None:
                 else:
                     cycle_page_size = max(int(runtime["page_size"]), 1)
 
-            if worker_kind == "metadata":
+            if worker_kind in {"metadata", "replication"}:
                 storage_health = check_metadata_storage_health(metadata_storage)
                 if not storage_health["available"]:
                     error = f"Metadata storage unavailable: {storage_health['last_error']}"
@@ -698,7 +721,8 @@ def run_worker(worker_kind: str = "chain") -> None:
                     persist_current_heartbeat()
                     sleep_seconds = _storage_pause_sleep_seconds(runtime)
                     logger.warning(
-                        "Metadata worker paused because storage is unavailable; retrying in %ss",
+                        "%s worker paused because storage is unavailable; retrying in %ss",
+                        worker_kind.capitalize(),
                         sleep_seconds,
                     )
                     _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
@@ -769,7 +793,7 @@ def run_worker(worker_kind: str = "chain") -> None:
         )
         if worker_kind == "chain":
             shutdown_corelib_client()
-        if worker_kind == "metadata":
+        if worker_kind in {"metadata", "replication"}:
             shutdown_metadata_storage()
         if advisory_lock is not None:
             advisory_lock.release()
@@ -786,7 +810,7 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["run", "status", "metadata", "chain"],
+        choices=["run", "status", "metadata", "replication", "chain"],
         default="run",
         help="run chain worker, run a specific worker kind, or check process status",
     )
@@ -796,6 +820,8 @@ def main() -> None:
         raise SystemExit(worker_status())
     if args.command == "metadata":
         run_worker("metadata")
+    elif args.command == "replication":
+        run_worker("replication")
     else:
         run_worker("chain")
 

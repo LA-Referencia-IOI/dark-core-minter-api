@@ -2,7 +2,7 @@
 Worker status endpoints backed by DB heartbeat.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import ceil
 from typing import Any, Dict
 
@@ -164,6 +164,14 @@ def _build_worker_config(settings) -> Dict[str, Any]:
             "worker_max_retries": settings.metadata_worker_max_retries,
             "worker_retry_backoff_base": settings.metadata_worker_retry_backoff_base,
             "worker_runtime_name": settings.metadata_worker_runtime_name,
+        },
+        "replication": {
+            "worker_page_size": settings.replication_worker_page_size,
+            "worker_concurrency": settings.replication_worker_concurrency,
+            "worker_sleep_seconds": settings.replication_worker_sleep_seconds,
+            "worker_recheck_seconds": settings.replication_worker_recheck_seconds,
+            "worker_storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
+            "worker_runtime_name": settings.replication_worker_runtime_name,
         },
         "chain": {
             "worker_page_size": settings.chain_worker_page_size,
@@ -668,18 +676,91 @@ def _build_runtime_status(
     }
 
 
+def _build_replication_queue_summary(
+    db: Session,
+    settings,
+    now: datetime,
+) -> Dict[str, Any]:
+    """Aggregate retained metadata whose replication check is pending or due."""
+    eligible = and_(
+        ARKMetadata.level1_cid.isnot(None),
+        ARKMetadata.original_cid.isnot(None),
+    )
+    retained = or_(
+        ARKMetadata.level1_json.isnot(None),
+        ARKMetadata.original_content.isnot(None),
+    )
+    cutoff = now - timedelta(
+        seconds=max(int(settings.replication_worker_recheck_seconds), 0)
+    )
+    due = or_(
+        ARKMetadata.replication_checked_at.is_(None),
+        ARKMetadata.replication_checked_at <= cutoff,
+    )
+    pending, ready, errors, oldest = db.query(
+        func.sum(case((and_(eligible, retained), 1), else_=0)),
+        func.sum(case((and_(eligible, retained, due), 1), else_=0)),
+        func.sum(
+            case(
+                (
+                    and_(
+                        eligible,
+                        retained,
+                        ARKMetadata.replication_last_error.isnot(None),
+                    ),
+                    1,
+                ),
+                else_=0,
+            )
+        ),
+        func.min(
+            case(
+                (
+                    and_(eligible, retained),
+                    func.coalesce(
+                        ARKMetadata.replication_checked_at,
+                        ARKMetadata.created_at,
+                    ),
+                ),
+                else_=None,
+            )
+        ),
+    ).one()
+    pending_total = int(pending or 0)
+    ready_now = int(ready or 0)
+    return {
+        "pending_total": pending_total,
+        "retained_total": pending_total,
+        "ready_now": ready_now,
+        "delayed_by_backoff": max(pending_total - ready_now, 0),
+        "errors": int(errors or 0),
+        "oldest_pending_at": _isoformat_or_none(oldest),
+    }
+
+
 def _build_full_status(db: Session) -> Dict[str, Any]:
     """Build the full worker status payload used for detailed debugging."""
     settings = get_settings()
     now = _utc_now()
     queue_summary = _build_queue_summary(db, settings, now)
+    queue_summary["queues"]["replication"] = _build_replication_queue_summary(
+        db, settings, now
+    )
     config_summary = _build_worker_config(settings)
     chain_capacity = _build_chain_capacity_summary(settings)
     repo = WorkerRuntimeRepository(db)
     stale_after = settings.worker_heartbeat_stale_after_seconds
 
-    metadata_record = repo.get_by_name(settings.metadata_worker_runtime_name)
-    chain_record = repo.get_by_name(settings.chain_worker_runtime_name)
+    runtime_records = repo.get_by_names(
+        (
+            settings.metadata_worker_runtime_name,
+            settings.replication_worker_runtime_name,
+            settings.chain_worker_runtime_name,
+        )
+    )
+    metadata_record = runtime_records.get(settings.metadata_worker_runtime_name)
+    replication_record = runtime_records.get(settings.replication_worker_runtime_name)
+    chain_record = runtime_records.get(settings.chain_worker_runtime_name)
     metadata_status = _build_runtime_status(
         metadata_record,
         settings.metadata_worker_runtime_name,
@@ -703,29 +784,46 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
         congestion_retry_seconds=settings.chain_worker_congestion_retry_seconds,
         queue=queue_summary["queues"]["chain"],
     )
+    replication_status = _build_runtime_status(
+        replication_record,
+        settings.replication_worker_runtime_name,
+        settings.replication_worker_enabled,
+        stale_after,
+        now,
+        page_size=settings.replication_worker_page_size,
+        sleep_seconds=settings.replication_worker_sleep_seconds,
+        storage_retry_seconds=settings.replication_worker_storage_retry_seconds,
+        queue=queue_summary["queues"]["replication"],
+    )
     chain_status["cadence"]["effective_page_size_recommended"] = chain_capacity[
         "recommended_page_size"
     ]
 
     metadata_state = _state_from_worker_status(metadata_status, queue_summary["queues"]["metadata"])
+    replication_state = _state_from_worker_status(
+        replication_status, queue_summary["queues"]["replication"]
+    )
     chain_state = _state_from_worker_status(chain_status, queue_summary["queues"]["chain"])
     metadata_status["state"] = metadata_state
     metadata_status["activity"] = metadata_state if metadata_state in {"idle", "working", "backlogged", "delayed"} else None
     chain_status["state"] = chain_state
     chain_status["activity"] = chain_state if chain_state in {"idle", "working", "backlogged", "delayed"} else None
+    replication_status["state"] = replication_state
+    replication_status["activity"] = replication_state if replication_state in {"idle", "working", "backlogged", "delayed"} else None
 
     rpc_status = check_rpc_health()
     storage_status = check_metadata_storage_health()
     error_totals = _build_error_totals(queue_summary["errors"])
     queue_totals = _build_queue_totals(queue_summary["queues"])
-    worker_states = {metadata_state, chain_state}
+    worker_states = {metadata_state, replication_state, chain_state}
     overall = _derive_overall_status(worker_states, error_totals, rpc_status, storage_status)
-    replication = _build_replication_summary(db, metadata_record)
+    replication = _build_replication_summary(db, replication_record)
 
     response = {
         "overall": overall,
         "message": _build_status_message(
             {"metadata": _simple_worker_status(metadata_status, queue_summary["queues"]["metadata"]),
+             "replication": _simple_worker_status(replication_status, queue_summary["queues"]["replication"]),
              "chain": _simple_worker_status(chain_status, queue_summary["queues"]["chain"])},
             error_totals,
             rpc_status,
@@ -736,6 +834,7 @@ def _build_full_status(db: Session) -> Dict[str, Any]:
         "chain_capacity": chain_capacity,
         "workers": {
             "metadata": metadata_status,
+            "replication": replication_status,
             "chain": chain_status,
         },
         "queues": {
@@ -836,12 +935,9 @@ def _build_error_totals(errors: Dict[str, Any]) -> Dict[str, int]:
 def _build_queue_totals(queues: Dict[str, Any]) -> Dict[str, int]:
     """Aggregate stage queue counters."""
     return {
-        "pending": int(queues["metadata"]["pending_total"] or 0)
-        + int(queues["chain"]["pending_total"] or 0),
-        "ready": int(queues["metadata"]["ready_now"] or 0)
-        + int(queues["chain"]["ready_now"] or 0),
-        "delayed": int(queues["metadata"]["delayed_by_backoff"] or 0)
-        + int(queues["chain"]["delayed_by_backoff"] or 0),
+        "pending": sum(int(queue["pending_total"] or 0) for queue in queues.values()),
+        "ready": sum(int(queue["ready_now"] or 0) for queue in queues.values()),
+        "delayed": sum(int(queue["delayed_by_backoff"] or 0) for queue in queues.values()),
     }
 
 
@@ -880,9 +976,15 @@ def _build_status_message(
     storage: Dict[str, Any],
 ) -> str:
     """Build a compact operational message from worker and error blocks."""
-    labels = {"metadata": "Metadata worker", "chain": "Chain worker"}
+    labels = {
+        "metadata": "Metadata worker",
+        "replication": "Replication worker",
+        "chain": "Chain worker",
+    }
     parts = []
-    for key in ("metadata", "chain"):
+    for key in ("metadata", "replication", "chain"):
+        if key not in workers:
+            continue
         worker = workers[key]
         state = worker["state"]
         pending = worker["queue"]["pending"]
@@ -911,37 +1013,103 @@ def _build_status_message(
     return "; ".join(parts) + "."
 
 
-def _build_simple_status(full_status: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the default human-readable worker status payload."""
-    metadata = _simple_worker_status(
-        full_status["workers"]["metadata"],
-        full_status["queues"]["metadata"],
-    )
-    chain = _simple_worker_status(
-        full_status["workers"]["chain"],
-        full_status["queues"]["chain"],
-    )
-    workers = {"metadata": metadata, "chain": chain}
+def _build_lightweight_status(db: Session) -> Dict[str, Any]:
+    """Build the default status from worker heartbeat rows only.
 
-    error_summary = _build_error_totals(full_status["errors"])
-    worker_states = {metadata["state"], chain["state"]}
-    overall = _derive_overall_status(
-        worker_states,
-        error_summary,
-        full_status["rpc"],
-        full_status["storage"],
+    This path deliberately avoids ARK/metadata counts and all RPC or storage
+    calls so monitoring cannot make the API depend on external services.
+    """
+    settings = get_settings()
+    now = _utc_now()
+    stale_after = settings.worker_heartbeat_stale_after_seconds
+    repo = WorkerRuntimeRepository(db)
+    records = repo.get_by_names(
+        (
+            settings.metadata_worker_runtime_name,
+            settings.replication_worker_runtime_name,
+            settings.chain_worker_runtime_name,
+        )
     )
 
+    definitions = {
+        "metadata": {
+            "name": settings.metadata_worker_runtime_name,
+            "enabled": settings.metadata_worker_enabled,
+            "page_size": settings.metadata_worker_page_size,
+            "sleep_seconds": settings.metadata_worker_sleep_seconds,
+            "storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
+        },
+        "replication": {
+            "name": settings.replication_worker_runtime_name,
+            "enabled": settings.replication_worker_enabled,
+            "page_size": settings.replication_worker_page_size,
+            "sleep_seconds": settings.replication_worker_sleep_seconds,
+            "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
+        },
+        "chain": {
+            "name": settings.chain_worker_runtime_name,
+            "enabled": settings.chain_worker_enabled,
+            "page_size": settings.chain_worker_page_size,
+            "sleep_seconds": settings.chain_worker_sleep_seconds,
+            "rpc_retry_seconds": settings.chain_worker_rpc_retry_seconds,
+            "congestion_retry_seconds": settings.chain_worker_congestion_retry_seconds,
+        },
+    }
+
+    workers: Dict[str, Any] = {}
+    for kind, definition in definitions.items():
+        record = records.get(definition["name"])
+        runtime = _build_runtime_status(
+            record,
+            definition["name"],
+            definition["enabled"],
+            stale_after,
+            now,
+            page_size=definition["page_size"],
+            sleep_seconds=definition["sleep_seconds"],
+            rpc_retry_seconds=definition.get("rpc_retry_seconds"),
+            congestion_retry_seconds=definition.get("congestion_retry_seconds"),
+            storage_retry_seconds=definition.get("storage_retry_seconds"),
+            queue=_empty_queue(),
+        )
+        state = _state_from_worker_status(runtime, _empty_queue())
+        runtime["state"] = state
+        simple = _simple_worker_status(runtime, _empty_queue())
+        simple.pop("queue", None)
+        simple["last_error"] = runtime.get("last_error")
+        workers[kind] = simple
+
+    worker_states = {worker["state"] for worker in workers.values()}
+    hard_failure_states = {"unknown", "stale", "error", "stopped"}
+    degraded_states = {
+        "paused_rpc_unavailable",
+        "paused_storage_unavailable",
+        "paused_chain_stalled",
+        "paused_chain_congested",
+    }
+    enabled_states = worker_states - {"disabled"}
+    if enabled_states and enabled_states.issubset(hard_failure_states):
+        overall = "down"
+    elif worker_states & (hard_failure_states | degraded_states):
+        overall = "degraded"
+    else:
+        overall = "ok"
+
+    message_workers = {
+        kind: {**worker, "queue": {"pending": 0, "ready": 0, "delayed": 0}}
+        for kind, worker in workers.items()
+    }
+    message = _build_status_message(
+        message_workers,
+        {"retrying": 0, "permanent": 0},
+        {"available": True},
+        {"available": True},
+    )
     return {
         "overall": overall,
-        "message": _build_status_message(workers, error_summary, full_status["rpc"], full_status["storage"]),
-        "rpc": full_status["rpc"],
-        "storage": full_status["storage"],
-        "chain_capacity": full_status["chain_capacity"],
+        "message": message,
+        "source": "db_heartbeat",
         "workers": workers,
-        "errors": error_summary,
-        "arks": full_status["by_state"],
-        "replication": full_status["replication"],
     }
 
 
@@ -1009,7 +1177,7 @@ def _build_replication_summary(db: Session, metadata_runtime) -> Dict[str, Any]:
 
 
 @router.get("/status", response_model=Dict[str, Any])
-async def get_worker_status(
+def get_worker_status(
     detail: str = Query(
         default="simple",
         pattern="^(simple|full)$",
@@ -1024,10 +1192,9 @@ async def get_worker_status(
     to inspect the full heartbeat, queue, cadence, config, and host/process
     fields.
     """
-    full_status = _build_full_status(db)
     if detail == "full":
-        return full_status
-    return _build_simple_status(full_status)
+        return _build_full_status(db)
+    return _build_lightweight_status(db)
 
 
 @router.get("/replication", response_model=Dict[str, Any])

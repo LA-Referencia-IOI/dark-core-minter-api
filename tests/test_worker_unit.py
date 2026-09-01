@@ -10,7 +10,11 @@ from dark_core_lib.metadata import StorageError, StoredDocument
 from dark_core_lib.models import ARKPublishResult
 
 from app.models.states import ARKState
-from app.workers.publisher import ARKPublisher, MetadataPersistenceWorker, _utc_now
+from app.workers.publisher import (
+    ARKPublisher,
+    MetadataPersistenceWorker,
+    ReplicationReconciliationWorker,
+)
 
 
 class MockMetadataStorage:
@@ -475,32 +479,41 @@ class TestARKPublisherUnit:
         assert publisher.stats["total_permanent_failures"] == 0
 
 
-class TestMetadataReconciliationScheduling:
-    def _run_cycle(self, records, last_reconciliation_at=None):
+class TestSplitReplicationScheduling:
+    def test_metadata_cycle_only_processes_ingestion(self):
         worker = MetadataPersistenceWorker(MockMetadataStorage(), concurrency=1)
-        worker.stats["last_reconciliation_at"] = last_reconciliation_at
         repo = Mock()
-        repo.get_metadata_pending_persist.return_value = records
+        repo.get_metadata_pending_persist.return_value = []
         db = Mock()
         session_factory = Mock(return_value=db)
         with patch("app.workers.publisher.SessionLocal", return_value=session_factory):
             with patch("app.workers.publisher.ARKRepository", return_value=repo):
                 with patch.object(worker, "_process_ark_batch") as process:
-                    with patch.object(worker, "_run_reconciliation_cycle") as reconcile:
-                        worker.run_publish_cycle()
-        return process, reconcile
-
-    def test_reconciles_immediately_when_ingestion_is_idle(self):
-        process, reconcile = self._run_cycle([], last_reconciliation_at=_utc_now())
+                    worker.run_publish_cycle()
         process.assert_called_once_with([])
-        reconcile.assert_called_once_with()
+        repo.get_metadata_pending_reconciliation.assert_not_called()
 
-    def test_reconciles_after_five_minutes_under_continuous_load(self):
-        from datetime import timedelta
-
-        process, reconcile = self._run_cycle(
-            [SimpleNamespace(ark="ark:12345/pending")],
-            last_reconciliation_at=_utc_now() - timedelta(seconds=301),
+    def test_replication_cycle_selects_due_page_with_configured_recheck(self):
+        worker = ReplicationReconciliationWorker(
+            MockMetadataStorage(), page_size=50, concurrency=1, recheck_seconds=300
         )
-        process.assert_called_once_with(["ark:12345/pending"])
-        reconcile.assert_called_once_with()
+        repo = Mock()
+        repo.get_metadata_pending_reconciliation.return_value = [
+            SimpleNamespace(ark="ark:12345/pending")
+        ]
+        db = Mock()
+        session_factory = Mock(return_value=db)
+        with patch("app.workers.publisher.SessionLocal", return_value=session_factory):
+            with patch("app.workers.publisher.ARKRepository", return_value=repo):
+                with patch.object(
+                    worker,
+                    "_reconcile_single_ark",
+                    return_value={"checked": 1, "repaired": 0, "purged": 0, "failed": 0},
+                ) as reconcile:
+                    worker.run_publish_cycle()
+
+        repo.get_metadata_pending_reconciliation.assert_called_once_with(
+            limit=50, recheck_seconds=300
+        )
+        reconcile.assert_called_once_with("ark:12345/pending")
+        assert worker.stats["last_run_processed"] == 1

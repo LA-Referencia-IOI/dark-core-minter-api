@@ -3,12 +3,15 @@ Unit tests for PostgreSQL advisory lock helpers in main_worker.
 """
 
 import threading
-
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
+
+import pytest
 
 from app.main_worker import (
     _HeartbeatSupervisor,
     _WorkerAdvisoryLock,
+    _acquire_worker_pid,
     _build_advisory_lock_key,
     _clamp_page_size,
     _congestion_pause_sleep_seconds,
@@ -17,10 +20,12 @@ from app.main_worker import (
     _next_higher_page_size,
     _page_size_levels,
     _rpc_pause_sleep_seconds,
+    _release_worker_pid,
     _select_next_sleep_seconds,
     _shutdown_event,
     _storage_pause_sleep_seconds,
     _wait_with_heartbeats,
+    _worker_runtime_config,
 )
 
 
@@ -74,6 +79,47 @@ def test_worker_advisory_lock_acquire_failure_closes_session():
         assert lock.acquire() is False
 
     db.close.assert_called_once()
+
+
+def test_replication_worker_uses_its_own_runtime_identity_and_defaults():
+    settings = SimpleNamespace(
+        replication_worker_enabled=True,
+        replication_worker_runtime_name="replication-reconciler",
+        replication_worker_page_size=50,
+        replication_worker_concurrency=2,
+        replication_worker_sleep_seconds=30,
+        replication_worker_recheck_seconds=300,
+        replication_worker_storage_retry_seconds=10,
+    )
+    with patch("app.main_worker.get_settings", return_value=settings):
+        runtime = _worker_runtime_config("replication")
+
+    assert runtime == {
+        "enabled": True,
+        "worker_name": "replication-reconciler",
+        "page_size": 50,
+        "concurrency": 2,
+        "sleep_seconds": 30,
+        "recheck_seconds": 300,
+        "storage_retry_seconds": 10,
+    }
+    assert _build_advisory_lock_key(runtime["worker_name"]) != _build_advisory_lock_key(
+        "metadata-publisher"
+    )
+
+
+def test_replication_pidfile_blocks_duplicate_local_process(tmp_path):
+    pid_file = tmp_path / "dark-core-replication-reconciler.pid"
+
+    _acquire_worker_pid(pid_file)
+    try:
+        assert pid_file.exists()
+        with pytest.raises(RuntimeError, match="Worker already running"):
+            _acquire_worker_pid(pid_file)
+    finally:
+        _release_worker_pid(pid_file)
+
+    assert not pid_file.exists()
 
 
 def test_select_next_sleep_uses_sleep_for_partial_page():

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from dark_core_lib.models import ARKPublishResult
 
+from app.api import worker as worker_api
 from app.database.models import ARKMetadata, ARKRecord, WorkerRuntimeStatus
 from app.models.states import ARKState
 
@@ -57,47 +58,34 @@ def _add_ark(
     return ark
 
 
-def test_worker_status_simple_unknown_when_no_heartbeat(client):
-    """Default API response should be compact and readable with no heartbeat."""
+def test_worker_status_simple_unknown_when_no_heartbeat(client, monkeypatch):
+    """Default status should use only DB heartbeat and skip expensive probes."""
+    def unexpected_call(*args, **kwargs):
+        raise AssertionError("lightweight status called an expensive dependency")
+
+    monkeypatch.setattr(worker_api, "check_rpc_health", unexpected_call)
+    monkeypatch.setattr(worker_api, "check_metadata_storage_health", unexpected_call)
+    monkeypatch.setattr(worker_api, "_build_chain_capacity_summary", unexpected_call)
+    monkeypatch.setattr(worker_api, "_build_queue_summary", unexpected_call)
+    monkeypatch.setattr(worker_api, "_build_replication_summary", unexpected_call)
     response = client.get("/api/v1/worker/status")
 
     assert response.status_code == 200
     data = response.json()
     assert data["overall"] == "down"
-    assert data["rpc"]["available"] is True
-    assert data["storage"]["available"] is True
+    assert data["source"] == "db_heartbeat"
     assert data["workers"]["metadata"]["state"] == "unknown"
     assert data["workers"]["metadata"]["alive"] is False
-    assert data["workers"]["metadata"]["queue"] == {"pending": 0, "ready": 0, "delayed": 0}
+    assert data["workers"]["replication"]["state"] == "unknown"
+    assert data["workers"]["replication"]["alive"] is False
     assert data["workers"]["chain"]["state"] == "unknown"
     assert data["workers"]["chain"]["alive"] is False
-    assert data["workers"]["chain"]["queue"] == {"pending": 0, "ready": 0, "delayed": 0}
-    assert data["errors"] == {"retrying": 0, "permanent": 0}
-    assert data["arks"] == {
-        "reserved": 0,
-        "draft": 0,
-        "update": 0,
-        "published": 0,
-        "tombstone": 0,
-    }
-    assert data["replication"] == {
-        "pending": 0,
-        "complete": 0,
-        "degraded": 0,
-        "error": 0,
-        "retained_payloads": 0,
-        "oldest_pending_at": None,
-        "last_cycle": {
-            "at": None,
-            "checked": 0,
-            "repaired": 0,
-            "purged": 0,
-            "failed": 0,
-        },
-    }
-    assert "config" not in data
-    assert "cadence" not in data
-    assert "running" not in data
+    assert "rpc" not in data
+    assert "storage" not in data
+    assert "chain_capacity" not in data
+    assert "errors" not in data
+    assert "arks" not in data
+    assert "replication" not in data
     assert "Metadata worker is unknown" in data["message"]
 
 
@@ -111,10 +99,21 @@ def test_worker_status_full_unknown_when_no_heartbeat(client):
     assert data["workers"]["metadata"]["running"] is False
     assert data["workers"]["metadata"]["status"] == "UNKNOWN"
     assert data["workers"]["metadata"]["source"] == "db_heartbeat"
+    assert data["workers"]["replication"]["enabled"] is True
+    assert data["workers"]["replication"]["running"] is False
+    assert data["workers"]["replication"]["status"] == "UNKNOWN"
     assert data["workers"]["chain"]["enabled"] is True
     assert data["workers"]["chain"]["running"] is False
     assert data["workers"]["chain"]["status"] == "UNKNOWN"
     assert data["queues"]["metadata"]["pending_total"] == 0
+    assert data["queues"]["replication"] == {
+        "pending_total": 0,
+        "retained_total": 0,
+        "ready_now": 0,
+        "delayed_by_backoff": 0,
+        "errors": 0,
+        "oldest_pending_at": None,
+    }
     assert data["queues"]["chain"]["pending_total"] == 0
     assert data["errors"]["chain"] == {
         "retrying": 0,
@@ -136,6 +135,9 @@ def test_worker_status_full_unknown_when_no_heartbeat(client):
     assert data["config"]["metadata"]["worker_page_size"] == 100
     assert data["config"]["metadata"]["worker_sleep_seconds"] == 2
     assert data["config"]["metadata"]["worker_concurrency"] == 4
+    assert data["config"]["replication"]["worker_page_size"] == 50
+    assert data["config"]["replication"]["worker_concurrency"] == 2
+    assert data["config"]["replication"]["worker_recheck_seconds"] == 300
     assert data["config"]["chain"]["worker_page_size"] == 20
     assert data["config"]["chain"]["worker_sleep_seconds"] == 5
     assert data["workers"]["chain"]["cadence"]["pressure"] == "unknown"
@@ -179,10 +181,40 @@ def test_replication_endpoint_lists_retained_payload_and_counts(client, test_db)
     assert data["items"][0]["level2"] == {"cid": "bafy-l2", "replicas": 1}
 
 
-def test_worker_status_simple_summarizes_live_workers_and_queues(client, test_db):
-    """Default status should expose only operational fields for live workers."""
+def test_worker_status_full_reports_replication_due_delayed_and_errors(client, test_db):
     now = _utc_now()
-    for worker_name in ("metadata-publisher", "chain-publisher"):
+    for name, checked_at, error in (
+        ("replication-due", now - timedelta(seconds=301), None),
+        ("replication-delayed", now, None),
+        ("replication-error", now - timedelta(seconds=301), "IPFS timeout"),
+    ):
+        ark = _add_ark(test_db, name=name, state=ARKState.DRAFT)
+        test_db.flush()
+        metadata = test_db.query(ARKMetadata).filter_by(ark_record_id=ark.id).one()
+        metadata.level1_cid = f"l1-{name}"
+        metadata.original_cid = f"l2-{name}"
+        metadata.replication_checked_at = checked_at
+        metadata.replication_last_error = error
+    test_db.commit()
+
+    response = client.get("/api/v1/worker/status?detail=full")
+
+    assert response.status_code == 200
+    queue = response.json()["queues"]["replication"]
+    assert queue["retained_total"] == 3
+    assert queue["ready_now"] == 2
+    assert queue["delayed_by_backoff"] == 1
+    assert queue["errors"] == 1
+
+
+def test_worker_status_simple_summarizes_live_worker_heartbeats(client, test_db):
+    """Default status should expose only heartbeat-derived operational fields."""
+    now = _utc_now()
+    for worker_name in (
+        "metadata-publisher",
+        "replication-reconciler",
+        "chain-publisher",
+    ):
         test_db.add(
             WorkerRuntimeStatus(
                 worker_name=worker_name,
@@ -223,16 +255,15 @@ def test_worker_status_simple_summarizes_live_workers_and_queues(client, test_db
         "full_page": False,
         "next_action": "sleep",
     }
-    assert data["workers"]["metadata"]["queue"] == {"pending": 1, "ready": 1, "delayed": 0}
     assert data["workers"]["chain"]["state"] == "working"
     assert data["workers"]["chain"]["alive"] is True
-    assert data["workers"]["chain"]["queue"] == {"pending": 1, "ready": 1, "delayed": 0}
-    assert data["chain_capacity"]["state"] == "healthy"
-    assert data["chain_capacity"]["recommended_page_size"] == 20
-    assert data["errors"] == {"retrying": 0, "permanent": 0}
-    assert data["arks"]["draft"] == 2
-    assert "config" not in data
-    assert "queues" not in data
+    assert data["workers"]["replication"]["state"] == "working"
+    assert data["workers"]["replication"]["alive"] is True
+    assert "queue" not in data["workers"]["metadata"]
+    assert "queue" not in data["workers"]["chain"]
+    assert "chain_capacity" not in data
+    assert "errors" not in data
+    assert "arks" not in data
 
 
 def test_worker_status_reports_chain_worker_paused_for_rpc(client, test_db):
@@ -359,8 +390,8 @@ def test_worker_status_reports_metadata_worker_paused_for_storage(client, test_d
     assert "paused because metadata storage is unavailable" in data["message"]
 
 
-def test_worker_status_message_mentions_permanent_errors(client, test_db):
-    """Idle workers with permanent ARK errors should explain degraded status."""
+def test_worker_status_full_message_mentions_permanent_errors(client, test_db):
+    """Full status should inspect ARK rows and explain permanent errors."""
     now = _utc_now()
     for worker_name in ("metadata-publisher", "chain-publisher"):
         test_db.add(
@@ -394,15 +425,13 @@ def test_worker_status_message_mentions_permanent_errors(client, test_db):
     )
     test_db.commit()
 
-    response = client.get("/api/v1/worker/status")
+    response = client.get("/api/v1/worker/status?detail=full")
 
     assert response.status_code == 200
     data = response.json()
     assert data["overall"] == "degraded"
     assert data["workers"]["metadata"]["state"] == "idle"
-    assert data["workers"]["metadata"]["activity"] == "idle"
-    assert data["workers"]["metadata"]["status"] == "running"
-    assert data["errors"] == {"retrying": 0, "permanent": 1}
+    assert data["errors"]["total"] == {"retrying": 0, "permanent": 1}
     assert "1 permanent ARK errors require review" in data["message"]
 
 

@@ -60,6 +60,9 @@ flowchart LR
     MetadataWorker["Metadata worker process"] --> DB
     MetadataWorker --> Store["Metadata storage backend"]
 
+    ReplicationWorker["Replication worker process"] --> DB
+    ReplicationWorker --> Store
+
     ChainWorker["Chain worker process"] --> DB
     ChainWorker --> Core
 
@@ -72,6 +75,7 @@ The API and workers are separate processes on purpose:
 
 - API stays responsive and transactional
 - metadata worker owns storage persistence
+- replication worker owns CID verification, repair, and safe payload purge
 - chain worker owns blockchain publication
 - retry and failure tracking stay in PostgreSQL
 - deployment can scale API while keeping each worker singleton
@@ -110,7 +114,9 @@ sequenceDiagram
 
 ### Worker Startup
 
-The worker startup path in [`app/main_worker.py`](./app/main_worker.py) supports two modes: `metadata` and `chain`. Both modes add lifecycle controls on top of normal dependency init:
+The worker startup path in [`app/main_worker.py`](./app/main_worker.py) supports
+three modes: `metadata`, `replication`, and `chain`. Every mode adds lifecycle
+controls on top of normal dependency init:
 
 - pidfile guard
 - PostgreSQL advisory lock
@@ -123,6 +129,7 @@ flowchart TD
     B --> C["init_db()"]
     C --> D["acquire PostgreSQL advisory lock"]
     D -->|metadata worker| E["init metadata storage"]
+    D -->|replication worker| E
     D -->|chain worker| F["check RPC health"]
     F -->|unavailable| P["write PAUSED_RPC_UNAVAILABLE heartbeat and sleep"]
     P --> F
@@ -239,13 +246,14 @@ sequenceDiagram
 
 The slow-path logic lives in [`app/workers/publisher.py`](./app/workers/publisher.py). Workers do not keep long-lived in-memory queues. Each worker queries PostgreSQL every cycle, claims work there, and records retry state in the same rows.
 
-### Why storage and chain publication are separate
+### Why metadata, replication, and chain publication are separate
 
 Storage writes and blockchain transactions have different failure modes, latency profiles, and operational dependencies. Splitting them keeps each stage easier to reason about:
 
 - metadata CIDs are produced before any chain call
 - blockchain retries can reuse previously stored CIDs
-- local metadata payloads can be purged once CIDs are complete
+- local metadata payloads remain available for repair until both CIDs meet the
+  configured replication target
 - blockchain calls happen outside the request path
 - publication metrics can be derived from DB and worker heartbeat
 - minter and resolver can share the same Level-1 schema and storage contract without duplicating code
@@ -272,10 +280,43 @@ sequenceDiagram
         Store-->>Worker: original_cid
         Worker->>Store: store Level-1 with embedded original_cid
         Store-->>Worker: level1_cid
-        Worker->>Repo: update_metadata_cids(purge_local=true, reset_publish_tracking=true)
+        Worker->>Repo: update_metadata_cids(purge_local=false, reset_publish_tracking=true)
         Worker->>DB: commit
     end
 ```
+
+### Replication Reconciliation Cycle
+
+```mermaid
+sequenceDiagram
+    participant Loop as "worker loop"
+    participant Worker as "ReplicationReconciliationWorker"
+    participant Repo as "ARKRepository"
+    participant DB as "PostgreSQL"
+    participant Store as "Metadata backend"
+
+    Loop->>Worker: run_publish_cycle()
+    Worker->>Repo: get_metadata_pending_reconciliation(limit=50, recheck=300)
+    Repo->>DB: select complete CIDs with retained payload due for checking
+    loop each selected ARK, concurrency 2
+        Worker->>Store: get_replication_status(L2 CID)
+        Worker->>Store: get_replication_status(L1 CID)
+        opt either CID has zero copies
+            Worker->>Store: restore from retained payload
+            Worker->>Worker: verify regenerated CID matches expected CID
+        end
+        Worker->>DB: lock metadata row and compare both current CIDs
+        Worker->>DB: update replica counts and check timestamp
+        opt both purge targets are met
+            Worker->>DB: clear Level-1 and Level-2 local payloads
+        end
+    end
+```
+
+Checks and repairs are retryable without a permanent-failure limit. A full
+50-item page continues immediately; an incomplete page sleeps 30 seconds. The
+process pauses for 10 seconds before selecting records when Store API/IPFS is
+unavailable.
 
 ### Chain Publication Cycle
 
@@ -331,8 +372,9 @@ The ordering is intentional:
 2. inject `original_metadata.cid` into Level-1 JSON
 3. store finalized Level-1 JSON
 4. persist both CIDs in PostgreSQL
-5. purge local `level1_json` and `original_content`
-6. publish the Level-1 CID on-chain from the chain worker
+5. publish the Level-1 CID on-chain from the chain worker independently
+6. verify/repair both CID replicas in the replication worker
+7. purge local `level1_json` and `original_content` only after both targets are met
 
 This makes Level-1 the canonical chain-facing entry point while still preserving the original payload.
 
@@ -422,13 +464,18 @@ That means retries survive:
 
 The same `publish_*` fields track whichever stage is currently active. Before both metadata CIDs exist they refer to metadata persistence; after both CIDs exist they refer to blockchain publication. The metadata worker resets these fields once CIDs are complete, so the chain worker starts with a clean retry budget.
 
+Replication has its own periodic schedule in `replication_checked_at` and error
+text in `replication_last_error`; it does not consume `publish_*` retries. Before
+writing counts or purging, it locks the metadata row and requires both CIDs to
+still equal the values it checked.
+
 ## 10. Worker Runtime Status
 
 Worker liveness is represented in the database through `worker_runtime_status`, not by inspecting process internals over IPC.
 
 ```mermaid
 sequenceDiagram
-    participant Worker as "main_worker metadata/chain"
+    participant Worker as "main_worker metadata/replication/chain"
     participant Repo as "WorkerRuntimeRepository"
     participant DB as "PostgreSQL"
     participant API as "/api/v1/worker/status"
@@ -436,9 +483,8 @@ sequenceDiagram
     Worker->>Repo: upsert_status(worker_name, RUNNING, heartbeat, counters)
     Worker->>Repo: supervisor upsert during long cycles
     Repo->>DB: UPSERT worker_runtime_status
-    API->>Repo: get_by_name(metadata_worker_runtime_name)
-    API->>Repo: get_by_name(chain_worker_runtime_name)
-    Repo->>DB: SELECT heartbeat row
+    API->>Repo: get_by_names(all three runtime names)
+    Repo->>DB: one SELECT over worker_runtime_status
     API->>API: derive running/stale flags
     API-->>Client: combined worker status payload
 ```
@@ -449,19 +495,28 @@ This makes worker status available even when:
 - worker logs are not directly accessible
 - only the shared database is visible
 
-`GET /api/v1/worker/status` returns a compact operational summary by default:
+`GET /api/v1/worker/status` returns a low-cost liveness summary by default:
 
 - `overall`: `ok`, `degraded`, or `down`
 - `message`: one-line human-readable status
-- `workers.metadata` and `workers.chain`: compact worker state, liveness, last-cycle summary, and queue summary
-- `errors`: aggregate retrying/permanent error counts
-- `arks`: aggregate ARK counts by lifecycle state
+- `source`: `db_heartbeat`
+- `workers.metadata`, `workers.replication`, and `workers.chain`: worker state, liveness, heartbeat age,
+  last-cycle summary, and last runtime error
 
-Queue metrics are read-only aggregate queries over `ark_records` and `ark_metadata`.
+The default path performs one bounded query over `worker_runtime_status`. It
+does not contact RPC or Store API and does not query `ark_records` or
+`ark_metadata`.
 
-In compact mode, `last_cycle.processed` is the number of ARKs attempted in the latest cycle. It is not a lifetime counter and it is not the queue size. For metadata it means "attempted metadata persistence"; for chain it means "attempted on-chain publication". `last_cycle.succeeded` means persisted for metadata and published or reconciled-as-published for chain.
+In compact mode, `last_cycle.processed` is the number of ARKs attempted in the
+latest cycle. It is not a lifetime counter and it is not the queue size. For
+metadata it means attempted persistence, for replication it means retained
+payloads checked, and for chain it means attempted on-chain publication.
 
-`GET /api/v1/worker/status?detail=full` returns detailed heartbeat, queue, cadence, config, and host/process fields. In full mode, each worker status includes `cadence` metrics:
+`GET /api/v1/worker/status?detail=full` performs the expensive operational
+diagnostics: external health probes, ARK counts, queues, errors, replication,
+chain capacity, detailed heartbeat, cadence, config, and host/process fields.
+It should be used interactively rather than as a frequent liveness probe. In
+full mode, each worker status includes `cadence` metrics:
 
 - `last_cycle_duration_seconds` and last-cycle attempted/succeeded/failed counts
 - `page_size`, `sleep_seconds`, `next_action`, and `sleep_seconds_next`
@@ -572,16 +627,18 @@ flowchart LR
     MINTER --> PG["postgres container"]
     MINTER --> API["minter-api"]
     MINTER --> MW["minter-metadata-worker"]
+    MINTER --> RW["minter-replication-worker"]
     MINTER --> CW["minter-chain-worker"]
     API --> VOL["metadata-storage volume"]
     MW --> VOL
+    RW --> VOL
 ```
 
 Important deployment assumptions:
 
 - blockchain is already running on `dark-net`
-- API and both workers share PostgreSQL
-- API and metadata worker share metadata storage when filesystem backend is used
+- API and all three workers share PostgreSQL
+- API, metadata worker, and replication worker share metadata storage when filesystem backend is used
 - chain worker does not need local metadata payloads; it only needs target, authority, ARK identity, and CIDs
 - `.env.integration` is the preferred deployed config file
 

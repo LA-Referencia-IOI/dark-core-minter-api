@@ -42,6 +42,9 @@ case "$MODE" in
   metadata-worker)
     run_as_appuser "python -m app.main_worker metadata"
     ;;
+  replication-worker)
+    run_as_appuser "python -m app.main_worker replication"
+    ;;
   *)
     if [ "$(id -u)" = "0" ]; then
       run_as_appuser "$*"

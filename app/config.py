@@ -65,6 +65,14 @@ class Settings(BaseSettings):
     metadata_worker_retry_backoff_base: float = 2.0
     metadata_worker_runtime_name: str = "metadata-publisher"
 
+    replication_worker_enabled: bool = True
+    replication_worker_page_size: int = 50
+    replication_worker_concurrency: int = 2
+    replication_worker_sleep_seconds: int = 30
+    replication_worker_recheck_seconds: int = 300
+    replication_worker_storage_retry_seconds: int = 10
+    replication_worker_runtime_name: str = "replication-reconciler"
+
     chain_worker_enabled: bool = True
     chain_worker_page_size: int = 20
     chain_worker_sleep_seconds: int = 5
