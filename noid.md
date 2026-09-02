@@ -97,7 +97,7 @@ Table:
 
 Migration:
 
-- `alembic/versions/0002_add_noid_counters.py`
+- `alembic/versions/0001_initial_schema.py`
 
 ## 7. Minting Flow
 
@@ -198,7 +198,7 @@ Current operational policy:
 - `app/api/arks.py`
 - `app/repositories/noid_counter_repository.py`
 - `app/database/models.py`
-- `alembic/versions/0002_add_noid_counters.py`
+- `alembic/versions/0001_initial_schema.py`
 - `tests/test_persistence.py`
 
 ## 14. Design Decisions

@@ -37,10 +37,10 @@ The service is intentionally split into a few layers.
   - [`app/repositories/noid_counter_repository.py`](./app/repositories/noid_counter_repository.py)
   - [`app/repositories/worker_runtime_repository.py`](./app/repositories/worker_runtime_repository.py)
 - Metadata and validation
-  - [`dark_core_lib/metadata/schemas.py`](../../core/dark-core-lib/dark_core_lib/metadata/schemas.py)
-  - [`dark_core_lib/metadata/service.py`](../../core/dark-core-lib/dark_core_lib/metadata/service.py)
-  - [`dark_core_lib/metadata/storage/filesystem.py`](../../core/dark-core-lib/dark_core_lib/metadata/storage/filesystem.py)
-  - [`dark_core_lib/metadata/storage/store_api.py`](../../core/dark-core-lib/dark_core_lib/metadata/storage/store_api.py)
+  - [`dark_core_lib/metadata/schemas.py`](../../libraries/dark-core-lib/dark_core_lib/metadata/schemas.py)
+  - [`dark_core_lib/metadata/service.py`](../../libraries/dark-core-lib/dark_core_lib/metadata/service.py)
+  - [`dark_core_lib/metadata/storage/filesystem.py`](../../libraries/dark-core-lib/dark_core_lib/metadata/storage/filesystem.py)
+  - [`dark_core_lib/metadata/storage/store_api.py`](../../libraries/dark-core-lib/dark_core_lib/metadata/storage/store_api.py)
 - Worker
   - [`app/main_worker.py`](./app/main_worker.py)
   - [`app/workers/publisher.py`](./app/workers/publisher.py)
