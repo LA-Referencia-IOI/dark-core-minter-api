@@ -45,6 +45,9 @@ case "$MODE" in
   replication-worker)
     run_as_appuser "python -m app.main_worker replication"
     ;;
+  recovery-worker)
+    run_as_appuser "python -m app.main_worker recovery"
+    ;;
   *)
     if [ "$(id -u)" = "0" ]; then
       run_as_appuser "$*"

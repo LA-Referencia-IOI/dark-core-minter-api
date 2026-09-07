@@ -4,6 +4,7 @@ Unit tests for PostgreSQL advisory lock helpers in main_worker.
 
 import threading
 from types import SimpleNamespace
+import os
 from unittest.mock import Mock, patch
 
 import pytest
@@ -120,6 +121,18 @@ def test_replication_pidfile_blocks_duplicate_local_process(tmp_path):
         _release_worker_pid(pid_file)
 
     assert not pid_file.exists()
+
+
+def test_pidfile_with_reused_current_pid_is_replaced(tmp_path):
+    pid_file = tmp_path / "dark-core-chain-publisher.pid"
+    current_pid = os.getpid()
+    pid_file.write_text(f"{current_pid}\n", encoding="utf-8")
+
+    with patch("app.main_worker.Path.exists", return_value=True):
+        _acquire_worker_pid(pid_file)
+
+    assert pid_file.read_text(encoding="utf-8").strip() == str(current_pid)
+    _release_worker_pid(pid_file)
 
 
 def test_select_next_sleep_uses_sleep_for_partial_page():

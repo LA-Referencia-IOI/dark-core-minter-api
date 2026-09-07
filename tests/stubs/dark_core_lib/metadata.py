@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
@@ -45,10 +45,6 @@ class ReplicationStatus:
     cid: str
     status: str
     total_replicas: int
-    local_replicas: int
-    remote_replicas: int
-    sites: dict[str, int] = field(default_factory=dict)
-    purge_target_met: bool = False
     checked_at: Optional[datetime] = None
 
 
@@ -75,7 +71,7 @@ class MetadataStorage(ABC):
 
     def get_replication_status(self, cid: str) -> ReplicationStatus:
         self.get_document(cid)
-        return ReplicationStatus(cid, "pinned", 1, 1, 0, {"local": 1}, True)
+        return ReplicationStatus(cid, "pinned", 1)
 
     def close(self) -> None:
         return None
@@ -187,7 +183,7 @@ class StoreApiMetadataStorage(MetadataStorage):
         except httpx.RequestError as exc:
             raise StorageError(f"Store API request failed: {exc}") from exc
         if response.status_code == 404:
-            return ReplicationStatus(cid, "unpinned", 0, 0, 0)
+            return ReplicationStatus(cid, "unpinned", 0)
         if response.status_code != 200:
             raise StorageError(f"Store API status failed ({response.status_code})")
         payload = response.json()
@@ -196,10 +192,6 @@ class StoreApiMetadataStorage(MetadataStorage):
             cid=payload["cid"],
             status=payload["status"],
             total_replicas=replication["total_replicas"],
-            local_replicas=replication["local_replicas"],
-            remote_replicas=replication["remote_replicas"],
-            sites=replication.get("sites", {}),
-            purge_target_met=replication["purge_target_met"],
         )
 
     def close(self) -> None:

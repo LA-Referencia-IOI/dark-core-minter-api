@@ -775,7 +775,7 @@ def test_get_ark_after_metadata_payload_purge(client, test_db, mock_corelib):
         level1_cid="cid-level-1",
         level2_cid="cid-level-2",
         purge_local=True,
-        reset_publish_tracking=True,
+        reset_processing=True,
     )
     test_db.commit()
 
@@ -833,7 +833,7 @@ def test_get_ark_after_metadata_payload_purge_storage_failure_is_best_effort(
         level1_cid="cid-level-1",
         level2_cid="cid-level-2",
         purge_local=True,
-        reset_publish_tracking=True,
+        reset_processing=True,
     )
     test_db.commit()
 

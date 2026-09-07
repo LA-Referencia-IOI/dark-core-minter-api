@@ -7,7 +7,7 @@ Uses pydantic-settings for environment variable loading and validation.
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
-from pydantic import AliasChoices, Field, field_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     replication_worker_recheck_seconds: int = 300
     replication_worker_storage_retry_seconds: int = 10
     replication_worker_runtime_name: str = "replication-reconciler"
+    replication_publish_after_replicas: int = 1
+    replication_target_replicas: int = 2
 
     chain_worker_enabled: bool = True
     chain_worker_page_size: int = 20
@@ -85,9 +87,12 @@ class Settings(BaseSettings):
     chain_worker_max_retries: int = 5
     chain_worker_retry_backoff_base: float = 2.0
     chain_worker_runtime_name: str = "chain-publisher"
+    recovery_worker_enabled: bool = True
+    recovery_worker_page_size: int = 50
+    recovery_worker_sleep_seconds: int = 30
+    recovery_worker_runtime_name: str = "recovery-scheduler"
     worker_heartbeat_interval_seconds: int = 10
     worker_heartbeat_stale_after_seconds: int = 180
-    permanent_rescue_max_items: int = 50
     
     # Metadata Storage Configuration
     metadata_storage_type: str = "store_api"  # "filesystem" or "store_api"
@@ -127,6 +132,18 @@ class Settings(BaseSettings):
                 "(2 = DARK version; MM = minter code)"
             )
         return value
+
+    @model_validator(mode="after")
+    def validate_replication_thresholds(self) -> "Settings":
+        """Require a publication threshold no greater than the durability target."""
+        if self.replication_publish_after_replicas < 1:
+            raise ValueError("REPLICATION_PUBLISH_AFTER_REPLICAS must be at least 1")
+        if self.replication_target_replicas < self.replication_publish_after_replicas:
+            raise ValueError(
+                "REPLICATION_TARGET_REPLICAS must be greater than or equal to "
+                "REPLICATION_PUBLISH_AFTER_REPLICAS"
+            )
+        return self
 
     def validate_blockchain_config(self) -> None:
         """Validate that blockchain configuration is complete."""

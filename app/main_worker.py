@@ -39,6 +39,7 @@ from app.workers.publisher import (
     MetadataPersistenceWorker,
     ReplicationReconciliationWorker,
 )
+from app.workers.recovery import RecoveryWorker
 
 
 logging.basicConfig(
@@ -107,7 +108,17 @@ def _acquire_worker_pid(pid_file: Path = _PID_FILE) -> None:
         fd = os.open(pid_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     except FileExistsError:
         existing_pid = _read_worker_pid(pid_file)
-        if existing_pid and _is_process_running(existing_pid):
+        # A restarted container can reuse the same PID while retaining the
+        # writable-layer pidfile. That file belongs to the previous process,
+        # not to a second worker instance.
+        same_pid_in_restarted_container = (
+            existing_pid == current_pid and Path("/.dockerenv").exists()
+        )
+        if (
+            existing_pid
+            and not same_pid_in_restarted_container
+            and _is_process_running(existing_pid)
+        ):
             raise RuntimeError(f"Worker already running with PID {existing_pid}")
         try:
             pid_file.unlink()
@@ -345,6 +356,13 @@ def _worker_runtime_config(worker_kind: str):
             "max_retries": settings.chain_worker_max_retries,
             "backoff_base": settings.chain_worker_retry_backoff_base,
         }
+    if worker_kind == "recovery":
+        return {
+            "enabled": settings.recovery_worker_enabled,
+            "worker_name": settings.recovery_worker_runtime_name,
+            "page_size": settings.recovery_worker_page_size,
+            "sleep_seconds": settings.recovery_worker_sleep_seconds,
+        }
     raise ValueError(f"Unsupported worker kind: {worker_kind}")
 
 
@@ -507,8 +525,9 @@ def run_worker(worker_kind: str = "chain") -> None:
     """
     Run one worker process.
 
-    All three worker kinds are intended to be deployed separately from the API.
+    All worker kinds are intended to be deployed separately from the API.
     """
+    settings = get_settings()
     runtime = _worker_runtime_config(worker_kind)
     if not runtime["enabled"]:
         logger.warning(f"{worker_kind} worker is disabled. Exiting worker process.")
@@ -569,7 +588,11 @@ def run_worker(worker_kind: str = "chain") -> None:
                     page_size=runtime["page_size"],
                     concurrency=runtime["concurrency"],
                     recheck_seconds=runtime["recheck_seconds"],
+                    publish_after_replicas=settings.replication_publish_after_replicas,
+                    target_replicas=settings.replication_target_replicas,
                 )
+        elif worker_kind == "recovery":
+            publisher = RecoveryWorker(page_size=runtime["page_size"])
         else:
             logger.info("Chain worker will initialize blockchain client after RPC is available")
 
@@ -810,7 +833,7 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["run", "status", "metadata", "replication", "chain"],
+        choices=["run", "status", "metadata", "replication", "chain", "recovery"],
         default="run",
         help="run chain worker, run a specific worker kind, or check process status",
     )
@@ -822,6 +845,8 @@ def main() -> None:
         run_worker("metadata")
     elif args.command == "replication":
         run_worker("replication")
+    elif args.command == "recovery":
+        run_worker("recovery")
     else:
         run_worker("chain")
 

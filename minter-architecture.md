@@ -115,7 +115,7 @@ sequenceDiagram
 ### Worker Startup
 
 The worker startup path in [`app/main_worker.py`](./app/main_worker.py) supports
-three modes: `metadata`, `replication`, and `chain`. Every mode adds lifecycle
+four modes: `metadata`, `replication`, `chain`, and low-priority `recovery`. Every mode adds lifecycle
 controls on top of normal dependency init:
 
 - pidfile guard
@@ -246,7 +246,7 @@ sequenceDiagram
 
 The slow-path logic lives in [`app/workers/publisher.py`](./app/workers/publisher.py). Workers do not keep long-lived in-memory queues. Each worker queries PostgreSQL every cycle, claims work there, and records retry state in the same rows.
 
-### Why metadata, replication, and chain publication are separate
+### Why metadata, replication, chain publication, and recovery are separate
 
 Storage writes and blockchain transactions have different failure modes, latency profiles, and operational dependencies. Splitting them keeps each stage easier to reason about:
 
@@ -271,7 +271,7 @@ sequenceDiagram
     Loop->>Worker: run_publish_cycle()
     Worker->>Repo: get_metadata_pending_persist()
     Repo->>DB: SELECT DRAFT/UPDATE with incomplete CIDs
-    Repo->>DB: mark publish_last_attempt_at
+    Repo->>DB: select METADATA work and acquire a PostgreSQL advisory lock per ARK
     Worker->>DB: commit claim
 
     loop each claimed ARK
@@ -280,7 +280,7 @@ sequenceDiagram
         Store-->>Worker: original_cid
         Worker->>Store: store Level-1 with embedded original_cid
         Store-->>Worker: level1_cid
-        Worker->>Repo: update_metadata_cids(purge_local=false, reset_publish_tracking=true)
+        Worker->>Repo: update CIDs and advance to AVAILABILITY/PENDING
         Worker->>DB: commit
     end
 ```
@@ -331,8 +331,8 @@ sequenceDiagram
 
     Loop->>Worker: run_publish_cycle()
     Worker->>Repo: get_chain_pending_publish()
-    Repo->>DB: SELECT ... FOR UPDATE SKIP LOCKED
-    Repo->>DB: set publish_last_attempt_at
+    Worker->>DB: acquire advisory lock for the ARK
+    Repo->>DB: select CHAIN work after verified availability and acquire an advisory lock per ARK
     Worker->>DB: commit claim
 
     Worker->>Worker: group claimed ARKs by authority_id
@@ -415,10 +415,10 @@ The minter relies on PostgreSQL semantics for most of its concurrency guarantees
 ```mermaid
 flowchart LR
     A["NOID counter"] --> B["atomic counter allocation"]
-    C["Pending worker claims"] --> D["FOR UPDATE SKIP LOCKED"]
+    C["Pending worker work"] --> D["PostgreSQL advisory lock per ARK"]
     E["Lifecycle transitions"] --> F["CAS SQL updates"]
     G["Worker singleton"] --> H["advisory lock + pidfile"]
-    I["Retry schedule"] --> J["publish_last_attempt_at + retry_count"]
+    I["Retry schedule"] --> J["processing_next_attempt_at"]
 ```
 
 ### Counter Allocation
@@ -435,7 +435,7 @@ Operationally, the minter is designed around PostgreSQL deployment, and that is 
 
 `get_metadata_pending_persist()` and `get_chain_pending_publish()` do not keep long row locks for the whole external operation. Instead they:
 
-1. selects pending records with `FOR UPDATE SKIP LOCKED`
+1. selects pending records and acquires a PostgreSQL advisory lock per ARK
 2. marks them as attempted
 3. commits the claim
 4. processes each ARK independently
@@ -451,10 +451,9 @@ That design avoids long locks during slow external operations such as:
 
 Retry state is persisted in the DB, not memory:
 
-- `publish_retry_count`
-- `publish_last_attempt_at`
-- `publish_permanently_failed`
-- `publish_last_error`
+- `processing_stage` and `processing_status` (compact numeric workflow codes)
+- `processing_attempt_count` and `processing_next_attempt_at`
+- `processing_error_code` and optional `processing_error_detail`
 
 That means retries survive:
 
@@ -475,7 +474,7 @@ Worker liveness is represented in the database through `worker_runtime_status`, 
 
 ```mermaid
 sequenceDiagram
-    participant Worker as "main_worker metadata/replication/chain"
+    participant Worker as "main_worker metadata/replication/chain/recovery"
     participant Repo as "WorkerRuntimeRepository"
     participant DB as "PostgreSQL"
     participant API as "/api/v1/worker/status"
@@ -500,7 +499,7 @@ This makes worker status available even when:
 - `overall`: `ok`, `degraded`, or `down`
 - `message`: one-line human-readable status
 - `source`: `db_heartbeat`
-- `workers.metadata`, `workers.replication`, and `workers.chain`: worker state, liveness, heartbeat age,
+- `workers.metadata`, `workers.replication`, `workers.chain`, and `workers.recovery`: worker state, liveness, heartbeat age,
   last-cycle summary, and last runtime error
 
 The default path performs one bounded query over `worker_runtime_status`. It
@@ -513,7 +512,7 @@ metadata it means attempted persistence, for replication it means retained
 payloads checked, and for chain it means attempted on-chain publication.
 
 `GET /api/v1/worker/status?detail=full` performs the expensive operational
-diagnostics: external health probes, ARK counts, queues, errors, replication,
+diagnostics: external health probes, bounded ARK aggregates, queues, errors, replication,
 chain capacity, detailed heartbeat, cadence, config, and host/process fields.
 It should be used interactively rather than as a frequent liveness probe. In
 full mode, each worker status includes `cadence` metrics:
@@ -539,9 +538,10 @@ erDiagram
         string authority_id
         string target
         string client_item_id
-        int publish_retry_count
-        datetime publish_last_attempt_at
-        boolean publish_permanently_failed
+        smallint processing_stage
+        smallint processing_status
+        smallint processing_attempt_count
+        smallint processing_error_code
     }
 
     ARK_METADATA {
@@ -637,7 +637,7 @@ flowchart LR
 Important deployment assumptions:
 
 - blockchain is already running on `dark-net`
-- API and all three workers share PostgreSQL
+- API and all four workers share PostgreSQL
 - API, metadata worker, and replication worker share metadata storage when filesystem backend is used
 - chain worker does not need local metadata payloads; it only needs target, authority, ARK identity, and CIDs
 - `.env.integration` is the preferred deployed config file

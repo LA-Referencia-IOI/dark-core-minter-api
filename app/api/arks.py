@@ -15,6 +15,7 @@ from dark_core_lib import DARKCoreClient
 from dark_core_lib.metadata import Level1Metadata, MetadataStorage
 
 from app.dependencies import get_corelib_client, get_db, get_metadata_storage
+from app.database.ark_locks import acquire_ark_lock
 from app.middleware.auth import (
     enforce_authority_match,
     require_authority_identity,
@@ -43,6 +44,19 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+async def get_locked_ark_db(ark: str):
+    """Serialize mutations with workers without waiting for external I/O."""
+    from app.repositories.ark_repository import parse_ark
+    try:
+        parse_ark(ark)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid ARK format")
+    with acquire_ark_lock(ark) as db:
+        if db is None:
+            raise HTTPException(status_code=409, detail="ARK is being processed; retry later")
+        yield db
 
 
 def _normalize_wallet(value: Optional[str]) -> Optional[str]:
@@ -494,7 +508,7 @@ async def update_ark_metadata(
     ark: str = Path(..., description="Full ARK identifier"),
     identity: dict = Depends(require_authority_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_locked_ark_db),
     storage: MetadataStorage = Depends(get_metadata_storage),
 ) -> ARKResponse:
     """
@@ -684,7 +698,7 @@ async def delete_ark(
     ark: str = Path(..., description="Full ARK identifier"),
     identity: dict = Depends(require_authority_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_locked_ark_db),
 ) -> None:
     """
     Tombstone an ARK (soft delete).

@@ -10,7 +10,9 @@ from sqlalchemy import (
     Column,
     Float,
     Integer,
+    SmallInteger,
     BigInteger,
+    Boolean,
     String,
     Text,
     DateTime,
@@ -24,8 +26,40 @@ from sqlalchemy.sql import func
 from sqlalchemy.orm import declarative_base
 
 from app.models.states import ARKState
+from app.models.processing import ProcessingStage, ProcessingStatus
 
 Base = declarative_base()
+
+
+class ProcessingStageCode(Base):
+    """Seeded catalogue for compact internal workflow stage IDs."""
+
+    __tablename__ = "processing_stages"
+
+    id = Column(SmallInteger, primary_key=True)
+    code = Column(String(32), nullable=False, unique=True)
+    description = Column(Text, nullable=False)
+
+
+class ProcessingStatusCode(Base):
+    """Seeded catalogue for compact internal workflow status IDs."""
+
+    __tablename__ = "processing_statuses"
+
+    id = Column(SmallInteger, primary_key=True)
+    code = Column(String(32), nullable=False, unique=True)
+    description = Column(Text, nullable=False)
+
+
+class ProcessingErrorCodeModel(Base):
+    """Seeded catalogue for error IDs and retry policy."""
+
+    __tablename__ = "processing_error_codes"
+
+    id = Column(SmallInteger, primary_key=True)
+    code = Column(String(64), nullable=False, unique=True)
+    retryable = Column(Boolean, nullable=False, default=False, server_default="false")
+    description = Column(Text, nullable=False)
 
 
 class ARKRecord(Base):
@@ -65,18 +99,37 @@ class ARKRecord(Base):
     # Batch tracking
     client_item_id = Column(String(100), nullable=True)
     
-    # Publish tracking fields for async worker
-    publish_retry_count = Column(Integer, default=0, nullable=False, server_default="0")
-    publish_last_error = Column(Text, nullable=True)
-    publish_last_attempt_at = Column(DateTime, nullable=True)
-    publish_permanently_failed = Column(Integer, default=0, nullable=False, server_default="0")
+    # Internal worker workflow. Public lifecycle state above remains R/D/U/P/T.
+    processing_stage = Column(
+        SmallInteger,
+        ForeignKey("processing_stages.id"),
+        default=int(ProcessingStage.NONE),
+        nullable=False,
+        server_default="0",
+    )
+    processing_status = Column(
+        SmallInteger,
+        ForeignKey("processing_statuses.id"),
+        default=int(ProcessingStatus.IDLE),
+        nullable=False,
+        server_default="0",
+    )
+    processing_attempt_count = Column(SmallInteger, default=0, nullable=False, server_default="0")
+    processing_next_attempt_at = Column(DateTime, nullable=True, index=True)
+    processing_error_code = Column(SmallInteger, ForeignKey("processing_error_codes.id"), nullable=True)
+    processing_error_detail = Column(Text, nullable=True)
     
     # Composite indexes for common queries
     __table_args__ = (
         UniqueConstraint("naan", "name", name="uq_naan_name"),
         Index("ix_naan_name", "naan", "name"),
         Index("ix_state_authority", "state", "authority_id"),
-        Index("ix_state_permanently_failed_created", "state", "publish_permanently_failed", "created_at"),
+        Index(
+            "ix_ark_processing_queue",
+            "processing_stage",
+            "processing_status",
+            "processing_next_attempt_at",
+        ),
         Index(
             "uq_ark_records_active_client_item",
             "authority_id",
@@ -181,10 +234,13 @@ class ARKMetadata(Base):
     original_cid = Column(String(100), nullable=True)     # Set by worker after IPFS store
 
     # Last replication counts observed by the metadata reconciler.
-    level1_replica_count = Column(Integer, nullable=False, default=0, server_default="0")
-    level2_replica_count = Column(Integer, nullable=False, default=0, server_default="0")
+    # NULL means not observed yet; zero means Cluster was queried and has no pin.
+    level1_replica_count = Column(SmallInteger, nullable=True)
+    level2_replica_count = Column(SmallInteger, nullable=True)
     replication_checked_at = Column(DateTime, nullable=True, index=True)
+    replication_error_code = Column(SmallInteger, ForeignKey("processing_error_codes.id"), nullable=True)
     replication_last_error = Column(Text, nullable=True)
+    payload_purged_at = Column(DateTime, nullable=True)
     
     # Timestamps
     created_at = Column(DateTime, server_default=func.now(), nullable=False)

@@ -5,6 +5,15 @@ from dark_core_lib.exceptions import (
     ConnectionError as CoreConnectionError,
     TransactionError,
 )
+from app.config import get_settings
+from app.utils.noid import compute_checkdigit, encode_counter
+
+
+def _valid_ark() -> str:
+    settings = get_settings()
+    stem = f"{settings.minter_shoulder}{encode_counter(0, settings.minter_noid_length)}"
+    name = f"{stem}{compute_checkdigit(f'12345/{stem}')}"
+    return f"ark:12345/{name}"
 
 
 def test_authority_error_handler_sets_dark_headers(client, mock_corelib):
@@ -24,7 +33,7 @@ def test_core_connection_error_handler_sets_dark_headers(client, mock_corelib):
     """Connection errors should expose stable retryable headers."""
     mock_corelib.ark_exists.side_effect = CoreConnectionError("Cannot connect to RPC")
 
-    response = client.get("/api/v1/arks/ark:12345/x0000000")
+    response = client.get(f"/api/v1/arks/{_valid_ark()}")
 
     assert response.status_code == 503
     assert response.json()["error"] == "BLOCKCHAIN_UNAVAILABLE"
@@ -42,7 +51,7 @@ def test_transaction_error_handler_sets_dark_headers(client, mock_corelib):
         gas_used=42,
     )
 
-    response = client.get("/api/v1/arks/ark:12345/x0000000")
+    response = client.get(f"/api/v1/arks/{_valid_ark()}")
 
     assert response.status_code == 503
     assert response.json()["error"] == "BLOCKCHAIN_ERROR"
