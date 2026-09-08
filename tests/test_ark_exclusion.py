@@ -18,7 +18,7 @@ from app.database import ark_locks
 from app.database.models import Base, ARKRecord, ARKMetadata
 from app.dependencies import get_corelib_client, get_metadata_storage, get_db
 from app.middleware.auth import require_authority_identity
-from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingErrorCode
+from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingErrorCode, ProcessingWaitReason
 from app.repositories.ark_repository import ARKRepository
 from app.workers.publisher import MetadataPersistenceWorker, ReplicationReconciliationWorker, ChainPublisherWorker
 
@@ -37,7 +37,7 @@ def engine(monkeypatch):
     engine = create_engine(url, connect_args={"options": f"-csearch_path={schema}"}, pool_size=4)
     Base.metadata.create_all(engine)
     with engine.begin() as conn:
-        for name, enum in (("processing_stages", ProcessingStage), ("processing_statuses", ProcessingStatus), ("processing_error_codes", ProcessingErrorCode)):
+        for name, enum in (("processing_stages", ProcessingStage), ("processing_statuses", ProcessingStatus), ("processing_wait_reasons", ProcessingWaitReason), ("processing_error_codes", ProcessingErrorCode)):
             table = Base.metadata.tables[name]
             values = [{"id": int(value), "code": value.name.lower(), "description": value.name} for value in enum]
             if name == "processing_error_codes":
@@ -52,7 +52,7 @@ def engine(monkeypatch):
     admin.dispose()
 
 
-def seed(engine, state="P", stage=ProcessingStage.REPLICATION, status=ProcessingStatus.PENDING):
+def seed(engine, state="P", stage=ProcessingStage.REPLICATION, status=ProcessingStatus.READY):
     with Session(engine) as db:
         record = ARKRecord(naan="12345", name="exclusion-test", state=state, authority_id="authority", target="https://example.org", processing_stage=int(stage), processing_status=int(status))
         db.add(record)
@@ -165,8 +165,9 @@ def test_workers_recheck_stage_and_retry_after_lock(engine):
     storage.get_replication_status.assert_not_called()
     with Session(engine) as db:
         record = ARKRepository(db).get_by_ark(ARK)
-        record.processing_status = int(ProcessingStatus.RECOVERABLE)
-        record.processing_next_attempt_at = datetime.utcnow() + timedelta(minutes=10)
+        record.processing_status = int(ProcessingStatus.WAITING)
+        record.next_action_at = datetime.utcnow() + timedelta(minutes=10)
+        record.processing_wait_reason = int(ProcessingWaitReason.STORAGE_BACKOFF)
         db.commit()
     assert not MetadataPersistenceWorker(storage)._persist(ARK)
     storage.store_document.assert_not_called()
@@ -182,6 +183,46 @@ def test_reconciler_holds_lock_through_external_io(engine, client):
     result = ReplicationReconciliationWorker(storage)._reconcile(ARK)
     assert result["purged"] == 1
     assert client.put(f"/arks/{ARK}", json=payload()).status_code == 200
+
+
+def test_async_cluster_pin_wait_is_a_normal_wait(engine):
+    seed(engine, state="D", stage=ProcessingStage.AVAILABILITY)
+    storage = Mock()
+    storage.get_replication_status.return_value = SimpleNamespace(total_replicas=1)
+
+    result = ReplicationReconciliationWorker(
+        storage, recheck_seconds=10, publish_after_replicas=2
+    )._reconcile(ARK)
+
+    assert result["failed"] == 0
+    with Session(engine) as db:
+        record = ARKRepository(db).get_by_ark(ARK)
+        assert record.processing_stage == int(ProcessingStage.AVAILABILITY)
+        assert record.processing_status == int(ProcessingStatus.WAITING)
+        assert record.next_action_at is not None
+        assert record.processing_wait_reason == int(ProcessingWaitReason.INITIAL_VISIBILITY)
+        assert record.processing_error_code is None
+    assert record.processing_error_detail is None
+
+
+def test_cluster_pinning_never_repairs_payload_before_it_settles(engine):
+    seed(engine, state="D", stage=ProcessingStage.AVAILABILITY)
+    storage = Mock()
+    storage.get_replication_status.return_value = SimpleNamespace(
+        total_replicas=0, status="pinning"
+    )
+
+    result = ReplicationReconciliationWorker(
+        storage, recheck_seconds=10, pinning_grace_seconds=0
+    )._reconcile(ARK)
+
+    assert result["failed"] == 0
+    storage.store_document.assert_not_called()
+    with Session(engine) as db:
+        record = ARKRepository(db).get_by_ark(ARK)
+        assert record.processing_status == int(ProcessingStatus.WAITING)
+        assert record.next_action_at is not None
+        assert record.processing_wait_reason == int(ProcessingWaitReason.CLUSTER_PINNING)
 
 
 def test_legacy_rescue_endpoint_is_removed(engine, client):

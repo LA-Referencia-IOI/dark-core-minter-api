@@ -46,12 +46,15 @@ class WorkerRuntimeRepository:
         heartbeat_at: datetime,
         started_at: datetime,
         last_cycle_at: Optional[datetime] = None,
+        next_wake_at: Optional[datetime] = None,
         last_cycle_duration_seconds: Optional[float] = None,
         last_cycle_processed: Optional[int] = None,
         last_cycle_succeeded: Optional[int] = None,
         last_cycle_failed: Optional[int] = None,
         last_reconciliation_at: Optional[datetime] = None,
         last_reconciliation_checked: int = 0,
+        last_reconciliation_advanced: int = 0,
+        last_reconciliation_waiting: int = 0,
         last_reconciliation_repaired: int = 0,
         last_reconciliation_purged: int = 0,
         last_reconciliation_failed: int = 0,
@@ -78,12 +81,15 @@ class WorkerRuntimeRepository:
                 last_heartbeat_at=heartbeat_at,
                 started_at=started_at,
                 last_cycle_at=last_cycle_at,
+                next_wake_at=next_wake_at,
                 last_cycle_duration_seconds=last_cycle_duration_seconds,
                 last_cycle_processed=last_cycle_processed,
                 last_cycle_succeeded=last_cycle_succeeded,
                 last_cycle_failed=last_cycle_failed,
                 last_reconciliation_at=last_reconciliation_at,
                 last_reconciliation_checked=last_reconciliation_checked,
+                last_reconciliation_advanced=last_reconciliation_advanced,
+                last_reconciliation_waiting=last_reconciliation_waiting,
                 last_reconciliation_repaired=last_reconciliation_repaired,
                 last_reconciliation_purged=last_reconciliation_purged,
                 last_reconciliation_failed=last_reconciliation_failed,
@@ -103,16 +109,28 @@ class WorkerRuntimeRepository:
         record.last_heartbeat_at = heartbeat_at
         record.started_at = started_at
         record.last_cycle_at = last_cycle_at
+        record.next_wake_at = next_wake_at
         record.last_cycle_duration_seconds = last_cycle_duration_seconds
         record.last_cycle_processed = last_cycle_processed
         record.last_cycle_succeeded = last_cycle_succeeded
         record.last_cycle_failed = last_cycle_failed
         record.last_reconciliation_at = last_reconciliation_at
         record.last_reconciliation_checked = last_reconciliation_checked
+        record.last_reconciliation_advanced = last_reconciliation_advanced
+        record.last_reconciliation_waiting = last_reconciliation_waiting
         record.last_reconciliation_repaired = last_reconciliation_repaired
         record.last_reconciliation_purged = last_reconciliation_purged
         record.last_reconciliation_failed = last_reconciliation_failed
         record.last_error = last_error
+        attempted = int(last_cycle_processed or 0)
+        if worker_name and last_reconciliation_at is not None:
+            progress = int(last_reconciliation_advanced or 0) + int(last_reconciliation_waiting or 0) + int(last_reconciliation_repaired or 0)
+        else:
+            progress = int(last_cycle_succeeded or 0)
+        record.consecutive_no_progress_cycles = (
+            min(int(record.consecutive_no_progress_cycles or 0) + 1, 32767)
+            if attempted > 0 and progress == 0 else 0
+        )
         record.total_processed = total_processed
         record.total_succeeded = total_succeeded
         record.total_failed = total_failed

@@ -9,7 +9,7 @@ from sqlalchemy import and_, or_, update
 from sqlalchemy.orm import Session
 
 from app.database.models import ARKRecord, ARKMetadata, ProcessingErrorCodeModel
-from app.models.processing import ProcessingStage, ProcessingStatus
+from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingWaitReason
 from app.models.states import ARKState
 
 
@@ -44,20 +44,22 @@ def parse_ark(ark: str) -> Tuple[str, str]:
 def _ready_for_processing(record: ARKRecord, now: datetime) -> bool:
     """Return whether a record is ready for an advisory-lock protected attempt."""
     status = int(record.processing_status)
-    if status == int(ProcessingStatus.PENDING):
-        return record.processing_next_attempt_at is None or record.processing_next_attempt_at <= now
+    if status == int(ProcessingStatus.READY):
+        return True
+    if status == int(ProcessingStatus.WAITING):
+        return record.next_action_at is not None and record.next_action_at <= now
     return False
 
 
 def _ready_for_processing_filter(now: datetime):
-    """SQL predicate matching pending and due retry work."""
+    """SQL predicate matching ready work and due normal waits."""
     return or_(
         and_(
-            ARKRecord.processing_status == int(ProcessingStatus.PENDING),
-            or_(
-                ARKRecord.processing_next_attempt_at.is_(None),
-                ARKRecord.processing_next_attempt_at <= now,
-            ),
+            ARKRecord.processing_status == int(ProcessingStatus.READY),
+        ),
+        and_(
+            ARKRecord.processing_status == int(ProcessingStatus.WAITING),
+            ARKRecord.next_action_at <= now,
         ),
     )
 
@@ -345,9 +347,10 @@ class ARKRepository:
         ark_record = self.db.query(ARKRecord).filter_by(id=ark_record_id).first()
         if ark_record:
             ark_record.processing_stage = int(ProcessingStage.METADATA)
-            ark_record.processing_status = int(ProcessingStatus.PENDING)
+            ark_record.processing_status = int(ProcessingStatus.READY)
             ark_record.processing_attempt_count = 0
-            ark_record.processing_next_attempt_at = None
+            ark_record.next_action_at = None
+            ark_record.processing_wait_reason = int(ProcessingWaitReason.NONE)
             ark_record.processing_error_code = None
             ark_record.processing_error_detail = None
             ark_record.updated_at = _utc_now()
@@ -389,7 +392,8 @@ class ARKRepository:
             ark_record = self.db.query(ARKRecord).filter_by(id=ark_record_id).first()
             if ark_record:
                 ark_record.processing_attempt_count = 0
-                ark_record.processing_next_attempt_at = None
+                ark_record.next_action_at = None
+                ark_record.processing_wait_reason = int(ProcessingWaitReason.NONE)
                 ark_record.processing_error_code = None
                 ark_record.processing_error_detail = None
                 ark_record.updated_at = _utc_now()
@@ -398,32 +402,90 @@ class ARKRepository:
         self,
         limit: int = 50,
         recheck_seconds: int = 300,
+        stage: int | None = None,
     ) -> List[ARKRecord]:
-        """Return availability/replication work whose observation is due."""
-        cutoff = _utc_now() - timedelta(seconds=max(int(recheck_seconds), 0))
-        query = (
+        """Return a work-conserving page, prioritizing first-pin work."""
+        now = _utc_now()
+        del recheck_seconds
+        normal_queue = or_(
+            ARKRecord.next_action_at.is_(None),
+            ARKRecord.next_action_at <= now,
+        )
+
+        def query_for(stage: int, quota: int) -> List[ARKRecord]:
+            query = (
             self.db.query(ARKRecord)
             .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
             .filter(
                 ARKMetadata.level1_cid.isnot(None),
                 ARKMetadata.original_cid.isnot(None),
-                ARKRecord.processing_stage.in_(
-                    [
-                        int(ProcessingStage.AVAILABILITY),
-                        int(ProcessingStage.REPLICATION),
-                    ]
-                ),
-                or_(
-                    ARKMetadata.replication_checked_at.is_(None),
-                    ARKMetadata.replication_checked_at <= cutoff,
-                ),
+                normal_queue,
+                ARKRecord.processing_status.in_([
+                    int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)
+                ]),
+                ARKRecord.processing_stage == stage,
             )
             .order_by(
+                ARKRecord.next_action_at.asc().nullsfirst(),
                 ARKMetadata.replication_checked_at.asc().nullsfirst(),
+                ARKRecord.authority_id.asc(),
                 ARKMetadata.updated_at.asc(),
             )
+            )
+            return self._claim_ready_records(query, quota, max_retries=0, backoff_base=1.0)
+
+        if stage is not None:
+            return query_for(int(stage), limit)
+        availability = query_for(int(ProcessingStage.AVAILABILITY), limit)
+        if len(availability) >= limit:
+            return availability[:limit]
+        durability = query_for(int(ProcessingStage.REPLICATION), limit - len(availability))
+        selected = availability + durability
+        return selected[:limit]
+
+    def has_critical_reconciliation_backlog(self) -> bool:
+        """Whether metadata persistence or first-pin work still exists."""
+        metadata = self.db.query(ARKRecord.id).filter(
+            ARKRecord.processing_stage == int(ProcessingStage.METADATA),
+            ARKRecord.processing_status.in_([
+                int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)
+            ]),
+        ).limit(1).first()
+        if metadata is not None:
+            return True
+        availability = (
+            self.db.query(ARKRecord.id)
+            .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+            .filter(
+                ARKRecord.processing_stage == int(ProcessingStage.AVAILABILITY),
+                ARKRecord.processing_status.in_([
+                    int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)
+                ]),
+                ARKMetadata.level1_cid.isnot(None),
+                ARKMetadata.original_cid.isnot(None),
+            )
+            .limit(1)
+            .first()
         )
-        return self._claim_ready_records(query, limit, max_retries=0, backoff_base=1.0)
+        return availability is not None
+
+    def get_next_reconciliation_action_at(self):
+        """Return the next scheduled availability/durability observation."""
+        return (
+            self.db.query(ARKRecord.next_action_at)
+            .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+            .filter(
+                ARKRecord.processing_stage.in_(
+                    [int(ProcessingStage.AVAILABILITY), int(ProcessingStage.REPLICATION)]
+                ),
+                ARKRecord.next_action_at.isnot(None),
+                ARKMetadata.level1_cid.isnot(None),
+                ARKMetadata.original_cid.isnot(None),
+            )
+            .order_by(ARKRecord.next_action_at.asc())
+            .limit(1)
+            .scalar()
+        )
 
     def get_metadata_pending_persist(
         self,
@@ -476,11 +538,7 @@ class ARKRepository:
         del max_retries, backoff_base
         query = query.filter(_ready_for_processing_filter(now))
 
-        candidates = (
-            query.order_by(ARKRecord.authority_id.asc(), ARKRecord.created_at.asc())
-            .limit(limit)
-            .all()
-        )
+        candidates = query.limit(limit).all()
 
         ready_records = []
         for record in candidates:
@@ -624,9 +682,10 @@ class ARKRepository:
             .values(
                 state=ARKState.PUBLISHED.value,
                 processing_stage=int(ProcessingStage.REPLICATION),
-                processing_status=int(ProcessingStatus.PENDING),
+                processing_status=int(ProcessingStatus.READY),
                 processing_attempt_count=0,
-                processing_next_attempt_at=None,
+                next_action_at=None,
+                processing_wait_reason=int(ProcessingWaitReason.NONE),
                 processing_error_code=None,
                 processing_error_detail=None,
                 updated_at=now,
@@ -678,7 +737,8 @@ class ARKRepository:
                 state=ARKState.TOMBSTONE.value,
                 tombstoned_at=now,
                 processing_status=int(ProcessingStatus.CANCELLED),
-                processing_next_attempt_at=None,
+                next_action_at=None,
+                processing_wait_reason=int(ProcessingWaitReason.NONE),
                 updated_at=now,
             )
         )
@@ -732,14 +792,15 @@ class ARKRepository:
         }
         policy = self.db.query(ProcessingErrorCodeModel).filter_by(id=int(error_code)).first()
         # The persisted error catalogue, not individual call sites, defines
-        # whether an error is eligible for low-priority recovery.
         is_permanent = not bool(policy.retryable) if policy is not None else is_permanent
         if is_permanent:
             values["processing_status"] = int(ProcessingStatus.FAILED)
-            values["processing_next_attempt_at"] = None
+            values["next_action_at"] = None
+            values["processing_wait_reason"] = int(ProcessingWaitReason.NONE)
         else:
-            values["processing_status"] = int(ProcessingStatus.RECOVERABLE)
-            values["processing_next_attempt_at"] = now + timedelta(minutes=1)
+            values["processing_status"] = int(ProcessingStatus.WAITING)
+            values["next_action_at"] = now + timedelta(minutes=1)
+            values["processing_wait_reason"] = int(ProcessingWaitReason.STORAGE_BACKOFF)
 
         conditions = [ARKRecord.naan == naan, ARKRecord.name == name]
         result = self.db.execute(update(ARKRecord).where(*conditions).values(**values))
@@ -776,8 +837,9 @@ class ARKRepository:
             update(ARKRecord)
             .where(*conditions)
             .values(
-                processing_status=int(ProcessingStatus.RECOVERABLE),
-                processing_next_attempt_at=now + timedelta(seconds=max(int(delay_seconds), 0)),
+                processing_status=int(ProcessingStatus.WAITING),
+                next_action_at=now + timedelta(seconds=max(int(delay_seconds), 0)),
+                processing_wait_reason=int(ProcessingWaitReason.STORAGE_BACKOFF),
                 processing_error_code=int(error_code),
                 processing_error_detail=error_message[:1000],
                 updated_at=now,
@@ -812,9 +874,10 @@ class ARKRepository:
         if not db_ark:
             raise ValueError(f"ARK not found: {ark}")
 
-        db_ark.processing_status = int(ProcessingStatus.PENDING)
+        db_ark.processing_status = int(ProcessingStatus.READY)
         db_ark.processing_attempt_count = 0
-        db_ark.processing_next_attempt_at = None
+        db_ark.next_action_at = None
+        db_ark.processing_wait_reason = int(ProcessingWaitReason.NONE)
         db_ark.processing_error_code = None
         db_ark.processing_error_detail = None
         db_ark.updated_at = _utc_now()

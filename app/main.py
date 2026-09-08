@@ -123,6 +123,11 @@ def create_app() -> FastAPI:
     app.include_router(api_router, prefix="/api/v1")
     
     # Health endpoint (no auth required)
+    @app.get("/health/live", tags=["Health"])
+    async def liveness_check():
+        """Cheap process liveness check; does not touch DB, RPC or storage."""
+        return {"status": "alive"}
+
     @app.get("/health", tags=["Health"])
     async def health_check(db: Session = Depends(get_db)):
         """Health check endpoint for load balancers."""

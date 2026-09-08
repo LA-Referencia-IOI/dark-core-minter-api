@@ -15,7 +15,7 @@ import socket
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import FrameType
 from typing import Any, Dict, Optional
@@ -39,7 +39,6 @@ from app.workers.publisher import (
     MetadataPersistenceWorker,
     ReplicationReconciliationWorker,
 )
-from app.workers.recovery import RecoveryWorker
 
 
 logging.basicConfig(
@@ -186,6 +185,8 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
             "last_cycle_deferred": None,
             "last_reconciliation_at": None,
             "last_reconciliation_checked": 0,
+            "last_reconciliation_advanced": 0,
+            "last_reconciliation_waiting": 0,
             "last_reconciliation_repaired": 0,
             "last_reconciliation_purged": 0,
             "last_reconciliation_failed": 0,
@@ -206,6 +207,8 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
         "last_cycle_deferred": raw_stats.get("last_run_deferred"),
         "last_reconciliation_at": raw_stats.get("last_reconciliation_at"),
         "last_reconciliation_checked": int(raw_stats.get("last_reconciliation_checked", 0) or 0),
+        "last_reconciliation_advanced": int(raw_stats.get("last_reconciliation_advanced", 0) or 0),
+        "last_reconciliation_waiting": int(raw_stats.get("last_reconciliation_waiting", 0) or 0),
         "last_reconciliation_repaired": int(raw_stats.get("last_reconciliation_repaired", 0) or 0),
         "last_reconciliation_purged": int(raw_stats.get("last_reconciliation_purged", 0) or 0),
         "last_reconciliation_failed": int(raw_stats.get("last_reconciliation_failed", 0) or 0),
@@ -277,6 +280,7 @@ def _persist_worker_heartbeat(
     started_at: datetime,
     publisher: Optional[Any] = None,
     last_error: Optional[str] = None,
+    next_wake_at: Optional[datetime] = None,
 ) -> None:
     """Persist worker heartbeat/status in DB."""
     stats = _extract_runtime_stats(publisher)
@@ -294,12 +298,15 @@ def _persist_worker_heartbeat(
             heartbeat_at=_utc_now(),
             started_at=started_at,
             last_cycle_at=stats["last_cycle_at"],
+            next_wake_at=next_wake_at,
             last_cycle_duration_seconds=stats["last_cycle_duration_seconds"],
             last_cycle_processed=stats["last_cycle_processed"],
             last_cycle_succeeded=stats["last_cycle_succeeded"],
             last_cycle_failed=stats["last_cycle_failed"],
             last_reconciliation_at=stats["last_reconciliation_at"],
             last_reconciliation_checked=stats["last_reconciliation_checked"],
+            last_reconciliation_advanced=stats["last_reconciliation_advanced"],
+            last_reconciliation_waiting=stats["last_reconciliation_waiting"],
             last_reconciliation_repaired=stats["last_reconciliation_repaired"],
             last_reconciliation_purged=stats["last_reconciliation_purged"],
             last_reconciliation_failed=stats["last_reconciliation_failed"],
@@ -332,14 +339,31 @@ def _worker_runtime_config(worker_kind: str):
             "backoff_base": settings.metadata_worker_retry_backoff_base,
         }
     if worker_kind == "replication":
+        if not hasattr(settings, "availability_recheck_seconds"):
+            return {
+                "enabled": settings.replication_worker_enabled,
+                "worker_name": settings.replication_worker_runtime_name,
+                "page_size": settings.replication_worker_page_size,
+                "concurrency": settings.replication_worker_concurrency,
+                "sleep_seconds": settings.replication_worker_sleep_seconds,
+                "recheck_seconds": settings.replication_worker_recheck_seconds,
+                "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
+            }
         return {
             "enabled": settings.replication_worker_enabled,
             "worker_name": settings.replication_worker_runtime_name,
             "page_size": settings.replication_worker_page_size,
             "concurrency": settings.replication_worker_concurrency,
             "sleep_seconds": settings.replication_worker_sleep_seconds,
-            "recheck_seconds": settings.replication_worker_recheck_seconds,
+            "availability_recheck_seconds": getattr(settings, "availability_recheck_seconds", getattr(settings, "replication_worker_recheck_seconds", 10)),
+            "availability_max_recheck_seconds": getattr(settings, "availability_max_recheck_seconds", 60),
+            "replication_recheck_seconds": getattr(settings, "replication_recheck_seconds", getattr(settings, "replication_worker_recheck_seconds", 300)),
+            "replication_max_recheck_seconds": getattr(settings, "replication_max_recheck_seconds", 1800),
+            "repair_grace_seconds": getattr(settings, "replication_repair_grace_seconds", 120),
+            "repair_cooldown_seconds": getattr(settings, "replication_repair_cooldown_seconds", 900),
             "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
+            "status_batch_size": getattr(settings, "replication_status_batch_size", 200),
+            "idle_sleep_seconds": getattr(settings, "replication_idle_sleep_seconds", 2),
         }
     if worker_kind == "chain":
         return {
@@ -352,16 +376,9 @@ def _worker_runtime_config(worker_kind: str):
             "block_stall_seconds": settings.chain_worker_block_stall_seconds,
             "adaptive_page_enabled": settings.chain_worker_adaptive_page_enabled,
             "min_page_size": settings.chain_worker_min_page_size,
-            "recovery_success_cycles": settings.chain_worker_recovery_success_cycles,
+            "healthy_cycles_before_growing": settings.chain_worker_healthy_cycles_before_growing,
             "max_retries": settings.chain_worker_max_retries,
             "backoff_base": settings.chain_worker_retry_backoff_base,
-        }
-    if worker_kind == "recovery":
-        return {
-            "enabled": settings.recovery_worker_enabled,
-            "worker_name": settings.recovery_worker_runtime_name,
-            "page_size": settings.recovery_worker_page_size,
-            "sleep_seconds": settings.recovery_worker_sleep_seconds,
         }
     raise ValueError(f"Unsupported worker kind: {worker_kind}")
 
@@ -375,6 +392,10 @@ def _last_cycle_processed(publisher: Optional[Any]) -> int:
 
 def _select_next_sleep_seconds(publisher: Optional[Any], runtime: Dict[str, Any]) -> tuple[int, str]:
     """Choose whether to continue immediately or sleep after a worker page."""
+    if publisher is not None and hasattr(publisher, "next_wake_plan"):
+        planned = publisher.next_wake_plan(runtime)
+        if isinstance(planned, tuple) and len(planned) == 2:
+            return planned
     page_size = _last_cycle_page_size(publisher, runtime)
     if _last_cycle_processed(publisher) >= page_size:
         return 0, "continue"
@@ -382,17 +403,17 @@ def _select_next_sleep_seconds(publisher: Optional[Any], runtime: Dict[str, Any]
 
 
 def _rpc_pause_sleep_seconds(runtime: Dict[str, Any]) -> int:
-    """Return sleep duration used while chain worker waits for RPC recovery."""
+    """Return sleep duration while the chain worker waits for RPC availability."""
     return max(int(runtime.get("rpc_retry_seconds", 10) or 0), 1)
 
 
 def _congestion_pause_sleep_seconds(runtime: Dict[str, Any]) -> int:
-    """Return sleep duration used while chain worker waits for chain recovery."""
+    """Return sleep duration while the chain worker waits for chain capacity."""
     return max(int(runtime.get("congestion_retry_seconds", 30) or 0), 1)
 
 
 def _storage_pause_sleep_seconds(runtime: Dict[str, Any]) -> int:
-    """Return sleep duration used while metadata worker waits for storage recovery."""
+    """Return sleep duration while a storage worker waits for storage availability."""
     return max(int(runtime.get("storage_retry_seconds", 10) or 0), 1)
 
 
@@ -587,12 +608,17 @@ def run_worker(worker_kind: str = "chain") -> None:
                     metadata_storage=metadata_storage,
                     page_size=runtime["page_size"],
                     concurrency=runtime["concurrency"],
-                    recheck_seconds=runtime["recheck_seconds"],
+                    availability_recheck_seconds=runtime["availability_recheck_seconds"],
+                    availability_max_recheck_seconds=runtime["availability_max_recheck_seconds"],
+                    replication_recheck_seconds=runtime["replication_recheck_seconds"],
+                    replication_max_recheck_seconds=runtime["replication_max_recheck_seconds"],
+                    repair_grace_seconds=runtime["repair_grace_seconds"],
+                    repair_cooldown_seconds=runtime["repair_cooldown_seconds"],
                     publish_after_replicas=settings.replication_publish_after_replicas,
                     target_replicas=settings.replication_target_replicas,
+                    status_batch_size=runtime["status_batch_size"],
+                    idle_sleep_seconds=runtime["idle_sleep_seconds"],
                 )
-        elif worker_kind == "recovery":
-            publisher = RecoveryWorker(page_size=runtime["page_size"])
         else:
             logger.info("Chain worker will initialize blockchain client after RPC is available")
 
@@ -610,9 +636,10 @@ def run_worker(worker_kind: str = "chain") -> None:
             "last_error": None,
         }
 
-        def set_heartbeat_state(status: str, last_error: Optional[str] = None) -> None:
+        def set_heartbeat_state(status: str, last_error: Optional[str] = None, next_wake_at: Optional[datetime] = None) -> None:
             heartbeat_state["status"] = status
             heartbeat_state["last_error"] = last_error
+            heartbeat_state["next_wake_at"] = next_wake_at
 
         def persist_current_heartbeat():
             _persist_worker_heartbeat(
@@ -624,6 +651,7 @@ def run_worker(worker_kind: str = "chain") -> None:
                 started_at=started_at,
                 publisher=publisher,
                 last_error=heartbeat_state["last_error"],
+                next_wake_at=heartbeat_state.get("next_wake_at"),
             )
 
         def ensure_chain_publisher() -> bool:
@@ -717,7 +745,7 @@ def run_worker(worker_kind: str = "chain") -> None:
                         if (
                             effective_chain_page_size < target_page_size
                             and healthy_capacity_cycles
-                            >= max(int(runtime.get("recovery_success_cycles", 3) or 1), 1)
+                            >= max(int(runtime.get("healthy_cycles_before_growing", 3) or 1), 1)
                         ):
                             effective_chain_page_size = min(
                                 target_page_size,
@@ -751,7 +779,7 @@ def run_worker(worker_kind: str = "chain") -> None:
                     _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
                     continue
 
-            set_heartbeat_state("RUNNING", None)
+            set_heartbeat_state("RUNNING", None, None)
             if worker_kind == "chain":
                 publisher.run_publish_cycle(effective_page_size=cycle_page_size)
             else:
@@ -781,6 +809,11 @@ def run_worker(worker_kind: str = "chain") -> None:
                 f"Worker cycle finished (processed: {_last_cycle_processed(publisher)}, "
                 f"sleep: {sleep_seconds}s, reason: {sleep_reason})"
             )
+            # Runtime state describes the process, not its queue.  A worker
+            # with ready ARKs may legitimately be sleeping until its bounded
+            # polling interval expires.
+            set_heartbeat_state("SLEEPING", None, _utc_now() + timedelta(seconds=sleep_seconds))
+            persist_current_heartbeat()
             _wait_with_heartbeats(sleep_seconds, heartbeat_interval, persist_current_heartbeat)
 
     except Exception as e:
@@ -833,7 +866,7 @@ def main() -> None:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["run", "status", "metadata", "replication", "chain", "recovery"],
+        choices=["run", "status", "metadata", "replication", "chain"],
         default="run",
         help="run chain worker, run a specific worker kind, or check process status",
     )
@@ -845,8 +878,6 @@ def main() -> None:
         run_worker("metadata")
     elif args.command == "replication":
         run_worker("replication")
-    elif args.command == "recovery":
-        run_worker("recovery")
     else:
         run_worker("chain")
 

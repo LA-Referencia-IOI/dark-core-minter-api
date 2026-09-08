@@ -1,1774 +1,274 @@
-"""
-Worker status endpoints backed by DB heartbeat.
-"""
+"""Status, permanent errors and explicit administrative retries for three workers."""
 
-from datetime import datetime, timedelta, timezone
+from __future__ import annotations
+
 import logging
+from datetime import datetime, timezone
 from math import ceil
-from typing import Any, Dict
+from typing import Any
 
-from dark_core_lib import ARKPublishOperation, DARKCoreClient
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
-from app.database.models import ARKMetadata, ARKRecord
-from app.dependencies import get_corelib_client, get_db
-from app.middleware.auth import enforce_authority_match, require_authority_identity, require_mtls
-from app.models.states import ARKState
-from app.models.processing import (
-    ProcessingErrorCode,
-    ProcessingStage,
-    ProcessingStatus,
-    code_label,
-)
-from app.repositories import WorkerRuntimeRepository
 from app.database.ark_locks import acquire_ark_lock
+from app.database.models import ARKMetadata, ARKRecord
+from app.dependencies import get_db
+from app.middleware.auth import require_mtls
+from app.models.processing import ProcessingErrorCode, ProcessingStage, ProcessingStatus, ProcessingWaitReason, code_label
+from app.models.states import ARKState
+from app.repositories import WorkerRuntimeRepository
 from app.repositories.ark_repository import ARKRepository
-from app.repositories.ark_repository import _ready_for_processing
 from app.utils.rpc_health import check_rpc_health
 from app.utils.storage_health import check_metadata_storage_health
-from app.workers.publisher import ChainPublisherWorker
 
 router = APIRouter(tags=["Worker"])
 logger = logging.getLogger(__name__)
 
-ERROR_TYPES = (
-    "storage_unavailable",
-    "storage_invalid_response",
-    "replication_unavailable",
-    "cid_mismatch",
-    "chain_rpc_unavailable",
-    "chain_reverted",
-    "authority_not_found",
-    "authorization_failed",
-    "chain_state_conflict",
-    "unexpected",
-    "recovery_not_possible",
-    "unknown",
-)
+WORKER_STAGES = {
+    "metadata": (ProcessingStage.METADATA,),
+    "replication": (ProcessingStage.AVAILABILITY, ProcessingStage.REPLICATION),
+    "chain": (ProcessingStage.CHAIN,),
+}
 
 
-class RecoveryRequest(BaseModel):
-    """Explicit administrative approval for permanently failed ARKs."""
-
+class RetryRequest(BaseModel):
     arks: list[str] = Field(min_length=1, max_length=1000)
-    reason: str | None = Field(default=None, max_length=500)
+    reason: str = Field(min_length=1, max_length=500)
 
 
-def _utc_now() -> datetime:
-    """Return current UTC time as naive datetime for DB compatibility."""
+def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _isoformat_or_none(value: datetime | None) -> str | None:
-    """Return ISO string for datetime values used in JSON responses."""
+def _iso(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
 
 
-def _metadata_complete(metadata: ARKMetadata | None) -> bool:
-    """Return True when both persisted metadata CIDs exist."""
-    return bool(metadata and metadata.level1_cid and metadata.original_cid)
+def _label(value: int | None, enum) -> str:
+    return code_label(value, enum) or "unknown"
 
 
-def _metadata_stage(record: ARKRecord) -> str:
-    """Return the readable internal worker stage stored on the record."""
-    return code_label(record.processing_stage, ProcessingStage) or "unknown"
-
-
-def _state_label(state: str | None) -> str | None:
-    """Return a readable state label from the compact DB state code."""
-    labels = {
-        ARKState.RESERVED.value: "reserved",
-        ARKState.DRAFT.value: "draft",
-        ARKState.UPDATE.value: "update",
-        ARKState.PUBLISHED.value: "published",
-        ARKState.TOMBSTONE.value: "tombstone",
+def _config(settings) -> dict[str, dict[str, Any]]:
+    return {
+        "metadata": {"kind": "metadata", "name": settings.metadata_worker_runtime_name, "enabled": settings.metadata_worker_enabled, "sleep": settings.metadata_worker_sleep_seconds, "page_size": settings.metadata_worker_page_size},
+        "replication": {"kind": "replication", "name": settings.replication_worker_runtime_name, "enabled": settings.replication_worker_enabled, "sleep": settings.replication_worker_sleep_seconds, "page_size": settings.replication_worker_page_size},
+        "chain": {"kind": "chain", "name": settings.chain_worker_runtime_name, "enabled": settings.chain_worker_enabled, "sleep": settings.chain_worker_sleep_seconds, "page_size": settings.chain_worker_page_size},
     }
-    return labels.get(state) if state else None
 
 
-def _error_status(record: ARKRecord) -> str:
-    """Return the operational error status for an ARK record."""
-    if record.processing_status == int(ProcessingStatus.FAILED):
-        return "permanent"
-    if record.processing_status == int(ProcessingStatus.RECOVERABLE):
-        return "recoverable"
-    return "none"
-
-
-def _classify_error_type(record: ARKRecord, metadata: ARKMetadata | None = None) -> str:
-    """Classify an ARK publish error from persisted error text."""
-    code = code_label(record.processing_error_code, ProcessingErrorCode)
-    if code:
-        return code
-    message = (record.processing_error_detail or "").lower()
-    if not message:
-        return "unknown"
-
-    if "gas limit" in message or "out of gas" in message or "gas x2" in message:
-        return "gas_limit"
-    if "reconcile conflict" in message or "on-chain ark differs" in message:
-        return "reconcile_conflict"
-    if "max retries exceeded, permanent" in message:
-        return "max_retries"
-    if "metadata storage" in message:
-        return "metadata_storage"
-    if "authority error" in message or "authorization" in message or "not authorized" in message:
-        return "authority"
-    if any(
-        token in message
-        for token in (
-            "infrastructure",
-            "ambiguous",
-            "send_failed",
-            "not_sent",
-            "rpc",
-            "timeout",
-            "timed out",
-            "connection",
-            "transport",
-            "unavailable",
-            "connect",
-            "refused",
-        )
+def _process(record, cfg: dict[str, Any], now: datetime, stale_after: int) -> dict[str, Any]:
+    if not cfg["enabled"]:
+        return {"enabled": False, "alive": False, "process_state": "DISABLED"}
+    if record is None:
+        return {"enabled": True, "alive": False, "process_state": "DOWN"}
+    age = (now - record.last_heartbeat_at).total_seconds() if record.last_heartbeat_at else None
+    if age is None or age > stale_after or record.status in {"ERROR", "STOPPED"}:
+        return {"enabled": True, "alive": False, "process_state": "DOWN", "heartbeat_age_seconds": age, "last_error": record.last_error}
+    if record.status.startswith("PAUSED_"):
+        return {"enabled": True, "alive": True, "process_state": "PAUSED", "pause_reason": record.status.lower().removeprefix("paused_"), "heartbeat_age_seconds": age, "last_error": record.last_error}
+    wake_at = record.next_wake_at
+    sleeping = record.status == "SLEEPING" and bool(wake_at and wake_at > now)
+    # A heartbeat written exactly at cycle completion represents the normal
+    # post-cycle wait even if an older/synthetic runtime row still says RUNNING.
+    if (
+        not sleeping
+        and record.status == "RUNNING"
+        and record.last_cycle_at is not None
+        and record.last_heartbeat_at is not None
+        and record.last_cycle_at == record.last_heartbeat_at
     ):
-        return "infrastructure"
-    if "reverted" in message or "transaction error" in message:
-        return "transaction_reverted"
-    return "unknown"
-
-
-def _is_infrastructure_error_message(message: str) -> bool:
-    """Return True when an error message looks like RPC/transport failure."""
-    lowered = message.lower()
-    return any(
-        token in lowered
-        for token in (
-            "infrastructure",
-            "ambiguous",
-            "rpc",
-            "timeout",
-            "timed out",
-            "connection",
-            "transport",
-            "unavailable",
-            "connect",
-            "refused",
-        )
-    )
-
-
-def _build_worker_config(settings) -> Dict[str, Any]:
-    """Return effective worker settings relevant for publication cycles."""
+        sleeping = True
+    last_cycle = {
+        "observed": record.last_cycle_processed or 0,
+        "advanced": record.last_cycle_succeeded or 0,
+        "waiting": 0,
+        "repaired": 0,
+        "failed": record.last_cycle_failed or 0,
+        "duration_seconds": record.last_cycle_duration_seconds,
+    }
+    if cfg.get("kind") == "replication":
+        last_cycle.update({
+            "observed": record.last_reconciliation_checked or 0,
+            "advanced": record.last_reconciliation_advanced or 0,
+            "waiting": record.last_reconciliation_waiting or 0,
+            "repaired": record.last_reconciliation_repaired or 0,
+            "failed": record.last_reconciliation_failed or 0,
+        })
+    no_progress_cycles = int(getattr(record, "consecutive_no_progress_cycles", 0) or 0)
     return {
-        "metadata": {
-            "worker_page_size": settings.metadata_worker_page_size,
-            "worker_concurrency": settings.metadata_worker_concurrency,
-            "worker_sleep_seconds": settings.metadata_worker_sleep_seconds,
-            "worker_storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
-            "worker_max_retries": settings.metadata_worker_max_retries,
-            "worker_retry_backoff_base": settings.metadata_worker_retry_backoff_base,
-            "worker_runtime_name": settings.metadata_worker_runtime_name,
-        },
-        "replication": {
-            "worker_page_size": settings.replication_worker_page_size,
-            "worker_concurrency": settings.replication_worker_concurrency,
-            "worker_sleep_seconds": settings.replication_worker_sleep_seconds,
-            "worker_recheck_seconds": settings.replication_worker_recheck_seconds,
-            "worker_storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
-            "worker_runtime_name": settings.replication_worker_runtime_name,
-        },
-        "chain": {
-            "worker_page_size": settings.chain_worker_page_size,
-            "worker_sleep_seconds": settings.chain_worker_sleep_seconds,
-            "worker_rpc_retry_seconds": settings.chain_worker_rpc_retry_seconds,
-            "worker_congestion_retry_seconds": settings.chain_worker_congestion_retry_seconds,
-            "worker_block_stall_seconds": settings.chain_worker_block_stall_seconds,
-            "worker_adaptive_page_enabled": settings.chain_worker_adaptive_page_enabled,
-            "worker_min_page_size": settings.chain_worker_min_page_size,
-            "worker_recovery_success_cycles": settings.chain_worker_recovery_success_cycles,
-            "worker_max_retries": settings.chain_worker_max_retries,
-            "worker_retry_backoff_base": settings.chain_worker_retry_backoff_base,
-            "worker_runtime_name": settings.chain_worker_runtime_name,
-        },
-        "recovery": {
-            "worker_page_size": settings.recovery_worker_page_size,
-            "worker_sleep_seconds": settings.recovery_worker_sleep_seconds,
-            "worker_runtime_name": settings.recovery_worker_runtime_name,
-        },
-        "rpc": {
-            "health_timeout_seconds": settings.dark_rpc_health_timeout_seconds,
-            "connect_retry_seconds": settings.dark_rpc_connect_retry_seconds,
-            "connect_retry_interval_seconds": settings.dark_rpc_connect_retry_interval_seconds,
-        },
-    }
-
-
-def _empty_queue() -> Dict[str, Any]:
-    return {
-        "pending_total": 0,
-        "ready_now": 0,
-        "delayed_by_backoff": 0,
-        "oldest_pending_at": None,
-    }
-
-
-def _empty_errors() -> Dict[str, Any]:
-    return {
-        "recoverable": 0,
-        "permanent": 0,
-        "oldest_error_at": None,
-    }
-
-
-def _chain_capacity_to_dict(capacity, max_page_size: int) -> Dict[str, Any]:
-    """Return a JSON-safe chain capacity snapshot."""
-    return {
-        "available": bool(getattr(capacity, "available", False)),
-        "state": str(getattr(capacity, "state", "unknown") or "unknown"),
-        "recommended_page_size": int(getattr(capacity, "recommended_page_size", 0) or 0),
-        "max_page_size": int(getattr(capacity, "max_page_size", max_page_size) or max_page_size),
-        "reason": str(getattr(capacity, "reason", "") or ""),
-        "block_number": getattr(capacity, "block_number", None),
-        "txpool_pending": getattr(capacity, "txpool_pending", None),
-    }
-
-
-def _build_chain_capacity_summary(settings) -> Dict[str, Any]:
-    """Build chain capacity through dark-core-lib, without direct txpool RPC calls."""
-    max_page_size = settings.chain_worker_page_size
-    try:
-        capacity = get_corelib_client().get_chain_capacity(max_page_size=max_page_size)
-        return _chain_capacity_to_dict(capacity, max_page_size)
-    except Exception as exc:
-        return {
-            "available": False,
-            "state": "unknown",
-            "recommended_page_size": 0,
-            "max_page_size": max_page_size,
-            "reason": f"Failed to read chain capacity from core-lib: {exc}",
-            "block_number": None,
-            "txpool_pending": None,
-        }
-
-
-def _build_queue_summary(db: Session, settings, now: datetime) -> Dict[str, Any]:
-    """Build read-only queue and error counters from ARK records."""
-    state_labels = {
-        ARKState.RESERVED.value: "reserved",
-        ARKState.DRAFT.value: "draft",
-        ARKState.UPDATE.value: "update",
-        ARKState.PUBLISHED.value: "published",
-        ARKState.TOMBSTONE.value: "tombstone",
-    }
-    by_state = {label: 0 for label in state_labels.values()}
-
-    state_counts = (
-        db.query(ARKRecord.state, func.count(ARKRecord.id)).group_by(ARKRecord.state).all()
-    )
-    for state, count in state_counts:
-        label = state_labels.get(state)
-        if label:
-            by_state[label] = int(count or 0)
-
-    queues = {
-        "metadata": _empty_queue(),
-        "availability": _empty_queue(),
-        "chain": _empty_queue(),
-        "replication": _empty_queue(),
-    }
-    errors = {
-        "metadata": _empty_errors(),
-        "availability": _empty_errors(),
-        "chain": _empty_errors(),
-        "replication": _empty_errors(),
-    }
-
-    active_states = [ARKState.DRAFT.value, ARKState.UPDATE.value, ARKState.PUBLISHED.value]
-    grouped = db.query(
-        ARKRecord.processing_stage,
-        ARKRecord.processing_status,
-        func.count(ARKRecord.id),
-        func.sum(case((or_(ARKRecord.processing_next_attempt_at.is_(None), ARKRecord.processing_next_attempt_at <= now), 1), else_=0)),
-        func.min(ARKRecord.created_at),
-        func.min(ARKRecord.updated_at),
-    ).filter(ARKRecord.state.in_(active_states)).group_by(
-        ARKRecord.processing_stage, ARKRecord.processing_status
-    ).all()
-    oldest_pending = {stage: None for stage in queues}
-    oldest_error = {stage: None for stage in errors}
-    for stage_value, status, count, ready, oldest_created, oldest_updated in grouped:
-        stage = code_label(stage_value, ProcessingStage) or "unknown"
-        if stage not in queues:
-            continue
-        count, ready = int(count or 0), int(ready or 0)
-        if int(status) == int(ProcessingStatus.PENDING):
-            queues[stage]["pending_total"] += count
-            queues[stage]["ready_now"] += ready
-            if oldest_created and (oldest_pending[stage] is None or oldest_created < oldest_pending[stage]):
-                oldest_pending[stage] = oldest_created
-        elif int(status) == int(ProcessingStatus.FAILED):
-            errors[stage]["permanent"] += count
-            if oldest_updated and (oldest_error[stage] is None or oldest_updated < oldest_error[stage]):
-                oldest_error[stage] = oldest_updated
-        elif int(status) == int(ProcessingStatus.RECOVERABLE):
-            errors[stage]["recoverable"] += count
-            if oldest_updated and (oldest_error[stage] is None or oldest_updated < oldest_error[stage]):
-                oldest_error[stage] = oldest_updated
-    for stage in queues:
-        queues[stage]["delayed_by_backoff"] = max(queues[stage]["pending_total"] - queues[stage]["ready_now"], 0)
-        queues[stage]["oldest_pending_at"] = _isoformat_or_none(oldest_pending[stage])
-        errors[stage]["oldest_error_at"] = _isoformat_or_none(oldest_error[stage])
-
-    return {
-        "queues": queues,
-        "errors": errors,
-        "by_state": by_state,
-    }
-
-
-def _serialize_worker_error(record: ARKRecord, metadata: ARKMetadata | None) -> Dict[str, Any]:
-    """Serialize one ARK worker error for operational review."""
-    return {
-        "ark": record.ark,
-        "naan": record.naan,
-        "name": record.name,
-        "state": record.state,
-        "status": _error_status(record),
-        "stage": _metadata_stage(record),
-        "authority_id": record.authority_id,
-        "target": record.target,
-        "retry_count": record.processing_attempt_count,
-        "permanent": record.processing_status == int(ProcessingStatus.FAILED),
-        "error": record.processing_error_detail,
-        "error_code": code_label(record.processing_error_code, ProcessingErrorCode),
-        "last_attempt_at": _isoformat_or_none(record.updated_at),
-        "created_at": _isoformat_or_none(record.created_at),
-        "updated_at": _isoformat_or_none(record.updated_at),
-        "metadata": {
-            "level1_cid": metadata.level1_cid if metadata else None,
-            "original_cid": metadata.original_cid if metadata else None,
-            "original_schema": metadata.original_schema if metadata else None,
-            "original_media_type": metadata.original_media_type if metadata else None,
-        },
-    }
-
-
-def _error_base_query(db: Session):
-    """Return the base query for active ARK rows that currently have worker errors."""
-    return (
-        db.query(ARKRecord, ARKMetadata)
-        .outerjoin(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
-        .filter(
-            ARKRecord.state.in_(
-                [ARKState.DRAFT.value, ARKState.UPDATE.value, ARKState.PUBLISHED.value]
-            ),
-            (ARKRecord.processing_status == int(ProcessingStatus.FAILED))
-            | (ARKRecord.processing_status == int(ProcessingStatus.RECOVERABLE)),
-        )
-    )
-
-
-def _apply_error_sql_filters(
-    query,
-    *,
-    list_type: str,
-    stage: str,
-    authority_id: str | None,
-):
-    """Apply DB-native filters shared by error listing and rescue."""
-    if list_type == "permanent":
-        query = query.filter(ARKRecord.processing_status == int(ProcessingStatus.FAILED))
-    elif list_type == "recoverable":
-        query = query.filter(
-            ARKRecord.processing_status == int(ProcessingStatus.RECOVERABLE),
-        )
-
-    if authority_id:
-        query = query.filter(ARKRecord.authority_id == authority_id)
-
-    if stage == "metadata":
-        query = query.filter(ARKRecord.processing_stage == int(ProcessingStage.METADATA))
-    elif stage == "availability":
-        query = query.filter(ARKRecord.processing_stage == int(ProcessingStage.AVAILABILITY))
-    elif stage == "chain":
-        query = query.filter(ARKRecord.processing_stage == int(ProcessingStage.CHAIN))
-    elif stage == "replication":
-        query = query.filter(ARKRecord.processing_stage == int(ProcessingStage.REPLICATION))
-
-    return query
-
-
-def _select_error_rows(
-    db: Session,
-    *,
-    list_type: str = "all",
-    stage: str = "all",
-    authority_id: str | None = None,
-    error_type: str = "all",
-    offset: int = 0,
-    limit: int | None = None,
-) -> list[tuple[ARKRecord, ARKMetadata | None]]:
-    """Select a bounded error page using database-native filters."""
-    query = _apply_error_sql_filters(
-        _error_base_query(db),
-        list_type=list_type,
-        stage=stage,
-        authority_id=authority_id,
-    )
-    if error_type != "all":
-        try:
-            code = ProcessingErrorCode[error_type.upper()]
-            query = query.filter(ARKRecord.processing_error_code == int(code))
-        except KeyError:
-            return []
-    query = query.order_by(ARKRecord.updated_at.desc(), ARKRecord.id.desc()).offset(offset)
-    if limit is not None:
-        query = query.limit(limit)
-    return query.all()
-
-
-def _build_errors_summary(rows: list[tuple[ARKRecord, ARKMetadata | None]]) -> Dict[str, Any]:
-    """Build a compact errors report from selected rows."""
-    summary = {"total": 0, "permanent": 0, "recoverable": 0}
-    by_stage = {
-        "metadata": {"total": 0, "permanent": 0, "recoverable": 0},
-        "availability": {"total": 0, "permanent": 0, "recoverable": 0},
-        "chain": {"total": 0, "permanent": 0, "recoverable": 0},
-        "replication": {"total": 0, "permanent": 0, "recoverable": 0},
-    }
-    by_type = {error_type: 0 for error_type in ERROR_TYPES}
-    by_authority: dict[str, int] = {}
-    oldest_error_at = None
-
-    for record, metadata in rows:
-        status = _error_status(record)
-        if status == "none":
-            continue
-
-        stage = _metadata_stage(record)
-        error_type = _classify_error_type(record, metadata)
-        summary["total"] += 1
-        summary[status] += 1
-        by_stage[stage]["total"] += 1
-        by_stage[stage][status] += 1
-        by_type[error_type] = by_type.get(error_type, 0) + 1
-        by_authority[record.authority_id] = by_authority.get(record.authority_id, 0) + 1
-
-        if record.updated_at and (oldest_error_at is None or record.updated_at < oldest_error_at):
-            oldest_error_at = record.updated_at
-
-    return {
-        "summary": summary,
-        "by_stage": by_stage,
-        "by_type": by_type,
-        "by_authority": by_authority,
-        "oldest_error_at": _isoformat_or_none(oldest_error_at),
-    }
-
-
-def _build_errors_summary_sql(
-    db: Session,
-    *,
-    stage: str = "all",
-    authority_id: str | None = None,
-    error_code: str = "all",
-) -> Dict[str, Any]:
-    """Build the default error summary with bounded aggregate queries."""
-    query = _apply_error_sql_filters(
-        _error_base_query(db), list_type="all", stage=stage, authority_id=authority_id
-    )
-    if error_code != "all":
-        try:
-            query = query.filter(
-                ARKRecord.processing_error_code == int(ProcessingErrorCode[error_code.upper()])
-            )
-        except KeyError:
-            query = query.filter(ARKRecord.id == -1)
-    active = query.subquery()
-    # Keep the summary deliberately small and stable: status/stage/code are
-    # fixed-cardinality dimensions, while individual ARKs remain paginated.
-    rows = db.query(
-        active.c.processing_status,
-        active.c.processing_stage,
-        active.c.processing_error_code,
-        func.count(active.c.id),
-        func.min(active.c.updated_at),
-    ).group_by(
-        active.c.processing_status,
-        active.c.processing_stage,
-        active.c.processing_error_code,
-    ).all()
-    summary = {"total": 0, "permanent": 0, "recoverable": 0}
-    by_stage = {
-        stage: {"total": 0, "permanent": 0, "recoverable": 0}
-        for stage in ("metadata", "availability", "chain", "replication")
-    }
-    by_code: dict[str, int] = {}
-    oldest = None
-    for status, stage_value, code, count, oldest_at in rows:
-        status_label = "permanent" if int(status) == int(ProcessingStatus.FAILED) else "recoverable"
-        stage = code_label(stage_value, ProcessingStage) or "unknown"
-        count = int(count or 0)
-        summary["total"] += count
-        summary[status_label] += count
-        if stage in by_stage:
-            by_stage[stage]["total"] += count
-            by_stage[stage][status_label] += count
-        code_name = code_label(code, ProcessingErrorCode) or "unknown"
-        by_code[code_name] = by_code.get(code_name, 0) + count
-        if oldest_at and (oldest is None or oldest_at < oldest):
-            oldest = oldest_at
-    return {
-        "summary": summary,
-        "by_stage": by_stage,
-        "by_code": by_code,
-        "oldest_error_at": _isoformat_or_none(oldest),
-    }
-
-
-def _round_or_none(value: float | None, digits: int = 3) -> float | None:
-    """Round a float for stable JSON output."""
-    return round(value, digits) if value is not None else None
-
-
-def _build_cadence_metrics(
-    record,
-    *,
-    page_size: int,
-    sleep_seconds: int,
-    rpc_retry_seconds: int | None = None,
-    congestion_retry_seconds: int | None = None,
-    storage_retry_seconds: int | None = None,
-    queue: Dict[str, Any],
-    running: bool,
-    stale: bool,
-    now: datetime,
-) -> Dict[str, Any]:
-    """Build worker cycle metrics for the continuous page loop."""
-    seconds_since_last_cycle = None
-    if record and record.last_cycle_at:
-        seconds_since_last_cycle = max((now - record.last_cycle_at).total_seconds(), 0.0)
-
-    duration = record.last_cycle_duration_seconds if record else None
-    utilization = None
-    if duration is not None and sleep_seconds > 0:
-        utilization = float(duration) / float(sleep_seconds)
-
-    ready_now = int(queue.get("ready_now") or 0)
-    safe_page_size = max(int(page_size or 0), 1)
-    ready_pages = ceil(ready_now / safe_page_size) if ready_now else 0
-    estimated_drain_seconds = ready_pages * sleep_seconds if ready_pages else 0
-    last_cycle_processed = record.last_cycle_processed if record else None
-    last_cycle_full_page = bool(
-        last_cycle_processed is not None and page_size > 0 and last_cycle_processed >= page_size
-    )
-    paused_rpc = bool(record and record.status == "PAUSED_RPC_UNAVAILABLE")
-    paused_chain = bool(
-        record and record.status in {"PAUSED_CHAIN_STALLED", "PAUSED_CHAIN_CONGESTED"}
-    )
-    paused_storage = bool(record and record.status == "PAUSED_STORAGE_UNAVAILABLE")
-    if paused_rpc:
-        next_action = "pause_rpc"
-        sleep_seconds_next = int(rpc_retry_seconds or sleep_seconds)
-    elif paused_chain:
-        next_action = "pause_chain"
-        sleep_seconds_next = int(congestion_retry_seconds or rpc_retry_seconds or sleep_seconds)
-    elif paused_storage:
-        next_action = "pause_storage"
-        sleep_seconds_next = int(storage_retry_seconds or sleep_seconds)
-    elif running and last_cycle_full_page:
-        next_action = "continue"
-        sleep_seconds_next = 0
-    else:
-        next_action = "sleep"
-        sleep_seconds_next = sleep_seconds
-
-    if record is None:
-        pressure = "unknown"
-    elif stale:
-        pressure = "stale"
-    elif paused_rpc:
-        pressure = "rpc_unavailable"
-    elif paused_chain:
-        pressure = "chain_congested"
-    elif paused_storage:
-        pressure = "storage_unavailable"
-    elif not running:
-        pressure = "stopped"
-    elif last_cycle_full_page:
-        pressure = "backlogged"
-    elif ready_now > safe_page_size:
-        pressure = "backlogged"
-    elif ready_now > 0:
-        pressure = "working"
-    else:
-        pressure = "idle"
-
-    return {
-        "page_size": page_size,
-        "sleep_seconds": sleep_seconds,
-        "rpc_retry_seconds": rpc_retry_seconds,
-        "congestion_retry_seconds": congestion_retry_seconds,
-        "storage_retry_seconds": storage_retry_seconds,
-        "last_cycle_duration_seconds": _round_or_none(duration),
-        "last_cycle_processed": last_cycle_processed,
-        "last_cycle_succeeded": record.last_cycle_succeeded if record else None,
-        "last_cycle_failed": record.last_cycle_failed if record else None,
-        "last_cycle_full_page": last_cycle_full_page,
-        "next_action": next_action,
-        "sleep_seconds_next": sleep_seconds_next,
-        "seconds_since_last_cycle": _round_or_none(seconds_since_last_cycle),
-        "cycle_utilization_ratio": _round_or_none(utilization),
-        "ready_pages": ready_pages,
-        "estimated_seconds_to_drain_ready": estimated_drain_seconds,
-        "pressure": pressure,
-    }
-
-
-def _build_runtime_status(
-    record,
-    worker_name: str,
-    enabled: bool,
-    stale_after: int,
-    now: datetime,
-    *,
-    page_size: int,
-    sleep_seconds: int,
-    rpc_retry_seconds: int | None = None,
-    congestion_retry_seconds: int | None = None,
-    storage_retry_seconds: int | None = None,
-    queue: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Build one worker runtime status block from DB heartbeat."""
-    if record is None:
-        return {
-            "enabled": enabled,
-            "running": False,
-            "status": "UNKNOWN",
-            "worker_name": worker_name,
-            "source": "db_heartbeat",
-            "message": "No worker heartbeat found",
-            "reconciliation": {
-                "last_run_at": None,
-                "checked": 0,
-                "repaired": 0,
-                "purged": 0,
-                "failed": 0,
-            },
-            "cadence": _build_cadence_metrics(
-                record,
-                page_size=page_size,
-                sleep_seconds=sleep_seconds,
-                rpc_retry_seconds=rpc_retry_seconds,
-                congestion_retry_seconds=congestion_retry_seconds,
-                storage_retry_seconds=storage_retry_seconds,
-                queue=queue,
-                running=False,
-                stale=False,
-                now=now,
-            ),
-        }
-
-    age_seconds = max((now - record.last_heartbeat_at).total_seconds(), 0.0)
-    stale = age_seconds > stale_after
-    active_states = {"STARTING", "RUNNING", "IDLE", "PAUSED_RPC_UNAVAILABLE"}
-    active_states.add("PAUSED_STORAGE_UNAVAILABLE")
-    active_states.update({"PAUSED_CHAIN_STALLED", "PAUSED_CHAIN_CONGESTED"})
-    running = (record.status in active_states) and (not stale)
-
-    return {
-        "enabled": True,
-        "running": running,
-        "stale": stale,
-        "status": record.status,
-        "worker_name": record.worker_name,
-        "instance_id": record.instance_id,
-        "host": record.host,
-        "pid": record.pid,
-        "heartbeat_age_seconds": age_seconds,
-        "stale_after_seconds": stale_after,
-        "last_heartbeat_at": _isoformat_or_none(record.last_heartbeat_at),
-        "started_at": _isoformat_or_none(record.started_at),
-        "last_cycle_at": _isoformat_or_none(record.last_cycle_at),
-        "cadence": _build_cadence_metrics(
-            record,
-            page_size=page_size,
-            sleep_seconds=sleep_seconds,
-            rpc_retry_seconds=rpc_retry_seconds,
-            congestion_retry_seconds=congestion_retry_seconds,
-            storage_retry_seconds=storage_retry_seconds,
-            queue=queue,
-            running=running,
-            stale=stale,
-            now=now,
-        ),
-        "stats": {
-            "total_processed": record.total_processed,
-            "total_succeeded": record.total_succeeded,
-            "total_failed": record.total_failed,
-            "total_permanent_failures": record.total_permanent_failures,
-        },
-        "reconciliation": {
-            "last_run_at": _isoformat_or_none(record.last_reconciliation_at),
-            "checked": record.last_reconciliation_checked,
-            "repaired": record.last_reconciliation_repaired,
-            "purged": record.last_reconciliation_purged,
-            "failed": record.last_reconciliation_failed,
-        },
+        "enabled": True, "alive": True,
+        "process_state": "SLEEPING" if sleeping else record.status if record.status in {"RUNNING", "STARTING"} else "RUNNING",
+        "activity": "sleeping_until_due" if sleeping else "working",
+        "wake_at": _iso(wake_at) if sleeping else None,
+        "wake_in_seconds": max(0, round((wake_at - now).total_seconds(), 1)) if sleeping and wake_at else 0,
+        "heartbeat_age_seconds": age,
+        "last_cycle_at": _iso(record.last_cycle_at),
+        "last_cycle": last_cycle,
+        "no_progress_cycles": no_progress_cycles,
+        "stalled_suspected": no_progress_cycles >= 3,
         "last_error": record.last_error,
-        "source": "db_heartbeat",
     }
 
 
-def _build_replication_queue_summary(
-    db: Session,
-    settings,
-    now: datetime,
-) -> Dict[str, Any]:
-    """Aggregate retained metadata whose replication check is pending or due."""
-    eligible = and_(
+def _workload(db: Session) -> dict[str, Any]:
+    """Bounded grouped SQL; process state is intentionally not inferred here."""
+    now = _now()
+    result = {
+        name: {
+            "ready_now": 0,
+            "waiting": 0,
+            "next_action_at": None,
+            "waiting_reasons": {},
+            "failed": 0,
+            "by_stage": {},
+        }
+        for name in WORKER_STAGES
+    }
+    owner = {int(stage): name for name, stages in WORKER_STAGES.items() for stage in stages}
+    due = case((ARKRecord.next_action_at <= now, 1), else_=0)
+    rows = db.query(ARKRecord.processing_stage, ARKRecord.processing_status, ARKRecord.processing_wait_reason, due, func.count(), func.min(ARKRecord.next_action_at)).filter(
+        ARKRecord.state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value, ARKState.PUBLISHED.value])
+    ).group_by(ARKRecord.processing_stage, ARKRecord.processing_status, ARKRecord.processing_wait_reason, due).all()
+    for stage, status, reason, is_due, count, earliest in rows:
+        name = owner.get(int(stage))
+        if not name:
+            continue
+        item = result[name]
+        stage_label = _label(stage, ProcessingStage)
+        stage_totals = item["by_stage"].setdefault(stage_label, {"ready_now": 0, "waiting": 0, "failed": 0})
+        if int(status) == int(ProcessingStatus.READY) or (
+            int(status) == int(ProcessingStatus.WAITING) and bool(is_due)
+        ):
+            item["ready_now"] += int(count)
+            stage_totals["ready_now"] += int(count)
+        elif int(status) == int(ProcessingStatus.WAITING):
+            item["waiting"] += int(count)
+            stage_totals["waiting"] += int(count)
+            label = _label(reason, ProcessingWaitReason)
+            item["waiting_reasons"][label] = item["waiting_reasons"].get(label, 0) + int(count)
+            if earliest and (item["next_action_at"] is None or earliest < item["next_action_at"]):
+                item["next_action_at"] = earliest
+        elif int(status) == int(ProcessingStatus.FAILED):
+            item["failed"] += int(count)
+            stage_totals["failed"] += int(count)
+    for item in result.values():
+        # Keep the legacy alias while exposing the unambiguous name used by
+        # the dashboard and new clients.
+        item["ready"] = item["ready_now"]
+        item["next_action_at"] = _iso(item["next_action_at"])
+    critical_metadata = db.query(func.count()).select_from(ARKRecord).filter(
+        ARKRecord.processing_stage == int(ProcessingStage.METADATA),
+        ARKRecord.processing_status.in_([
+            int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)
+        ]),
+    ).scalar() or 0
+    critical_availability = db.query(func.count()).select_from(ARKRecord).join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id).filter(
+        ARKRecord.processing_stage == int(ProcessingStage.AVAILABILITY),
+        ARKRecord.processing_status.in_([
+            int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)
+        ]),
         ARKMetadata.level1_cid.isnot(None),
         ARKMetadata.original_cid.isnot(None),
+    ).scalar() or 0
+    published_replication = db.query(func.count()).select_from(ARKRecord).filter(
+        ARKRecord.state == ARKState.PUBLISHED.value,
+        ARKRecord.processing_stage == int(ProcessingStage.REPLICATION),
+        ARKRecord.processing_status.in_([
+            int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)
+        ]),
+    ).scalar() or 0
+    result["replication"]["maintenance_ready"] = int(published_replication)
+    result["replication"]["maintenance_blocked_by"] = (
+        "metadata_backlog" if critical_metadata else
+        "first_pin_backlog" if critical_availability else None
     )
-    retained = or_(
-        ARKMetadata.level1_json.isnot(None),
-        ARKMetadata.original_content.isnot(None),
-    )
-    cutoff = now - timedelta(seconds=max(int(settings.replication_worker_recheck_seconds), 0))
-    due = or_(
-        ARKMetadata.replication_checked_at.is_(None),
-        ARKMetadata.replication_checked_at <= cutoff,
-    )
-    pending, ready, errors, oldest = db.query(
-        func.sum(case((and_(eligible, retained), 1), else_=0)),
-        func.sum(case((and_(eligible, retained, due), 1), else_=0)),
-        func.sum(
-            case(
-                (
-                    and_(
-                        eligible,
-                        retained,
-                        ARKMetadata.replication_last_error.isnot(None),
-                    ),
-                    1,
-                ),
-                else_=0,
-            )
-        ),
-        func.min(
-            case(
-                (
-                    and_(eligible, retained),
-                    func.coalesce(
-                        ARKMetadata.replication_checked_at,
-                        ARKMetadata.created_at,
-                    ),
-                ),
-                else_=None,
-            )
-        ),
-    ).one()
-    pending_total = int(pending or 0)
-    ready_now = int(ready or 0)
-    return {
-        "pending_total": pending_total,
-        "retained_total": pending_total,
-        "ready_now": ready_now,
-        "delayed_by_backoff": max(pending_total - ready_now, 0),
-        "errors": int(errors or 0),
-        "oldest_pending_at": _isoformat_or_none(oldest),
-    }
+    return result
 
 
-def _build_recovery_queue_summary(db: Session, now: datetime) -> Dict[str, Any]:
-    """Count low-priority recovery candidates without external calls."""
-    pending, ready = db.query(
-        func.count(ARKRecord.id),
-        func.sum(
-            case(
-                (
-                    or_(
-                        ARKRecord.processing_next_attempt_at.is_(None),
-                        ARKRecord.processing_next_attempt_at <= now,
-                    ),
-                    1,
-                ),
-                else_=0,
-            )
-        ),
-    ).filter(ARKRecord.processing_status == int(ProcessingStatus.RECOVERABLE)).one()
-    total = int(pending or 0)
-    return {
-        "pending_total": total,
-        "ready_now": int(ready or 0),
-        "delayed_by_backoff": max(total - int(ready or 0), 0),
-        "oldest_pending_at": None,
-    }
+def _errors_summary(db: Session) -> dict[str, Any]:
+    rows = db.query(ARKRecord.processing_stage, ARKRecord.processing_error_code, func.count()).filter(
+        ARKRecord.processing_status == int(ProcessingStatus.FAILED)
+    ).group_by(ARKRecord.processing_stage, ARKRecord.processing_error_code).all()
+    by_stage, by_code = {}, {}
+    for stage, code, count in rows:
+        stage_label, code_label_value = _label(stage, ProcessingStage), _label(code, ProcessingErrorCode)
+        by_stage[stage_label] = by_stage.get(stage_label, 0) + int(count)
+        by_code[code_label_value] = by_code.get(code_label_value, 0) + int(count)
+    return {"total": sum(by_stage.values()), "by_stage": by_stage, "by_code": by_code}
 
 
-def _build_full_status(db: Session) -> Dict[str, Any]:
-    """Build the full worker status payload used for detailed debugging."""
+def _simple_status(db: Session) -> dict[str, Any]:
+    settings, now = get_settings(), _now()
+    config = _config(settings)
+    runtime = WorkerRuntimeRepository(db).get_by_names(tuple(value["name"] for value in config.values()))
+    workers = {name: _process(runtime.get(value["name"]), value, now, settings.worker_heartbeat_stale_after_seconds) for name, value in config.items()}
+    states = {value["process_state"] for value in workers.values() if value["enabled"]}
+    stalled = any(worker.get("stalled_suspected") for worker in workers.values())
+    overall = "down" if states and states <= {"DOWN"} else "degraded" if states & {"DOWN", "PAUSED"} or stalled else "ok"
+    return {"overall": overall, "source": "db_heartbeat", "workers": workers}
+
+
+@router.get("/status", response_model=dict[str, Any])
+def get_worker_status(detail: str = Query("simple", pattern="^(simple|workload|infrastructure|full)$"), db: Session = Depends(get_db)) -> dict[str, Any]:
+    """Return cheap heartbeats, bounded SQL workload, infrastructure, or both."""
     settings = get_settings()
-    now = _utc_now()
-    queue_summary = _build_queue_summary(db, settings, now)
-    queue_summary["queues"]["replication"] = _build_replication_queue_summary(db, settings, now)
-    queue_summary["queues"]["recovery"] = _build_recovery_queue_summary(db, now)
-    config_summary = _build_worker_config(settings)
-    chain_capacity = _build_chain_capacity_summary(settings)
-    repo = WorkerRuntimeRepository(db)
-    stale_after = settings.worker_heartbeat_stale_after_seconds
-
-    runtime_records = repo.get_by_names(
-        (
-            settings.metadata_worker_runtime_name,
-            settings.replication_worker_runtime_name,
-            settings.chain_worker_runtime_name,
-            settings.recovery_worker_runtime_name,
-        )
-    )
-    metadata_record = runtime_records.get(settings.metadata_worker_runtime_name)
-    replication_record = runtime_records.get(settings.replication_worker_runtime_name)
-    chain_record = runtime_records.get(settings.chain_worker_runtime_name)
-    recovery_record = runtime_records.get(settings.recovery_worker_runtime_name)
-    metadata_status = _build_runtime_status(
-        metadata_record,
-        settings.metadata_worker_runtime_name,
-        settings.metadata_worker_enabled,
-        stale_after,
-        now,
-        page_size=settings.metadata_worker_page_size,
-        sleep_seconds=settings.metadata_worker_sleep_seconds,
-        storage_retry_seconds=settings.metadata_worker_storage_retry_seconds,
-        queue=queue_summary["queues"]["metadata"],
-    )
-    chain_status = _build_runtime_status(
-        chain_record,
-        settings.chain_worker_runtime_name,
-        settings.chain_worker_enabled,
-        stale_after,
-        now,
-        page_size=settings.chain_worker_page_size,
-        sleep_seconds=settings.chain_worker_sleep_seconds,
-        rpc_retry_seconds=settings.chain_worker_rpc_retry_seconds,
-        congestion_retry_seconds=settings.chain_worker_congestion_retry_seconds,
-        queue=queue_summary["queues"]["chain"],
-    )
-    replication_status = _build_runtime_status(
-        replication_record,
-        settings.replication_worker_runtime_name,
-        settings.replication_worker_enabled,
-        stale_after,
-        now,
-        page_size=settings.replication_worker_page_size,
-        sleep_seconds=settings.replication_worker_sleep_seconds,
-        storage_retry_seconds=settings.replication_worker_storage_retry_seconds,
-        queue=queue_summary["queues"]["replication"],
-    )
-    recovery_status = _build_runtime_status(
-        recovery_record,
-        settings.recovery_worker_runtime_name,
-        settings.recovery_worker_enabled,
-        stale_after,
-        now,
-        page_size=settings.recovery_worker_page_size,
-        sleep_seconds=settings.recovery_worker_sleep_seconds,
-        queue=queue_summary["queues"]["recovery"],
-    )
-    chain_status["cadence"]["effective_page_size_recommended"] = chain_capacity[
-        "recommended_page_size"
-    ]
-
-    metadata_state = _state_from_worker_status(metadata_status, queue_summary["queues"]["metadata"])
-    replication_state = _state_from_worker_status(
-        replication_status, queue_summary["queues"]["replication"]
-    )
-    chain_state = _state_from_worker_status(chain_status, queue_summary["queues"]["chain"])
-    metadata_status["state"] = metadata_state
-    metadata_status["activity"] = (
-        metadata_state if metadata_state in {"idle", "working", "backlogged", "delayed"} else None
-    )
-    chain_status["state"] = chain_state
-    chain_status["activity"] = (
-        chain_state if chain_state in {"idle", "working", "backlogged", "delayed"} else None
-    )
-    replication_status["state"] = replication_state
-    replication_status["activity"] = (
-        replication_state
-        if replication_state in {"idle", "working", "backlogged", "delayed"}
-        else None
-    )
-    recovery_state = _state_from_worker_status(recovery_status, queue_summary["queues"]["recovery"])
-    recovery_status["state"] = recovery_state
-    recovery_status["activity"] = recovery_state if recovery_state in {"idle", "working", "backlogged", "delayed"} else None
-
-    rpc_status = check_rpc_health()
-    storage_status = check_metadata_storage_health()
-    error_totals = _build_error_totals(queue_summary["errors"])
-    queue_totals = _build_queue_totals(queue_summary["queues"])
-    worker_states = {metadata_state, replication_state, chain_state, recovery_state}
-    overall = _derive_overall_status(worker_states, error_totals, rpc_status, storage_status)
-    replication = _build_replication_summary(db, replication_record)
-
-    response = {
-        "overall": overall,
-        "message": _build_status_message(
-            {
-                "metadata": _simple_worker_status(
-                    metadata_status, queue_summary["queues"]["metadata"]
-                ),
-                "replication": _simple_worker_status(
-                    replication_status, queue_summary["queues"]["replication"]
-                ),
-                "chain": _simple_worker_status(chain_status, queue_summary["queues"]["chain"]),
-                "recovery": _simple_worker_status(recovery_status, queue_summary["queues"]["recovery"]),
-            },
-            error_totals,
-            rpc_status,
-            storage_status,
-        ),
-        "rpc": rpc_status,
-        "storage": storage_status,
-        "chain_capacity": chain_capacity,
-        "workers": {
-            "metadata": metadata_status,
-            "replication": replication_status,
-            "chain": chain_status,
-            "recovery": recovery_status,
-        },
-        "queues": {
-            **queue_summary["queues"],
-            "total": queue_totals,
-        },
-        "errors": {
-            **queue_summary["errors"],
-            "total": error_totals,
-        },
-        "by_state": queue_summary["by_state"],
-        "config": config_summary,
-        "replication": replication,
-    }
+    response = _simple_status(db)
+    if detail in {"workload", "full"}:
+        response["workload"] = _workload(db)
+        response["errors"] = _errors_summary(db)
+        response["configuration"] = {
+            "replication": {
+                "page_size": settings.replication_worker_page_size,
+                "status_batch_size": settings.replication_status_batch_size,
+                "idle_sleep_seconds": settings.replication_idle_sleep_seconds,
+                "publish_after_replicas": settings.replication_publish_after_replicas,
+                "target_replicas": settings.replication_target_replicas,
+            }
+        }
+    if detail in {"infrastructure", "full"}:
+        response["infrastructure"] = {"rpc": check_rpc_health(), "storage": check_metadata_storage_health()}
     return response
 
 
-def _state_from_worker_status(status: Dict[str, Any], queue: Dict[str, Any]) -> str:
-    """Derive a compact human-facing worker state."""
-    if not status.get("enabled", False):
-        return "disabled"
-    if status.get("status") == "UNKNOWN":
-        return "unknown"
-    if status.get("stale", False):
-        return "stale"
-    if status.get("status") == "ERROR":
-        return "error"
-    if status.get("status") == "PAUSED_RPC_UNAVAILABLE":
-        return "paused_rpc_unavailable"
-    if status.get("status") == "PAUSED_CHAIN_STALLED":
-        return "paused_chain_stalled"
-    if status.get("status") == "PAUSED_CHAIN_CONGESTED":
-        return "paused_chain_congested"
-    if status.get("status") == "PAUSED_STORAGE_UNAVAILABLE":
-        return "paused_storage_unavailable"
-    if not status.get("running", False):
-        return "stopped"
-
-    pending = int(queue.get("pending_total") or 0)
-    ready = int(queue.get("ready_now") or 0)
-    delayed = int(queue.get("delayed_by_backoff") or 0)
-    page_size = int((status.get("cadence") or {}).get("page_size") or 1)
-
-    if pending > 0 and ready == 0 and delayed > 0:
-        return "delayed"
-    if ready > page_size:
-        return "backlogged"
-    if ready > 0 or int((status.get("cadence") or {}).get("last_cycle_processed") or 0) > 0:
-        return "working"
-    return "idle"
-
-
-def _simple_worker_status(
-    status: Dict[str, Any],
-    queue: Dict[str, Any],
-) -> Dict[str, Any]:
-    """Reduce a detailed worker status block to the operational essentials."""
-    cadence = status.get("cadence") or {}
-    state = status.get("state") or _state_from_worker_status(status, queue)
-    alive = bool(status.get("running", False))
-    return {
-        "enabled": bool(status.get("enabled", False)),
-        "state": state,
-        "activity": state if state in {"idle", "working", "backlogged", "delayed"} else None,
-        "status": "running" if alive else state,
-        "alive": alive,
-        "last_heartbeat_seconds": (
-            int(round(status["heartbeat_age_seconds"]))
-            if status.get("heartbeat_age_seconds") is not None
-            else None
-        ),
-        "last_cycle": {
-            "processed": cadence.get("last_cycle_processed"),
-            "succeeded": cadence.get("last_cycle_succeeded"),
-            "failed": cadence.get("last_cycle_failed"),
-            "duration_seconds": cadence.get("last_cycle_duration_seconds"),
-            "page_size": cadence.get("page_size"),
-            "full_page": cadence.get("last_cycle_full_page"),
-            "next_action": cadence.get("next_action"),
-        },
-        "queue": {
-            "pending": int(queue.get("pending_total") or 0),
-            "ready": int(queue.get("ready_now") or 0),
-            "delayed": int(queue.get("delayed_by_backoff") or 0),
-        },
-    }
-
-
-def _build_error_totals(errors: Dict[str, Any]) -> Dict[str, int]:
-    """Aggregate stage error counters."""
-    return {
-        "recoverable": sum(int(errors[stage]["recoverable"] or 0) for stage in errors),
-        "permanent": sum(int(errors[stage]["permanent"] or 0) for stage in errors),
-    }
-
-
-def _build_queue_totals(queues: Dict[str, Any]) -> Dict[str, int]:
-    """Aggregate stage queue counters."""
-    return {
-        "pending": sum(int(queue["pending_total"] or 0) for queue in queues.values()),
-        "ready": sum(int(queue["ready_now"] or 0) for queue in queues.values()),
-        "delayed": sum(int(queue["delayed_by_backoff"] or 0) for queue in queues.values()),
-    }
-
-
-def _derive_overall_status(
-    worker_states: set[str],
-    error_summary: Dict[str, int],
-    rpc: Dict[str, Any],
-    storage: Dict[str, Any],
-) -> str:
-    """Derive overall health from workers, RPC, and blocked ARKs."""
-    hard_failure_states = {"unknown", "stale", "error", "stopped"}
-    degraded_states = {
-        "paused_rpc_unavailable",
-        "paused_storage_unavailable",
-        "paused_chain_stalled",
-        "paused_chain_congested",
-        "backlogged",
-    }
-    if worker_states and worker_states.issubset(hard_failure_states | {"disabled"}):
-        return "down"
-    if (
-        worker_states & hard_failure_states
-        or worker_states & degraded_states
-        or error_summary["permanent"] > 0
-        or not rpc["available"]
-        or not storage["available"]
-    ):
-        return "degraded"
-    return "ok"
-
-
-def _build_status_message(
-    workers: Dict[str, Any],
-    error_summary: Dict[str, int],
-    rpc: Dict[str, Any],
-    storage: Dict[str, Any],
-) -> str:
-    """Build a compact operational message from worker and error blocks."""
-    labels = {
-        "metadata": "Metadata worker",
-        "replication": "Replication worker",
-        "chain": "Chain worker",
-        "recovery": "Recovery worker",
-    }
-    parts = []
-    for key in ("metadata", "replication", "chain", "recovery"):
-        if key not in workers:
-            continue
-        worker = workers[key]
-        state = worker["state"]
-        pending = worker["queue"]["pending"]
-        if state == "paused_rpc_unavailable":
-            parts.append(f"{labels[key]} is paused because RPC is unavailable")
-        elif state == "paused_chain_stalled":
-            parts.append(f"{labels[key]} is paused because block production is stalled")
-        elif state == "paused_chain_congested":
-            parts.append(f"{labels[key]} is paused because chain congestion is suspected")
-        elif state == "paused_storage_unavailable":
-            parts.append(f"{labels[key]} is paused because metadata storage is unavailable")
-        elif state in {"unknown", "stale", "error", "stopped", "disabled"}:
-            parts.append(f"{labels[key]} is {state}")
-        elif pending > 0:
-            parts.append(f"{labels[key]} is {state} with {pending} pending")
-        else:
-            parts.append(f"{labels[key]} is {state}")
-    if error_summary["permanent"] > 0:
-        parts.append(f"{error_summary['permanent']} permanent ARK errors require review")
-    if error_summary["recoverable"] > 0:
-        parts.append(f"{error_summary['recoverable']} ARKs await recovery")
-    if not rpc["available"]:
-        parts.append("RPC is unavailable")
-    if not storage["available"]:
-        parts.append("metadata storage is unavailable")
-    return "; ".join(parts) + "."
-
-
-def _build_lightweight_status(db: Session) -> Dict[str, Any]:
-    """Build the default status from worker heartbeat rows only.
-
-    This path deliberately avoids ARK/metadata counts and all RPC or storage
-    calls so monitoring cannot make the API depend on external services.
-    """
-    settings = get_settings()
-    now = _utc_now()
-    stale_after = settings.worker_heartbeat_stale_after_seconds
-    repo = WorkerRuntimeRepository(db)
-    records = repo.get_by_names(
-        (
-            settings.metadata_worker_runtime_name,
-            settings.replication_worker_runtime_name,
-            settings.chain_worker_runtime_name,
-            settings.recovery_worker_runtime_name,
-        )
-    )
-
-    definitions = {
-        "metadata": {
-            "name": settings.metadata_worker_runtime_name,
-            "enabled": settings.metadata_worker_enabled,
-            "page_size": settings.metadata_worker_page_size,
-            "sleep_seconds": settings.metadata_worker_sleep_seconds,
-            "storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
-        },
-        "replication": {
-            "name": settings.replication_worker_runtime_name,
-            "enabled": settings.replication_worker_enabled,
-            "page_size": settings.replication_worker_page_size,
-            "sleep_seconds": settings.replication_worker_sleep_seconds,
-            "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
-        },
-        "chain": {
-            "name": settings.chain_worker_runtime_name,
-            "enabled": settings.chain_worker_enabled,
-            "page_size": settings.chain_worker_page_size,
-            "sleep_seconds": settings.chain_worker_sleep_seconds,
-            "rpc_retry_seconds": settings.chain_worker_rpc_retry_seconds,
-            "congestion_retry_seconds": settings.chain_worker_congestion_retry_seconds,
-        },
-        "recovery": {
-            "name": settings.recovery_worker_runtime_name,
-            "enabled": settings.recovery_worker_enabled,
-            "page_size": settings.recovery_worker_page_size,
-            "sleep_seconds": settings.recovery_worker_sleep_seconds,
-        },
-    }
-
-    workers: Dict[str, Any] = {}
-    for kind, definition in definitions.items():
-        record = records.get(definition["name"])
-        runtime = _build_runtime_status(
-            record,
-            definition["name"],
-            definition["enabled"],
-            stale_after,
-            now,
-            page_size=definition["page_size"],
-            sleep_seconds=definition["sleep_seconds"],
-            rpc_retry_seconds=definition.get("rpc_retry_seconds"),
-            congestion_retry_seconds=definition.get("congestion_retry_seconds"),
-            storage_retry_seconds=definition.get("storage_retry_seconds"),
-            queue=_empty_queue(),
-        )
-        state = _state_from_worker_status(runtime, _empty_queue())
-        runtime["state"] = state
-        simple = _simple_worker_status(runtime, _empty_queue())
-        simple.pop("queue", None)
-        simple["last_error"] = runtime.get("last_error")
-        workers[kind] = simple
-
-    worker_states = {worker["state"] for worker in workers.values()}
-    hard_failure_states = {"unknown", "stale", "error", "stopped"}
-    degraded_states = {
-        "paused_rpc_unavailable",
-        "paused_storage_unavailable",
-        "paused_chain_stalled",
-        "paused_chain_congested",
-    }
-    enabled_states = worker_states - {"disabled"}
-    if enabled_states and enabled_states.issubset(hard_failure_states):
-        overall = "down"
-    elif worker_states & (hard_failure_states | degraded_states):
-        overall = "degraded"
-    else:
-        overall = "ok"
-
-    message_workers = {
-        kind: {**worker, "queue": {"pending": 0, "ready": 0, "delayed": 0}}
-        for kind, worker in workers.items()
-    }
-    message = _build_status_message(
-        message_workers,
-        {"recoverable": 0, "permanent": 0},
-        {"available": True},
-        {"available": True},
-    )
-    return {
-        "overall": overall,
-        "message": message,
-        "source": "db_heartbeat",
-        "workers": workers,
-    }
-
-
-def _replication_state(metadata: ARKMetadata) -> str:
-    """Derive the operational state without persisting a state machine."""
-    retained = metadata.level1_json is not None or metadata.original_content is not None
-    if not retained:
-        return "complete"
-    if metadata.replication_last_error:
-        return "error"
-    if metadata.level1_replica_count <= 0 or metadata.level2_replica_count <= 0:
-        return "degraded"
-    return "pending"
-
-
-def _build_replication_summary(db: Session, metadata_runtime) -> Dict[str, Any]:
-    """Aggregate the minimal persisted reconciliation state."""
-    eligible = and_(
-        ARKMetadata.level1_cid.isnot(None),
-        ARKMetadata.original_cid.isnot(None),
-    )
-    retained = or_(
-        ARKMetadata.level1_json.isnot(None),
-        ARKMetadata.original_content.isnot(None),
-    )
-    has_error = ARKMetadata.replication_last_error.isnot(None)
-    degraded = or_(
-        ARKMetadata.level1_replica_count <= 0,
-        ARKMetadata.level2_replica_count <= 0,
-    )
-    aggregate = db.query(
-        func.sum(case((and_(eligible, ~retained), 1), else_=0)),
-        func.sum(case((and_(eligible, retained, has_error), 1), else_=0)),
-        func.sum(case((and_(eligible, retained, ~has_error, degraded), 1), else_=0)),
-        func.sum(case((and_(eligible, retained, ~has_error, ~degraded), 1), else_=0)),
-        func.sum(case((and_(eligible, retained), 1), else_=0)),
-        func.min(
-            case(
-                (
-                    and_(eligible, retained),
-                    func.coalesce(
-                        ARKMetadata.replication_checked_at,
-                        ARKMetadata.created_at,
-                    ),
-                ),
-                else_=None,
-            )
-        ),
-    ).one()
-    complete_count, error_count, degraded_count, pending_count, retained_count, oldest_pending = (
-        aggregate
-    )
-    return {
-        "pending": int(pending_count or 0),
-        "complete": int(complete_count or 0),
-        "degraded": int(degraded_count or 0),
-        "error": int(error_count or 0),
-        "retained_payloads": int(retained_count or 0),
-        "oldest_pending_at": _isoformat_or_none(oldest_pending),
-        "last_cycle": {
-            "at": _isoformat_or_none(
-                metadata_runtime.last_reconciliation_at if metadata_runtime else None
-            ),
-            "checked": metadata_runtime.last_reconciliation_checked if metadata_runtime else 0,
-            "repaired": metadata_runtime.last_reconciliation_repaired if metadata_runtime else 0,
-            "purged": metadata_runtime.last_reconciliation_purged if metadata_runtime else 0,
-            "failed": metadata_runtime.last_reconciliation_failed if metadata_runtime else 0,
-        },
-    }
-
-
-@router.get("/status", response_model=Dict[str, Any])
-def get_worker_status(
-    detail: str = Query(
-        default="simple",
-        pattern="^(simple|full)$",
-        description="Use detail=full for the complete debug payload.",
-    ),
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    """
-    Get worker status using DB heartbeat.
-
-    By default this returns a compact operational summary. Use `detail=full`
-    to inspect the full heartbeat, queue, cadence, config, and host/process
-    fields.
-    """
-    if detail == "full":
-        return _build_full_status(db)
-    return _build_lightweight_status(db)
-
-
-@router.get("/replication", response_model=Dict[str, Any])
-async def get_replication_queue(
-    state: str = Query(default="all", pattern="^(all|pending|complete|degraded|error)$"),
-    limit: int = Query(default=100, ge=1, le=500),
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    """List the last observed L1/L2 replica counts for operational inspection."""
-    query = db.query(ARKRecord, ARKMetadata).join(
-        ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id
-    ).filter(ARKMetadata.level1_cid.isnot(None), ARKMetadata.original_cid.isnot(None))
-    retained = or_(ARKMetadata.level1_json.isnot(None), ARKMetadata.original_content.isnot(None))
-    if state == "complete":
-        query = query.filter(~retained)
-    elif state == "error":
-        query = query.filter(retained, ARKMetadata.replication_last_error.isnot(None))
-    elif state == "degraded":
-        query = query.filter(retained, ARKMetadata.replication_last_error.is_(None), or_(ARKMetadata.level1_replica_count <= 0, ARKMetadata.level2_replica_count <= 0))
-    elif state == "pending":
-        query = query.filter(retained, ARKMetadata.replication_last_error.is_(None), ARKMetadata.level1_replica_count > 0, ARKMetadata.level2_replica_count > 0)
-    rows = query.order_by(
-        ARKMetadata.replication_checked_at.asc().nullsfirst(), ARKMetadata.id.asc()
-    ).limit(limit).all()
-    items = []
-    for record, metadata in rows:
-        item_state = _replication_state(metadata)
-        if state != "all" and item_state != state:
-            continue
-        items.append(
-            {
-                "ark": record.ark,
-                "state": item_state,
-                "payload_retained": (
-                    metadata.level1_json is not None or metadata.original_content is not None
-                ),
-                "level1": {
-                    "cid": metadata.level1_cid,
-                    "replicas": metadata.level1_replica_count,
-                },
-                "level2": {
-                    "cid": metadata.original_cid,
-                    "replicas": metadata.level2_replica_count,
-                },
-                "checked_at": _isoformat_or_none(metadata.replication_checked_at),
-                "last_error": metadata.replication_last_error,
-            }
-        )
-    return {"items": items, "count": len(items), "limit": limit, "state": state}
-
-
-@router.get("/errors", response_model=Dict[str, Any])
-async def get_worker_errors(
-    list_type: str | None = Query(
-        default=None,
-        alias="list",
-        pattern="^(permanent|recoverable|all)$",
-        description="When omitted, return a compact summary. Use permanent/recoverable/all to list rows.",
-    ),
-    stage: str = Query(
-        default="all",
-        pattern="^(all|metadata|availability|chain|replication)$",
-        description="Filter by inferred failed stage.",
-    ),
-    authority_id: str | None = Query(
-        default=None,
-        description="Filter errors by authority UUID.",
-    ),
-    error_code: str = Query(
-        default="all",
-        pattern="^(all|[a-z0-9_]+)$",
-        description="Filter by persisted processing error code.",
-    ),
-    page: int = Query(
-        default=1,
-        ge=1,
-        description="1-based page number.",
-    ),
-    page_size: int = Query(
-        default=50,
-        ge=1,
-        le=200,
-        description="Items per page.",
-    ),
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    """
-    Summarize or list ARK worker errors for operational review.
-
-    By default this endpoint returns a compact report. Use `list=permanent`,
-    `list=recoverable`, or `list=all` to request paginated rows.
-    """
-    resolved_list_type = list_type or "all"
-    filters = {
-        "list": list_type,
-        "stage": stage,
-        "authority_id": authority_id,
-        "error_code": error_code,
-    }
-
-    if list_type is None:
-        return {
-            "filters": filters,
-            **_build_errors_summary_sql(
-                db, stage=stage, authority_id=authority_id, error_code=error_code
-            ),
-        }
-
-    base_query = _apply_error_sql_filters(
-        _error_base_query(db),
-        list_type=resolved_list_type,
-        stage=stage,
-        authority_id=authority_id,
-    )
+@router.get("/errors", response_model=dict[str, Any])
+def get_worker_errors(
+    stage: str = Query("all", pattern="^(all|metadata|availability|chain|replication)$"),
+    authority_id: str | None = None,
+    error_code: str = Query("all", pattern="^(all|[a-z0-9_]+)$"),
+    page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=200), db: Session = Depends(get_db),
+) -> dict[str, Any]:
+    """Only permanent failures are errors; normal waits are not listed here."""
+    query = db.query(ARKRecord, ARKMetadata).outerjoin(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id).filter(ARKRecord.processing_status == int(ProcessingStatus.FAILED))
+    if stage != "all": query = query.filter(ARKRecord.processing_stage == int(ProcessingStage[stage.upper()]))
+    if authority_id: query = query.filter(ARKRecord.authority_id == authority_id)
     if error_code != "all":
-        try:
-            base_query = base_query.filter(
-                ARKRecord.processing_error_code == int(ProcessingErrorCode[error_code.upper()])
-            )
-        except KeyError:
-            base_query = base_query.filter(ARKRecord.id == -1)
-    total = base_query.count()
-    total_pages = ceil(total / page_size) if total else 0
-    offset = (page - 1) * page_size
-    page_rows = _select_error_rows(
-        db,
-        list_type=resolved_list_type,
-        stage=stage,
-        authority_id=authority_id,
-        error_type=error_code,
-        offset=offset,
-        limit=page_size,
-    )
-
-    return {
-        "filters": filters,
-        "pagination": {
-            "page": page,
-            "page_size": page_size,
-            "total": total,
-            "total_pages": total_pages,
-            "has_next": page < total_pages,
-            "has_previous": page > 1 and total > 0,
-        },
-        "items": [_serialize_worker_error(record, metadata) for record, metadata in page_rows],
-    }
+        query = query.filter(ARKRecord.processing_error_code == int(ProcessingErrorCode[error_code.upper()])) if error_code.upper() in ProcessingErrorCode.__members__ else query.filter(ARKRecord.id == -1)
+    total = query.count()
+    rows = query.order_by(ARKRecord.updated_at.desc(), ARKRecord.id.desc()).offset((page - 1) * page_size).limit(page_size).all()
+    return {"summary": _errors_summary(db), "pagination": {"page": page, "page_size": page_size, "total": total, "total_pages": ceil(total / page_size) if total else 0}, "items": [{"ark": r.ark, "public_state": r.state, "stage": _label(r.processing_stage, ProcessingStage), "error_code": _label(r.processing_error_code, ProcessingErrorCode), "detail": r.processing_error_detail, "attempts": r.processing_attempt_count, "updated_at": _iso(r.updated_at), "level1_cid": m.level1_cid if m else None, "level2_cid": m.original_cid if m else None} for r, m in rows]}
 
 
-@router.post("/recovery", response_model=Dict[str, Any])
-async def approve_recovery(
-    request: RecoveryRequest,
-    cert_info: dict = Depends(require_mtls),
-) -> Dict[str, Any]:
-    """Approve explicit permanent failures for low-priority automatic recovery."""
-    outcomes: list[dict[str, str]] = []
-    identity = (cert_info or {}).get("dn", "local-development")
+@router.post("/retry", response_model=dict[str, Any])
+def retry_failed_arks(request: RetryRequest, cert_info: dict = Depends(require_mtls)) -> dict[str, Any]:
+    """Explicitly return a permanent failure to READY in its current stage."""
+    identity, outcomes = (cert_info or {}).get("dn", "local-development"), []
     for ark in dict.fromkeys(request.arks):
-        with acquire_ark_lock(ark) as locked_db:
-            if locked_db is None:
-                outcomes.append({"ark": ark, "status": "locked"})
-                continue
-            repo = ARKRepository(locked_db)
-            record = repo.get_by_ark(ark)
-            if record is None:
-                outcomes.append({"ark": ark, "status": "not_found"})
-                continue
-            if record.state == ARKState.RESERVED.value:
-                outcomes.append({"ark": ark, "status": "reserved"})
-                continue
-            if record.state == ARKState.TOMBSTONE.value:
-                outcomes.append({"ark": ark, "status": "tombstoned"})
-                continue
-            if record.processing_status == int(ProcessingStatus.RECOVERABLE):
-                outcomes.append({"ark": ark, "status": "already_recoverable"})
-                continue
-            if record.processing_status != int(ProcessingStatus.FAILED):
-                outcomes.append({"ark": ark, "status": "not_failed"})
-                continue
-            record.processing_status = int(ProcessingStatus.RECOVERABLE)
-            record.processing_attempt_count = 0
-            record.processing_next_attempt_at = _utc_now()
-            record.updated_at = _utc_now()
-            locked_db.commit()
-            outcomes.append({"ark": ark, "status": "accepted"})
-            logger.info(
-                "Administrative recovery approved by %s for %s: %s",
-                identity,
-                ark,
-                request.reason or "no reason supplied",
-            )
-    return {
-        "requested": len(request.arks),
-        "reason": request.reason,
-        "items": outcomes,
-    }
-
-
-def _rescue_operation_for_row(record: ARKRecord, metadata: ARKMetadata) -> ARKPublishOperation:
-    """Build the semantic core-lib operation used by rescue."""
-    action = "create" if record.state == ARKState.DRAFT.value else "update"
-    return ARKPublishOperation(
-        ref=record.ark,
-        action=action,
-        naan=record.naan,
-        name=record.name,
-        url=record.target,
-        cid=metadata.level1_cid,
-    )
-
-
-def _rescue_item(
-    record: ARKRecord,
-    metadata: ARKMetadata | None,
-    *,
-    status: str,
-    gas_limit: int,
-    error_type: str | None = None,
-    gas_estimate: int | None = None,
-    gas_used: int | None = None,
-    error: str | None = None,
-) -> Dict[str, Any]:
-    """Serialize one rescue result item."""
-    return {
-        "ark": record.ark,
-        "error_type": error_type or _classify_error_type(record, metadata),
-        "status": status,
-        "final_state": _state_label(record.state),
-        "gas_limit": gas_limit,
-        "gas_estimate": gas_estimate,
-        "gas_used": gas_used,
-        "error": error,
-    }
-
-
-async def rescue_worker_errors(
-    request: Any,
-    identity: dict = Depends(require_authority_identity),
-    corelib_client: DARKCoreClient = Depends(get_corelib_client),
-    db: Session = Depends(get_db),
-) -> Dict[str, Any]:
-    """Rescue permanent chain errors selected by the same filters as /errors."""
-    enforce_authority_match(identity, request.authority_id)
-
-    settings = get_settings()
-    max_items = int(settings.permanent_rescue_max_items)
-    limit = min(int(request.limit or max_items), max_items)
-    rescue_gas_limit = int(corelib_client.config.default_gas_limit) * 2
-    filters = {
-        "authority_id": request.authority_id,
-        "stage": request.stage,
-        "error_type": request.error_type,
-    }
-
-    if request.stage == "metadata":
-        return {
-            "filters": filters,
-            "selected": 0,
-            "processed": 0,
-            "limit": limit,
-            "gas": {
-                "current_limit": int(corelib_client.config.default_gas_limit),
-                "rescue_limit": rescue_gas_limit,
-            },
-            "items": [],
-        }
-
-    rows = _select_error_rows(
-        db,
-        list_type="permanent",
-        stage="chain",
-        authority_id=request.authority_id,
-        error_type=request.error_type,
-    )
-    selected = len(rows)
-    rows = rows[:limit]
-    repo = ARKRepository(db)
-
-    items: list[Dict[str, Any]] = []
-    stopped = False
-    stop_reason = None
-
-    arks = [record.ark for record, _ in rows]
-    db.rollback()
-    for ark in arks:
         with acquire_ark_lock(ark) as db:
             if db is None:
-                raise HTTPException(status_code=409, detail="ARK is being processed; retry later")
-            repo = ARKRepository(db)
-            # Re-evaluate eligibility after acquiring the shared worker/API lock.
-            current_rows = _select_error_rows(
-                db,
-                list_type="permanent",
-                stage="chain",
-                authority_id=request.authority_id,
-                error_type=request.error_type,
-            )
-            matching = [
-                (record, metadata) for record, metadata in current_rows if record.ark == ark
-            ]
-            if not matching:
-                continue
-            record, metadata = matching[0]
-            if metadata is None or not metadata.level1_cid or not metadata.original_cid:
-                continue
-
-            original_error_type = _classify_error_type(record, metadata)
-            operation = _rescue_operation_for_row(record, metadata)
-            try:
-                gas_estimate = corelib_client.estimate_ark_operation_gas(
-                    request.authority_id,
-                    operation,
-                )
-            except Exception as exc:
-                error_msg = f"Gas estimate failed during rescue: {exc}"
-                repo.mark_processing_failed(
-                    record.ark,
-                    error_msg,
-                    int(ProcessingErrorCode.CHAIN_RPC_UNAVAILABLE),
-                    is_permanent=True,
-                )
-                db.commit()
-                db.refresh(record)
-                item = _rescue_item(
-                    record,
-                    metadata,
-                    status="estimate_failed",
-                    gas_limit=rescue_gas_limit,
-                    error=error_msg,
-                )
-                items.append(item)
-                if _is_infrastructure_error_message(str(exc)):
-                    stopped = True
-                    stop_reason = "estimate_unavailable"
-                    break
-                continue
-
-            if int(gas_estimate) > rescue_gas_limit:
-                error_msg = (
-                    "Gas limit too low during rescue: "
-                    f"estimate {gas_estimate} exceeds rescue gas limit {rescue_gas_limit}"
-                )
-                repo.mark_processing_failed(
-                    record.ark,
-                    error_msg,
-                    int(ProcessingErrorCode.CHAIN_REVERTED),
-                    is_permanent=True,
-                )
-                db.commit()
-                db.refresh(record)
-                items.append(
-                    _rescue_item(
-                        record,
-                        metadata,
-                        status="skipped_gas_x2_insufficient",
-                        gas_limit=rescue_gas_limit,
-                        gas_estimate=int(gas_estimate),
-                        error=error_msg,
-                    )
-                )
-                continue
-
-            result = corelib_client.publish_ark_operation(
-                request.authority_id,
-                operation,
-                gas_limit=rescue_gas_limit,
-                gas_estimate=int(gas_estimate),
-            )
-
-            if result.status == "confirmed":
-                try:
-                    repo.update_to_published(record.ark)
-                    repo.reset_processing(record.ark)
-                    db.commit()
-                    db.refresh(record)
-                    items.append(
-                        _rescue_item(
-                            record,
-                            metadata,
-                            status="confirmed",
-                            gas_limit=rescue_gas_limit,
-                            error_type=original_error_type,
-                            gas_estimate=int(gas_estimate),
-                            gas_used=result.gas_used,
-                        )
-                    )
-                except ValueError as exc:
-                    db.rollback()
-                    db.refresh(record)
-                    items.append(
-                        _rescue_item(
-                            record,
-                            metadata,
-                            status="finalize_failed",
-                            gas_limit=rescue_gas_limit,
-                            gas_estimate=int(gas_estimate),
-                            gas_used=result.gas_used,
-                            error=str(exc),
-                        )
-                    )
-                continue
-
-            if result.status == "reverted":
-                error_msg = (
-                    f"Rescue transaction reverted (permanent): {result.error or result.status}"
-                )
-                repo.mark_processing_failed(
-                    record.ark,
-                    error_msg,
-                    int(ProcessingErrorCode.CHAIN_REVERTED),
-                    is_permanent=True,
-                )
-                db.commit()
-                latest = repo.get_by_ark(record.ark)
-                items.append(
-                    _rescue_item(
-                        latest or record,
-                        metadata,
-                        status="reverted",
-                        gas_limit=rescue_gas_limit,
-                        gas_estimate=int(gas_estimate),
-                        gas_used=result.gas_used,
-                        error=error_msg,
-                    )
-                )
-                continue
-
-            error_msg = f"Rescue transaction {result.status} (infrastructure): {result.error or result.status}"
-            repo.mark_processing_failed(
-                record.ark,
-                error_msg,
-                int(ProcessingErrorCode.CHAIN_RPC_UNAVAILABLE),
-                is_permanent=True,
-            )
-            db.commit()
-            db.refresh(record)
-            items.append(
-                _rescue_item(
-                    record,
-                    metadata,
-                    status=result.status,
-                    gas_limit=rescue_gas_limit,
-                    gas_estimate=int(gas_estimate),
-                    gas_used=result.gas_used,
-                    error=error_msg,
-                )
-            )
-            stopped = True
-            stop_reason = result.status
-            break
-
-    return {
-        "filters": filters,
-        "selected": selected,
-        "processed": len(items),
-        "limit": limit,
-        "stopped": stopped,
-        "stop_reason": stop_reason,
-        "gas": {
-            "current_limit": int(corelib_client.config.default_gas_limit),
-            "rescue_limit": rescue_gas_limit,
-        },
-        "items": items,
-    }
+                outcomes.append({"ark": ark, "status": "locked"}); continue
+            record = ARKRepository(db).get_by_ark(ark)
+            if record is None:
+                outcomes.append({"ark": ark, "status": "not_found"}); continue
+            if record.state in {ARKState.RESERVED.value, ARKState.TOMBSTONE.value}:
+                outcomes.append({"ark": ark, "status": "not_retryable_state"}); continue
+            if record.processing_status != int(ProcessingStatus.FAILED):
+                outcomes.append({"ark": ark, "status": "not_failed"}); continue
+            record.processing_status, record.next_action_at = int(ProcessingStatus.READY), None
+            record.processing_wait_reason, record.processing_attempt_count = int(ProcessingWaitReason.NONE), 0
+            record.updated_at = _now(); db.commit()
+            logger.info("Administrative retry approved by %s for %s: %s", identity, ark, request.reason)
+            outcomes.append({"ark": ark, "status": "accepted"})
+    return {"requested": len(request.arks), "reason": request.reason, "items": outcomes}

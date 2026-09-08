@@ -5,9 +5,6 @@ from unittest.mock import Mock
 from dark_core_lib import ARKPublishResult
 
 from app.workers.publisher import ChainPublisherWorker, ReplicationReconciliationWorker
-from app.workers.recovery import derive_recovery_stage
-from app.models.processing import ProcessingStage
-from app.models.states import ARKState
 
 
 def test_replication_policy_never_allows_purge_before_publication():
@@ -76,17 +73,3 @@ def test_reverted_pipeline_result_remains_permanent_after_exact_chain_check():
     assert not published
     repo.mark_processing_failed.assert_called_once()
     repo.defer_processing_retry.assert_not_called()
-
-
-def test_recovery_derives_stage_from_local_evidence_only():
-    metadata = Mock(level1_cid="l1", original_cid="l2", level1_json={"title": "x"})
-    draft = Mock(state=ARKState.DRAFT.value)
-    published = Mock(state=ARKState.PUBLISHED.value)
-
-    assert derive_recovery_stage(draft, metadata)[0] == ProcessingStage.AVAILABILITY
-    assert derive_recovery_stage(published, metadata)[0] == ProcessingStage.REPLICATION
-
-    metadata.original_cid = None
-    metadata.original_content = "raw"
-    metadata.original_media_type = "application/xml"
-    assert derive_recovery_stage(draft, metadata)[0] == ProcessingStage.METADATA

@@ -18,12 +18,24 @@ class ProcessingStage(IntEnum):
 
 
 class ProcessingStatus(IntEnum):
-    IDLE = 0
-    PENDING = 1
-    RECOVERABLE = 2
+    READY = 1
+    WAITING = 2
     FAILED = 3
     DONE = 4
     CANCELLED = 5
+
+
+class ProcessingWaitReason(IntEnum):
+    """Why a normal worker scheduled a later action for an ARK."""
+
+    NONE = 0
+    CLUSTER_PINNING = 1
+    INITIAL_VISIBILITY = 2
+    REPLICA_TARGET = 3
+    STORAGE_BACKOFF = 4
+    RPC_BACKOFF = 5
+    CHAIN_CONFIRMATION = 6
+    CLUSTER_QUEUED = 7
 
 
 class ProcessingErrorCode(IntEnum):
@@ -36,7 +48,6 @@ class ProcessingErrorCode(IntEnum):
     AUTHORITY_NOT_FOUND = 302
     AUTHORIZATION_FAILED = 303
     CHAIN_STATE_CONFLICT = 304
-    RECOVERY_NOT_POSSIBLE = 901
     UNEXPECTED = 900
 
 

@@ -25,7 +25,12 @@ from dark_core_lib.metadata import MetadataService, MetadataStorage
 from app.database.ark_locks import acquire_ark_lock
 from app.database.connection import SessionLocal
 from app.database.models import ARKRecord
-from app.models.processing import ProcessingErrorCode, ProcessingStage, ProcessingStatus
+from app.models.processing import (
+    ProcessingErrorCode,
+    ProcessingStage,
+    ProcessingStatus,
+    ProcessingWaitReason,
+)
 from app.models.states import ARKState
 from app.repositories.ark_repository import ARKRepository, _ready_for_processing, parse_ark
 
@@ -43,6 +48,18 @@ def _is_infrastructure_error(exc: Exception) -> bool:
     return any(
         word in text for word in ("connection", "timeout", "unavailable", "refused", "temporarily")
     )
+
+
+def _has_cluster_assignment(status: Any) -> bool:
+    """Return whether Cluster still owns a pin attempt for this CID.
+
+    The explicit count is authoritative.  The status fallback keeps the
+    worker safe with non-Store API implementations of MetadataStorage.
+    """
+    assigned = getattr(status, "assigned_replicas", None)
+    if assigned is not None:
+        return int(assigned) > 0
+    return str(getattr(status, "status", "")).lower() in {"pinned", "pinning", "queued"}
 
 
 class _Stats:
@@ -63,9 +80,14 @@ class _Stats:
             "recent_errors": [],
             "last_reconciliation_at": None,
             "last_reconciliation_checked": 0,
+            "last_reconciliation_advanced": 0,
+            "last_reconciliation_waiting": 0,
             "last_reconciliation_repaired": 0,
             "last_reconciliation_purged": 0,
             "last_reconciliation_failed": 0,
+            "last_reconciliation_mode": "first_pin",
+            "last_maintenance_block_reason": None,
+            "last_replication_promotions": 0,
         }
 
     def get_stats(self) -> dict[str, Any]:
@@ -156,12 +178,14 @@ class MetadataPersistenceWorker(_Stats):
                 current_metadata.level1_replica_count = None
                 current_metadata.level2_replica_count = None
                 current_metadata.replication_checked_at = None
+                current_metadata.replication_observation_count = 0
                 current_metadata.replication_error_code = None
                 current_metadata.replication_last_error = None
                 current.processing_stage = int(ProcessingStage.AVAILABILITY)
-                current.processing_status = int(ProcessingStatus.PENDING)
+                current.processing_status = int(ProcessingStatus.READY)
                 current.processing_attempt_count = 0
-                current.processing_next_attempt_at = None
+                current.next_action_at = None
+                current.processing_wait_reason = int(ProcessingWaitReason.NONE)
                 current.processing_error_code = None
                 current.processing_error_detail = None
                 db.commit()
@@ -217,21 +241,35 @@ class ReplicationReconciliationWorker(_Stats):
         metadata_storage: MetadataStorage,
         page_size: int = 50,
         concurrency: int = 2,
-        recheck_seconds: int = 300,
+        availability_recheck_seconds: int = 10,
+        availability_max_recheck_seconds: int = 60,
+        replication_recheck_seconds: int = 300,
+        replication_max_recheck_seconds: int = 1800,
+        repair_grace_seconds: int = 120,
+        repair_cooldown_seconds: int = 900,
         publish_after_replicas: int = 1,
         target_replicas: int = 2,
+        status_batch_size: int = 200,
+        idle_sleep_seconds: int = 2,
     ):
         self.storage = metadata_storage
         self.service = MetadataService(metadata_storage)
         self.page_size = max(int(page_size), 1)
         self.concurrency = max(int(concurrency), 1)
-        self.recheck_seconds = max(int(recheck_seconds), 0)
+        self.availability_recheck_seconds = max(int(availability_recheck_seconds), 0)
+        self.availability_max_recheck_seconds = max(int(availability_max_recheck_seconds), self.availability_recheck_seconds)
+        self.replication_recheck_seconds = max(int(replication_recheck_seconds), 0)
+        self.replication_max_recheck_seconds = max(int(replication_max_recheck_seconds), self.replication_recheck_seconds)
+        self.repair_grace_seconds = max(int(repair_grace_seconds), 0)
+        self.repair_cooldown_seconds = max(int(repair_cooldown_seconds), 0)
         self.publish_after = max(int(publish_after_replicas), 1)
         self.target_replicas = max(int(target_replicas), self.publish_after)
+        self.status_batch_size = min(max(int(status_batch_size), 1), 200)
+        self.idle_sleep_seconds = max(int(idle_sleep_seconds), 1)
         self._init_stats()
 
-    def _reconcile(self, ark: str) -> dict[str, int]:
-        result = {"checked": 1, "repaired": 0, "purged": 0, "failed": 0}
+    def _reconcile(self, ark: str, observed_statuses: Optional[dict[str, Any]] = None) -> dict[str, int]:
+        result = {"checked": 1, "advanced": 0, "waiting": 0, "repaired": 0, "purged": 0, "failed": 0}
         with acquire_ark_lock(ark) as db:
             if db is None:
                 return {**result, "checked": 0}
@@ -252,8 +290,26 @@ class ReplicationReconciliationWorker(_Stats):
                 level1_cid, level2_cid = metadata.level1_cid, metadata.original_cid
                 db.commit()
 
-                level2_status = self.storage.get_replication_status(level2_cid)
-                if level2_status.total_replicas == 0:
+                now = _now()
+                first_seen_at = metadata.created_at or metadata.updated_at or now
+                last_repair_at = metadata.last_repair_at
+                repair_allowed = (
+                    (now - first_seen_at).total_seconds() >= self.repair_grace_seconds
+                    and (last_repair_at is None or (now - last_repair_at).total_seconds() >= self.repair_cooldown_seconds)
+                )
+                statuses = observed_statuses
+                if statuses is None:
+                    statuses = self.storage.get_replication_statuses([level2_cid, level1_cid])
+                level2_status = statuses.get(level2_cid)
+                level1_status = statuses.get(level1_cid)
+                if level2_status is None or level1_status is None:
+                    raise ValueError("Store API batch status omitted a CID")
+                if (
+                    level2_status.total_replicas == 0
+                    and level2_status.status in {"unpinned", "error"}
+                    and (level2_status.status == "error" or not _has_cluster_assignment(level2_status))
+                    and repair_allowed
+                ):
                     if metadata.original_content is None or not metadata.original_media_type:
                         raise ValueError("Level 2 payload is unavailable for repair")
                     repaired = self.service.store_level2(
@@ -264,9 +320,13 @@ class ReplicationReconciliationWorker(_Stats):
                     if repaired != level2_cid:
                         raise ValueError("Level 2 repair returned a different CID")
                     result["repaired"] += 1
-                    level2_status = self.storage.get_replication_status(level2_cid)
-                level1_status = self.storage.get_replication_status(level1_cid)
-                if level1_status.total_replicas == 0:
+                    metadata.last_repair_at = now
+                if (
+                    level1_status.total_replicas == 0
+                    and level1_status.status in {"unpinned", "error"}
+                    and (level1_status.status == "error" or not _has_cluster_assignment(level1_status))
+                    and repair_allowed
+                ):
                     if metadata.level1_json is None:
                         raise ValueError("Level 1 payload is unavailable for repair")
                     _, repaired = self.service.store_level1_with_level2_reference(
@@ -275,7 +335,7 @@ class ReplicationReconciliationWorker(_Stats):
                     if repaired != level1_cid:
                         raise ValueError("Level 1 repair returned a different CID")
                     result["repaired"] += 1
-                    level1_status = self.storage.get_replication_status(level1_cid)
+                    metadata.last_repair_at = now
 
                 current = db.query(ARKRecord).filter_by(id=record.id).with_for_update().one()
                 current_metadata = repo.get_metadata_by_ark_id(current.id)
@@ -287,7 +347,10 @@ class ReplicationReconciliationWorker(_Stats):
                     return {**result, "checked": 0}
                 current_metadata.level1_replica_count = max(int(level1_status.total_replicas), 0)
                 current_metadata.level2_replica_count = max(int(level2_status.total_replicas), 0)
-                current_metadata.replication_checked_at = _now()
+                current_metadata.replication_checked_at = now
+                current_metadata.replication_observation_count = int(current_metadata.replication_observation_count or 0) + 1
+                if result["repaired"]:
+                    current_metadata.last_repair_at = now
                 current_metadata.replication_error_code = None
                 current_metadata.replication_last_error = None
                 replicas = min(
@@ -296,26 +359,40 @@ class ReplicationReconciliationWorker(_Stats):
                 if current.processing_stage == int(ProcessingStage.AVAILABILITY):
                     if replicas >= self.publish_after:
                         current.processing_stage = int(ProcessingStage.CHAIN)
-                        current.processing_status = int(ProcessingStatus.PENDING)
-                        current.processing_next_attempt_at = None
+                        current.processing_status = int(ProcessingStatus.READY)
+                        current.next_action_at = None
+                        current.processing_wait_reason = int(ProcessingWaitReason.NONE)
+                        result["advanced"] += 1
                     else:
-                        current.processing_status = int(ProcessingStatus.RECOVERABLE)
-                        current.processing_next_attempt_at = _now() + timedelta(
-                            seconds=self.recheck_seconds
+                        # Cluster propagation is a normal scheduled action.
+                        current.processing_status = int(ProcessingStatus.WAITING)
+                        current.next_action_at = None
+                        current.processing_wait_reason = int(
+                            ProcessingWaitReason.CLUSTER_QUEUED
+                            if "queued" in {level1_status.status, level2_status.status}
+                            else ProcessingWaitReason.CLUSTER_PINNING
+                            if "pinning" in {level1_status.status, level2_status.status}
+                            else ProcessingWaitReason.INITIAL_VISIBILITY
                         )
+                        result["waiting"] += 1
                 elif replicas >= self.target_replicas:
                     current_metadata.level1_json = None
                     current_metadata.original_content = None
                     current_metadata.payload_purged_at = _now()
                     current.processing_stage = int(ProcessingStage.COMPLETE)
                     current.processing_status = int(ProcessingStatus.DONE)
-                    current.processing_next_attempt_at = None
+                    current.next_action_at = None
+                    current.processing_wait_reason = int(ProcessingWaitReason.NONE)
                     result["purged"] = 1
+                    result["advanced"] += 1
                 else:
-                    current.processing_status = int(ProcessingStatus.RECOVERABLE)
-                    current.processing_next_attempt_at = _now() + timedelta(
-                        seconds=self.recheck_seconds
-                    )
+                    # The content is available, but the target replica count
+                    # has not been reached yet.  Keep it in the normal
+                    # replication queue and re-observe it later.
+                    current.processing_status = int(ProcessingStatus.WAITING)
+                    current.next_action_at = None
+                    current.processing_wait_reason = int(ProcessingWaitReason.REPLICA_TARGET)
+                    result["waiting"] += 1
                 db.commit()
                 return result
             except Exception as exc:
@@ -325,7 +402,7 @@ class ReplicationReconciliationWorker(_Stats):
                     ark,
                     f"replication reconciliation failed: {exc}",
                     int(ProcessingErrorCode.REPLICATION_UNAVAILABLE),
-                    delay_seconds=self.recheck_seconds,
+                    delay_seconds=self.availability_recheck_seconds,
                 )
                 db.commit()
                 self._error(ark, f"replication reconciliation failed: {exc}")
@@ -334,34 +411,94 @@ class ReplicationReconciliationWorker(_Stats):
     def run_publish_cycle(self) -> None:
         started, before = self._start()
         db = SessionLocal()()
+        maintenance = False
         try:
-            arks = [
-                record.ark
-                for record in ARKRepository(db).get_metadata_pending_reconciliation(
-                    self.page_size, self.recheck_seconds
+            repo = ARKRepository(db)
+            records = repo.get_metadata_pending_reconciliation(
+                self.page_size,
+                self.availability_recheck_seconds,
+                stage=int(ProcessingStage.AVAILABILITY),
+            )
+            if not records and not repo.has_critical_reconciliation_backlog():
+                maintenance = True
+                records = repo.get_metadata_pending_reconciliation(
+                    self.page_size,
+                    self.replication_recheck_seconds,
+                    stage=int(ProcessingStage.REPLICATION),
                 )
-            ]
+            self.stats["last_reconciliation_mode"] = "maintenance" if maintenance else "first_pin"
+            self.stats["last_maintenance_block_reason"] = None if maintenance or records else "critical_backlog"
+            ark_cids: dict[str, tuple[str, str]] = {}
+            for record in records:
+                metadata = ARKRepository(db).get_metadata_by_ark_id(record.id)
+                if metadata and metadata.level1_cid and metadata.original_cid:
+                    ark_cids[record.ark] = (metadata.level1_cid, metadata.original_cid)
         finally:
             db.close()
-        totals = {"checked": 0, "repaired": 0, "purged": 0, "failed": 0}
+        if maintenance and ark_cids:
+            try:
+                promotion_results = self.storage.ensure_replication(
+                    [cid for pair in ark_cids.values() for cid in pair],
+                    self.target_replicas,
+                )
+                self.stats["last_replication_promotions"] = sum(
+                    value in {"promotion_requested", "already_durable"}
+                    for value in promotion_results.values()
+                )
+            except Exception as exc:
+                logger.warning("Durability promotion request failed: %s", exc)
+        unique_cids = sorted({cid for pair in ark_cids.values() for cid in pair})
+        observed: dict[str, Any] = {}
+        for offset in range(0, len(unique_cids), self.status_batch_size):
+            batch = unique_cids[offset:offset + self.status_batch_size]
+            try:
+                observed.update(self.storage.get_replication_statuses(batch))
+            except Exception as exc:
+                # Leave this batch absent so each affected ARK is deferred by
+                # its normal retry path; unrelated CID batches can proceed.
+                logger.warning("Replication status batch failed (%s CIDs): %s", len(batch), exc)
+        arks = list(ark_cids)
+        totals = {"checked": 0, "advanced": 0, "waiting": 0, "repaired": 0, "purged": 0, "failed": 0}
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
-            for future in as_completed([executor.submit(self._reconcile, ark) for ark in arks]):
+            for future in as_completed([executor.submit(self._reconcile, ark, observed) for ark in arks]):
                 for key, value in future.result().items():
                     totals[key] += value
         self.stats["total_processed"] += totals["checked"]
-        self.stats["total_succeeded"] += totals["checked"] - totals["failed"]
+        self.stats["total_succeeded"] += totals["advanced"]
+        self.stats["total_deferred"] += totals["waiting"]
         self.stats["total_failed"] += totals["failed"]
         self.stats.update(
             {
                 "last_run_page_size": self.page_size,
                 "last_reconciliation_at": _now(),
                 "last_reconciliation_checked": totals["checked"],
+                "last_reconciliation_advanced": totals["advanced"],
+                "last_reconciliation_waiting": totals["waiting"],
                 "last_reconciliation_repaired": totals["repaired"],
                 "last_reconciliation_purged": totals["purged"],
                 "last_reconciliation_failed": totals["failed"],
             }
         )
         self._finish(started, before)
+
+    def next_wake_plan(self, runtime: dict[str, Any]) -> tuple[int, str] | None:
+        """Return a bounded, due-aware sleep decision for the worker loop."""
+        db = SessionLocal()()
+        try:
+            repository = ARKRepository(db)
+            due = repository.get_metadata_pending_reconciliation(
+                1,
+                self.availability_recheck_seconds,
+            )
+            if due:
+                return 0, "continue_due_work"
+            next_due = repository.get_next_reconciliation_action_at()
+        finally:
+            db.close()
+        if next_due is None:
+            return self.idle_sleep_seconds, "idle_no_work"
+        delay = max(int((next_due - _now()).total_seconds()), 0)
+        return min(delay, self.idle_sleep_seconds), "sleeping_until_due"
 
 
 class ChainPublisherWorker(_Stats):

@@ -32,6 +32,30 @@ Use the docs in this order, depending on what you need:
 - [minter-architecture.md](./minter-architecture.md)
   - technical implementation details, module map, concurrency model, worker internals
 - [notebooks/README.md](./notebooks/README.md)
+
+## Current storage and worker sequence
+
+Metadata persistence stores L1/L2 payloads and obtains their CIDs through Store
+API. A successful `store` means that Cluster accepted the content; it does not
+mean that a peer has completed the pin. The replication worker observes both
+CIDs in batches and keeps the ARK in `AVAILABILITY` while either first pin is
+still `queued`, `pinning`, or not yet visible.
+
+When both CIDs have at least `REPLICATION_PUBLISH_AFTER_REPLICAS` confirmed
+`pinned` replicas, the worker moves the ARK to `CHAIN`. After Chain publishes,
+the replication worker continues observing until both CIDs reach
+`REPLICATION_TARGET_REPLICAS`; only then are local payloads purged.
+
+The current selector uses pages of 100 by default, prioritizes all eligible
+`AVAILABILITY` records, and fills unused page capacity with `REPLICATION`
+records. It batches up to 200 unique CIDs. There is no quota split or normal
+per-ARK recheck timer in the current implementation.
+
+The current two-phase policy requests one initial Cluster allocation. After
+publication, the replication worker promotes existing pins to the configured
+target only when SQL shows no metadata persistence backlog and no pending
+first-pin availability work. This promotion is asynchronous; the worker then
+observes the pins and purges only after both CIDs reach the target.
   - notebook index, expected environment variables, execution notes
 - [noid.md](./noid.md)
   - detailed NOID generation rules and rationale
@@ -277,7 +301,8 @@ Important points:
 The asynchronous path is split into three independent workers. The metadata
 worker persists staged metadata, the replication worker verifies and repairs
 the resulting CIDs, and the chain worker is the only component that publishes
-blockchain transactions.
+blockchain transactions. A Store API `pin_queued` or `pinning` result is a
+normal wait, not an error and not a repair trigger.
 
 ```mermaid
 sequenceDiagram
@@ -292,7 +317,7 @@ sequenceDiagram
 
     MetadataWorker->>Repo: get_metadata_pending_persist(limit)
     Worker->>DB: acquire advisory lock for the ARK
-    Repo->>DB: select METADATA/PENDING work and acquire one advisory lock per ARK
+    Repo->>DB: select METADATA/READY work (or due waits) and acquire one advisory lock per ARK
     MetadataWorker->>DB: commit claim
 
     loop each claimed ARK
@@ -300,26 +325,26 @@ sequenceDiagram
         Store-->>MetadataWorker: original_cid
         MetadataWorker->>Store: store Level-1 JSON with schema + media_type + original_cid
         Store-->>MetadataWorker: level1_cid
-        MetadataWorker->>Repo: persist CIDs, retain payloads, advance to AVAILABILITY/PENDING
+        MetadataWorker->>Repo: persist CIDs, retain payloads, advance to AVAILABILITY/READY
     end
 
     ReplicationWorker->>Repo: get_metadata_pending_reconciliation(limit, recheck)
     loop each AVAILABILITY or REPLICATION item with both CIDs
-        ReplicationWorker->>Store: get replication status for L1 and L2
+        ReplicationWorker->>Store: POST /v1/status/batch for L1 and L2
         opt a CID has zero copies
             ReplicationWorker->>Store: restore retained payload
             ReplicationWorker->>ReplicationWorker: require regenerated CID to match
         end
         ReplicationWorker->>Repo: lock row and compare current CIDs
         alt both counts reach publish_after_replicas
-            ReplicationWorker->>Repo: advance to CHAIN/PENDING
+            ReplicationWorker->>Repo: advance to CHAIN/READY
         else published and both counts reach target_replicas
             ReplicationWorker->>Repo: purge payload and mark COMPLETE/DONE
         end
     end
 
     ChainWorker->>Repo: get_chain_pending_publish(limit)
-    Repo->>DB: SELECT only CHAIN/PENDING rows whose availability was verified
+    Repo->>DB: SELECT only CHAIN/READY rows whose availability was verified
     Repo->>DB: select CHAIN work and acquire one advisory lock per ARK
     ChainWorker->>DB: commit claim
 
@@ -457,8 +482,10 @@ Store API, count ARKs, scan queues, or aggregate metadata:
       "alive": true,
       "last_heartbeat_seconds": 9,
       "last_cycle": {
-        "processed": 100,
-        "succeeded": 100,
+        "observed": 100,
+        "advanced": 100,
+        "waiting": 0,
+        "repaired": 0,
         "failed": 0,
         "duration_seconds": 10.573
       }
@@ -467,16 +494,20 @@ Store API, count ARKs, scan queues, or aggregate metadata:
 }
 ```
 
-In the compact payload, `last_cycle.processed` means "attempted in the latest
-worker cycle". It is not a lifetime counter and it is not the remaining queue
-size. For the chain worker, `last_cycle.succeeded` means ARKs published or
-reconciled as already published; for metadata, ARKs persisted; and for
-replication, retained payloads checked successfully.
+In the compact payload, `last_cycle.observed` means records inspected in the
+latest cycle. `advanced` means records moved to the next stage, `waiting` means
+records deliberately scheduled for a later observation, and `repaired` means
+payloads submitted again after a confirmed absence/error. These are cycle
+counters, not queue sizes or lifetime totals. The heartbeat stores the actual
+`wake_at`; the API does not infer sleeping from the previous cycle.
 
-Use `GET /api/v1/worker/status?detail=full` for RPC and storage probes, bounded ARK
-aggregates, queue/error/replication aggregates, chain capacity, detailed heartbeat,
-cadence, config, and host/process fields. Full mode is intended for diagnosis,
-not frequent monitoring. The full payload includes a `cadence` block for each worker:
+Use `GET /api/v1/worker/status?detail=full` for RPC and storage probes, bounded
+workload aggregates, permanent-error aggregates and the last cycle. Full mode is
+intended for diagnosis, not frequent monitoring. It reports process state and
+workload separately: `READY` is work that can be attempted now, while `WAITING`
+is a normal scheduled observation with a concrete `next_action_at` and reason.
+The full response includes `no_progress_cycles` and `stalled_suspected` when a
+worker has attempted work repeatedly without advancing any record.
 
 - `last_cycle_duration_seconds`: how long the last cycle took.
 - `last_cycle_processed`: how many ARKs the last cycle attempted.
@@ -499,16 +530,16 @@ Worker heartbeats are emitted by a lightweight supervisor thread, so a full chai
 
 API mutations and worker attempts acquire the same PostgreSQL advisory lock per ARK before reading the record. A physical connection remains checked out until unlock, across commits and rollbacks; a lost connection cannot reconnect and write an unlocked result. Workers recheck stage, state and retry eligibility after acquiring the lock. Metadata updates, tombstones and manual rescue return `409 Conflict` when an ARK is busy. Updates require `PUBLISHED`; initial metadata submission still allows `RESERVED → DRAFT`. No revision counter or lease is stored: content cannot change during a worker attempt. PostgreSQL releases the lock when its connection terminates. Clients should retry a busy response later; pending `DRAFT`/`UPDATE` records must finish their workflow before accepting another metadata update.
 
-The detailed `config.chain.worker_page_size` field shows the active chain transaction pipeline window because chain page size and core-lib pipeline size are intentionally the same value. `last_cycle.processed` still means ARKs attempted in the latest cycle, not transactions confirmed forever and not queue size.
+The detailed `config.chain.worker_page_size` field shows the active chain transaction pipeline window because chain page size and core-lib pipeline size are intentionally the same value. Cycle counters describe only the latest observation round, not lifetime totals or queue size.
 
-### Worker Errors and Recovery
+### Worker errors and explicit retry
 
-`GET /api/v1/worker/errors` returns a compact SQL aggregate by default. Add
-`list=permanent`, `list=recoverable`, or `list=all` to receive bounded pages;
-use `error_code` for structured-code filtering. The canonical error states are
-`recoverable` and `permanent`; there is no `retrying` state.
+`GET /api/v1/worker/errors` returns only permanent failures: records which
+require an operator decision. Normal storage/RPC backoff and IPFS propagation
+are `WAITING` workflow actions and never appear as errors. Results are paginated
+and can be filtered by `stage`, `authority_id`, and `error_code`.
 
-`POST /api/v1/worker/recovery` approves explicit failed ARKs for low-priority recovery. It does not call IPFS or blockchain; the recovery worker later derives a safe stage and requeues it only while normal workers are idle.
+`POST /api/v1/worker/retry` is an mTLS-protected administrative retry. It returns an explicitly approved `FAILED` ARK to `READY` in its current internal stage; the owning worker performs the retry.
 
 ## API Surface
 
@@ -523,9 +554,8 @@ use `error_code` for structured-code filtering. The canonical error states are
 | `/api/v1/authority/{uuid}/naans` | `GET` | List authorized NAANs |
 | `/api/v1/authority/{uuid}/authorized/{naan}` | `GET` | Check NAAN authorization |
 | `/api/v1/worker/status` | `GET` | Read low-cost worker liveness from DB heartbeat; use `?detail=full` for diagnostics |
-| `/api/v1/worker/replication` | `GET` | List retained ARKs and last observed L1/L2 replica counts |
-| `/api/v1/worker/errors` | `GET` | Read compact worker error report or filtered error list |
-| `/api/v1/worker/recovery` | `POST` | Approve explicit failed ARKs for low-priority recovery |
+| `/api/v1/worker/errors` | `GET` | List permanent errors, with bounded summary and filters |
+| `/api/v1/worker/retry` | `POST` | Approve an explicit failed ARK retry by its owning worker |
 | `/health` | `GET` | Check database, blockchain, and storage wiring |
 
 ## Authentication and Authorization
@@ -678,10 +708,10 @@ docker compose up -d --build
 
 ### Docker Notes
 
-- `minter-api`, `minter-metadata-worker`, `minter-replication-worker`, `minter-chain-worker`, and `minter-recovery-worker` join the external `dark-net` network.
+- `minter-api`, `minter-metadata-worker`, `minter-replication-worker`, and `minter-chain-worker` join the external application and backbone networks.
 - `DARK_RPC_URL` comes from `.env.integration` as generated by dark-deployer: `http://rpc01:8545` when blockchain runs on this same `dark-net` (co-located install), or the real external RPC address for a decoupled/remote blockchain tier.
 - PostgreSQL runs as a sibling service in the same compose project.
-- all four processes share PostgreSQL.
+- The API and the three worker processes share PostgreSQL.
 - `minter-api`, `minter-metadata-worker`, and `minter-replication-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage` when `METADATA_STORAGE_TYPE=filesystem`.
 - `.env.integration` is preferred automatically when present.
 - Alembic migrations are explicit: run `docker compose run --rm minter-api migrate` after schema changes or a fresh database.
@@ -738,10 +768,11 @@ The app prefers `.env.integration` over `.env`.
 | `METADATA_WORKER_MAX_RETRIES` | Metadata retry attempts before permanent failure | `5` |
 | `METADATA_WORKER_RUNTIME_NAME` | Metadata worker identity | `metadata-publisher` |
 | `REPLICATION_WORKER_ENABLED` | Enable IPFS replication reconciliation worker | `true` |
-| `REPLICATION_WORKER_PAGE_SIZE` | Retained metadata records checked per cycle | `50` |
+| `REPLICATION_WORKER_PAGE_SIZE` | Retained metadata records checked per cycle | `100` |
 | `REPLICATION_WORKER_CONCURRENCY` | Concurrent replication checks/repairs | `2` |
-| `REPLICATION_WORKER_SLEEP_SECONDS` | Sleep after an empty or partial reconciliation page | `30` |
-| `REPLICATION_WORKER_RECHECK_SECONDS` | Minimum interval before checking a retained payload again | `300` |
+| `REPLICATION_WORKER_SLEEP_SECONDS` | Legacy worker sleep setting; normal queue observations use the global idle interval | `30` |
+| `REPLICATION_STATUS_BATCH_SIZE` | Maximum unique CIDs per Store API status batch | `200` |
+| `REPLICATION_IDLE_SLEEP_SECONDS` | Global sleep when no due replication work exists | `2` |
 | `REPLICATION_WORKER_STORAGE_RETRY_SECONDS` | Pause while metadata storage is unavailable | `10` |
 | `REPLICATION_WORKER_RUNTIME_NAME` | Reconciler heartbeat, PID and advisory-lock identity | `replication-reconciler` |
 | `REPLICATION_PUBLISH_AFTER_REPLICAS` | Minimum real pins required before the record is publishable | `1` |
@@ -754,13 +785,9 @@ The app prefers `.env.integration` over `.env`.
 | `CHAIN_WORKER_BLOCK_STALL_SECONDS` | Seconds without block progress before pausing chain worker | `120` |
 | `CHAIN_WORKER_ADAPTIVE_PAGE_ENABLED` | Enable core-lib chain-capacity based effective page size | `true` |
 | `CHAIN_WORKER_MIN_PAGE_SIZE` | Minimum effective chain page size during adaptive throttling | `1` |
-| `CHAIN_WORKER_RECOVERY_SUCCESS_CYCLES` | Healthy capacity cycles before increasing effective page size | `3` |
+| `CHAIN_WORKER_HEALTHY_CYCLES_BEFORE_GROWING` | Healthy capacity cycles before increasing effective page size | `3` |
 | `CHAIN_WORKER_MAX_RETRIES` | Chain retry attempts before permanent failure | `5` |
 | `CHAIN_WORKER_RUNTIME_NAME` | Chain worker identity | `chain-publisher` |
-| `RECOVERY_WORKER_ENABLED` | Enable low-priority automatic recovery | `true` |
-| `RECOVERY_WORKER_PAGE_SIZE` | Recoverable ARKs released per idle cycle | `50` |
-| `RECOVERY_WORKER_SLEEP_SECONDS` | Sleep between recovery checks | `30` |
-| `RECOVERY_WORKER_RUNTIME_NAME` | Recovery worker identity | `recovery-scheduler` |
 | `WORKER_HEARTBEAT_INTERVAL_SECONDS` | DB heartbeat interval for all workers | `10` |
 | `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` | Stale heartbeat threshold | `180` |
 
@@ -856,7 +883,7 @@ See [notebooks/README.md](./notebooks/README.md) for execution notes and environ
 ### ARKs remain in `DRAFT` or `UPDATE`
 
 Check, in this order:
-1. all four worker containers are running
+1. the three worker containers are running
 2. `GET /api/v1/worker/status` shows `workers.metadata.alive=true`,
    `workers.replication.alive=true`, and `workers.chain.alive=true`
 3. blockchain connectivity is healthy

@@ -26,7 +26,7 @@ from sqlalchemy.sql import func
 from sqlalchemy.orm import declarative_base
 
 from app.models.states import ARKState
-from app.models.processing import ProcessingStage, ProcessingStatus
+from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingWaitReason
 
 Base = declarative_base()
 
@@ -45,6 +45,16 @@ class ProcessingStatusCode(Base):
     """Seeded catalogue for compact internal workflow status IDs."""
 
     __tablename__ = "processing_statuses"
+
+    id = Column(SmallInteger, primary_key=True)
+    code = Column(String(32), nullable=False, unique=True)
+    description = Column(Text, nullable=False)
+
+
+class ProcessingWaitReasonCode(Base):
+    """Seeded catalogue for why a normal workflow action is deferred."""
+
+    __tablename__ = "processing_wait_reasons"
 
     id = Column(SmallInteger, primary_key=True)
     code = Column(String(32), nullable=False, unique=True)
@@ -110,12 +120,19 @@ class ARKRecord(Base):
     processing_status = Column(
         SmallInteger,
         ForeignKey("processing_statuses.id"),
-        default=int(ProcessingStatus.IDLE),
+        default=int(ProcessingStatus.DONE),
         nullable=False,
-        server_default="0",
+        server_default=str(int(ProcessingStatus.DONE)),
     )
     processing_attempt_count = Column(SmallInteger, default=0, nullable=False, server_default="0")
-    processing_next_attempt_at = Column(DateTime, nullable=True, index=True)
+    next_action_at = Column(DateTime, nullable=True, index=True)
+    processing_wait_reason = Column(
+        SmallInteger,
+        ForeignKey("processing_wait_reasons.id"),
+        default=int(ProcessingWaitReason.NONE),
+        nullable=False,
+        server_default=str(int(ProcessingWaitReason.NONE)),
+    )
     processing_error_code = Column(SmallInteger, ForeignKey("processing_error_codes.id"), nullable=True)
     processing_error_detail = Column(Text, nullable=True)
     
@@ -128,7 +145,30 @@ class ARKRecord(Base):
             "ix_ark_processing_queue",
             "processing_stage",
             "processing_status",
-            "processing_next_attempt_at",
+            "next_action_at",
+        ),
+        Index(
+            "ix_ark_detail_active_rollup",
+            "processing_stage",
+            "processing_status",
+            "processing_wait_reason",
+            "next_action_at",
+            postgresql_where=state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value, ARKState.PUBLISHED.value]),
+            sqlite_where=state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value, ARKState.PUBLISHED.value]),
+        ),
+        Index(
+            "ix_ark_failed_summary",
+            "processing_stage",
+            "processing_error_code",
+            postgresql_where=processing_status == int(ProcessingStatus.FAILED),
+            sqlite_where=processing_status == int(ProcessingStatus.FAILED),
+        ),
+        Index(
+            "ix_ark_failed_recent",
+            "updated_at",
+            "id",
+            postgresql_where=processing_status == int(ProcessingStatus.FAILED),
+            sqlite_where=processing_status == int(ProcessingStatus.FAILED),
         ),
         Index(
             "uq_ark_records_active_client_item",
@@ -185,16 +225,20 @@ class WorkerRuntimeStatus(Base):
     last_heartbeat_at = Column(DateTime, nullable=False, index=True)
     started_at = Column(DateTime, nullable=False)
     last_cycle_at = Column(DateTime, nullable=True)
+    next_wake_at = Column(DateTime, nullable=True)
     last_cycle_duration_seconds = Column(Float, nullable=True)
     last_cycle_processed = Column(Integer, nullable=True)
     last_cycle_succeeded = Column(Integer, nullable=True)
     last_cycle_failed = Column(Integer, nullable=True)
     last_reconciliation_at = Column(DateTime, nullable=True)
     last_reconciliation_checked = Column(Integer, nullable=False, default=0, server_default="0")
+    last_reconciliation_advanced = Column(Integer, nullable=False, default=0, server_default="0")
+    last_reconciliation_waiting = Column(Integer, nullable=False, default=0, server_default="0")
     last_reconciliation_repaired = Column(Integer, nullable=False, default=0, server_default="0")
     last_reconciliation_purged = Column(Integer, nullable=False, default=0, server_default="0")
     last_reconciliation_failed = Column(Integer, nullable=False, default=0, server_default="0")
     last_error = Column(Text, nullable=True)
+    consecutive_no_progress_cycles = Column(SmallInteger, nullable=False, default=0, server_default="0")
 
     total_processed = Column(Integer, nullable=False, default=0, server_default="0")
     total_succeeded = Column(Integer, nullable=False, default=0, server_default="0")
@@ -238,8 +282,10 @@ class ARKMetadata(Base):
     level1_replica_count = Column(SmallInteger, nullable=True)
     level2_replica_count = Column(SmallInteger, nullable=True)
     replication_checked_at = Column(DateTime, nullable=True, index=True)
+    replication_observation_count = Column(SmallInteger, nullable=False, default=0, server_default="0")
     replication_error_code = Column(SmallInteger, ForeignKey("processing_error_codes.id"), nullable=True)
     replication_last_error = Column(Text, nullable=True)
+    last_repair_at = Column(DateTime, nullable=True)
     payload_purged_at = Column(DateTime, nullable=True)
     
     # Timestamps

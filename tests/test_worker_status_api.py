@@ -1,10 +1,10 @@
-"""Status endpoints expose compact runtime state and detailed replication data."""
+"""The status API reports process state separately from normal waits."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from app.api import worker as worker_api
-from app.database.models import ARKMetadata, ARKRecord, WorkerRuntimeStatus
-from app.models.processing import ProcessingStage, ProcessingStatus
+from app.database.models import ARKRecord, WorkerRuntimeStatus
+from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingWaitReason
 from app.models.states import ARKState
 
 
@@ -12,75 +12,63 @@ def _now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def test_lightweight_status_uses_only_heartbeats(client, monkeypatch):
-    def expensive(*args, **kwargs):
-        raise AssertionError("lightweight status must not query operational dependencies")
+def test_simple_status_reads_heartbeats_only(client, monkeypatch):
+    def external_probe(*args, **kwargs):
+        raise AssertionError("simple status must not call external services")
 
-    monkeypatch.setattr(worker_api, "check_rpc_health", expensive)
-    monkeypatch.setattr(worker_api, "check_metadata_storage_health", expensive)
-    monkeypatch.setattr(worker_api, "_build_chain_capacity_summary", expensive)
+    monkeypatch.setattr(worker_api, "check_rpc_health", external_probe)
+    monkeypatch.setattr(worker_api, "check_metadata_storage_health", external_probe)
+
     response = client.get("/api/v1/worker/status")
     assert response.status_code == 200
     assert response.json()["source"] == "db_heartbeat"
-    assert set(response.json()["workers"]) == {"metadata", "replication", "chain", "recovery"}
+    assert set(response.json()["workers"]) == {"metadata", "replication", "chain"}
 
 
-def test_full_status_lists_replication_queue(client, test_db):
+def test_full_status_separates_process_and_workload(client, test_db):
     now = _now()
-    record = ARKRecord(
-        naan="12345",
-        name="2000000x",
-        state=ARKState.PUBLISHED.value,
-        authority_id="test-uuid",
-        target="https://example.org/object",
+    ready = ARKRecord(
+        naan="12345", name="200ready", state=ARKState.PUBLISHED.value,
+        authority_id="test-uuid", target="https://example.org/ready",
         processing_stage=int(ProcessingStage.REPLICATION),
-        processing_status=int(ProcessingStatus.PENDING),
+        processing_status=int(ProcessingStatus.READY),
     )
-    test_db.add(record)
-    test_db.flush()
-    test_db.add(
-        ARKMetadata(
-            ark_record_id=record.id,
-            level1_json={"title": "item"},
-            level1_cid="bafy-l1",
-            original_content="raw",
-            original_schema="dc",
-            original_media_type="text/plain",
-            original_cid="bafy-l2",
-            level1_replica_count=1,
-            level2_replica_count=1,
-        )
+    waiting = ARKRecord(
+        naan="12345", name="200wait", state=ARKState.PUBLISHED.value,
+        authority_id="test-uuid", target="https://example.org/wait",
+        processing_stage=int(ProcessingStage.REPLICATION),
+        processing_status=int(ProcessingStatus.WAITING),
+        processing_wait_reason=int(ProcessingWaitReason.REPLICA_TARGET),
+        next_action_at=now + timedelta(seconds=30),
     )
-    test_db.add(
-        WorkerRuntimeStatus(
-            worker_name="replication-reconciler",
-            instance_id="test",
-            host="test",
-            pid=1,
-            status="RUNNING",
-            started_at=now,
-            last_heartbeat_at=now,
-        )
+    runtime = WorkerRuntimeStatus(
+        worker_name="replication-reconciler", instance_id="test", host="test", pid=1,
+        status="RUNNING", started_at=now, last_heartbeat_at=now,
+        last_cycle_at=now,
     )
+    test_db.add_all([ready, waiting, runtime])
     test_db.commit()
 
     response = client.get("/api/v1/worker/status?detail=full")
     assert response.status_code == 200
     data = response.json()
-    assert data["replication"]["retained_payloads"] == 1
-    assert data["workers"]["replication"]["running"] is True
-
-    queue = client.get("/api/v1/worker/replication")
-    assert queue.status_code == 200
-    assert queue.json()["items"][0]["level1"]["replicas"] == 1
+    assert data["workload"]["replication"]["ready"] == 1
+    assert data["workload"]["replication"]["waiting"] == 1
+    assert data["workload"]["replication"]["waiting_reasons"] == {"replica_target": 1}
+    assert data["workers"]["replication"]["process_state"] == "SLEEPING"
 
 
-def test_error_summary_is_aggregate_and_error_pages_are_bounded(client):
-    summary = client.get("/api/v1/worker/errors")
-    assert summary.status_code == 200
-    assert summary.json()["summary"]["total"] == 0
+def test_errors_list_only_permanent_failures(client, test_db):
+    failed = ARKRecord(
+        naan="12345", name="200failed", state=ARKState.DRAFT.value,
+        authority_id="test-uuid", target="https://example.org/failed",
+        processing_stage=int(ProcessingStage.CHAIN),
+        processing_status=int(ProcessingStatus.FAILED),
+    )
+    test_db.add(failed)
+    test_db.commit()
 
-    page = client.get("/api/v1/worker/errors?list=all&page=1&page_size=10")
-    assert page.status_code == 200
-    assert page.json()["pagination"]["total"] == 0
-    assert page.json()["items"] == []
+    response = client.get("/api/v1/worker/errors")
+    assert response.status_code == 200
+    assert response.json()["summary"]["total"] == 1
+    assert response.json()["items"][0]["ark"] == failed.ark

@@ -115,7 +115,7 @@ sequenceDiagram
 ### Worker Startup
 
 The worker startup path in [`app/main_worker.py`](./app/main_worker.py) supports
-four modes: `metadata`, `replication`, `chain`, and low-priority `recovery`. Every mode adds lifecycle
+three modes: `metadata`, `replication`, and `chain`. Every mode adds lifecycle
 controls on top of normal dependency init:
 
 - pidfile guard
@@ -246,7 +246,7 @@ sequenceDiagram
 
 The slow-path logic lives in [`app/workers/publisher.py`](./app/workers/publisher.py). Workers do not keep long-lived in-memory queues. Each worker queries PostgreSQL every cycle, claims work there, and records retry state in the same rows.
 
-### Why metadata, replication, chain publication, and recovery are separate
+### Why metadata, replication, and chain publication are separate
 
 Storage writes and blockchain transactions have different failure modes, latency profiles, and operational dependencies. Splitting them keeps each stage easier to reason about:
 
@@ -280,7 +280,7 @@ sequenceDiagram
         Store-->>Worker: original_cid
         Worker->>Store: store Level-1 with embedded original_cid
         Store-->>Worker: level1_cid
-        Worker->>Repo: update CIDs and advance to AVAILABILITY/PENDING
+        Worker->>Repo: update CIDs and advance to AVAILABILITY/READY
         Worker->>DB: commit
     end
 ```
@@ -296,12 +296,11 @@ sequenceDiagram
     participant Store as "Metadata backend"
 
     Loop->>Worker: run_publish_cycle()
-    Worker->>Repo: get_metadata_pending_reconciliation(limit=50, recheck=300)
+    Worker->>Repo: get_metadata_pending_reconciliation(limit=50)
     Repo->>DB: select complete CIDs with retained payload due for checking
     loop each selected ARK, concurrency 2
-        Worker->>Store: get_replication_status(L2 CID)
-        Worker->>Store: get_replication_status(L1 CID)
-        opt either CID has zero copies
+        Worker->>Store: POST /v1/status/batch (L1 + L2)
+        opt CID is unpinned or has a real Cluster error after grace/cooldown
             Worker->>Store: restore from retained payload
             Worker->>Worker: verify regenerated CID matches expected CID
         end
@@ -313,10 +312,10 @@ sequenceDiagram
     end
 ```
 
-Checks and repairs are retryable without a permanent-failure limit. A full
-50-item page continues immediately; an incomplete page sleeps 30 seconds. The
-process pauses for 10 seconds before selecting records when Store API/IPFS is
-unavailable.
+`pin_queued` and `pinning` are normal Cluster progress. The worker revisits
+them through its global idle scheduler; there are no normal per-ARK recheck
+cadences. Repairs are attempted only with evidence of a real Cluster error or
+missing pin, never while Cluster still owns an assignment.
 
 ### Chain Publication Cycle
 
@@ -418,7 +417,7 @@ flowchart LR
     C["Pending worker work"] --> D["PostgreSQL advisory lock per ARK"]
     E["Lifecycle transitions"] --> F["CAS SQL updates"]
     G["Worker singleton"] --> H["advisory lock + pidfile"]
-    I["Retry schedule"] --> J["processing_next_attempt_at"]
+    I["Scheduled normal action"] --> J["next_action_at + processing_wait_reason"]
 ```
 
 ### Counter Allocation
@@ -452,7 +451,7 @@ That design avoids long locks during slow external operations such as:
 Retry state is persisted in the DB, not memory:
 
 - `processing_stage` and `processing_status` (compact numeric workflow codes)
-- `processing_attempt_count` and `processing_next_attempt_at`
+- `processing_attempt_count`, `next_action_at`, and `processing_wait_reason`
 - `processing_error_code` and optional `processing_error_detail`
 
 That means retries survive:
@@ -474,7 +473,7 @@ Worker liveness is represented in the database through `worker_runtime_status`, 
 
 ```mermaid
 sequenceDiagram
-    participant Worker as "main_worker metadata/replication/chain/recovery"
+    participant Worker as "main_worker metadata/replication/chain"
     participant Repo as "WorkerRuntimeRepository"
     participant DB as "PostgreSQL"
     participant API as "/api/v1/worker/status"
@@ -482,9 +481,9 @@ sequenceDiagram
     Worker->>Repo: upsert_status(worker_name, RUNNING, heartbeat, counters)
     Worker->>Repo: supervisor upsert during long cycles
     Repo->>DB: UPSERT worker_runtime_status
-    API->>Repo: get_by_names(all three runtime names)
+API->>Repo: get_by_names(all three runtime names)
     Repo->>DB: one SELECT over worker_runtime_status
-    API->>API: derive running/stale flags
+API->>API: read persisted process state and next_wake_at
     API-->>Client: combined worker status payload
 ```
 
@@ -497,34 +496,28 @@ This makes worker status available even when:
 `GET /api/v1/worker/status` returns a low-cost liveness summary by default:
 
 - `overall`: `ok`, `degraded`, or `down`
-- `message`: one-line human-readable status
 - `source`: `db_heartbeat`
-- `workers.metadata`, `workers.replication`, `workers.chain`, and `workers.recovery`: worker state, liveness, heartbeat age,
+- `workers.metadata`, `workers.replication`, and `workers.chain`: process state, liveness, heartbeat age,
   last-cycle summary, and last runtime error
 
 The default path performs one bounded query over `worker_runtime_status`. It
 does not contact RPC or Store API and does not query `ark_records` or
 `ark_metadata`.
 
-In compact mode, `last_cycle.processed` is the number of ARKs attempted in the
-latest cycle. It is not a lifetime counter and it is not the queue size. For
-metadata it means attempted persistence, for replication it means retained
-payloads checked, and for chain it means attempted on-chain publication.
+In compact mode, `last_cycle.observed`, `advanced`, `waiting`, `repaired` and
+`failed` describe only the latest cycle. They are not lifetime counters and
+are not queue sizes. The heartbeat persists the actual `next_wake_at`; the API
+does not infer sleeping from the previous cycle. Full mode also reports
+`no_progress_cycles` and `stalled_suspected` when attempts produce no advance.
 
-`GET /api/v1/worker/status?detail=full` performs the expensive operational
-diagnostics: external health probes, bounded ARK aggregates, queues, errors, replication,
-chain capacity, detailed heartbeat, cadence, config, and host/process fields.
-It should be used interactively rather than as a frequent liveness probe. In
-full mode, each worker status includes `cadence` metrics:
-
-- `last_cycle_duration_seconds` and last-cycle attempted/succeeded/failed counts
-- `page_size`, `sleep_seconds`, `next_action`, and `sleep_seconds_next`
-- `last_cycle_full_page`, true when the previous cycle processed at least one full page
-- `cycle_utilization_ratio`, calculated as cycle duration divided by worker sleep
-- `ready_pages` and `estimated_seconds_to_drain_ready` for the ready queue
-- `pressure`, a compact state for operational dashboards
-
-Full status also includes `config.chain.worker_page_size`, which is the active max in-flight transaction window per authority because chain page size and pipeline size are the same.
+`GET /api/v1/worker/status?detail=full` performs the diagnostic work: external
+health probes, bounded workload aggregates, permanent errors and last-cycle
+data. `READY` work and `WAITING` work are deliberately separate; a waiting row
+always reports its reason and next scheduled action.
+It should be used interactively rather than as a frequent liveness probe. The
+full result intentionally remains bounded: one aggregate per stage/status/wait
+reason, plus the earliest next action, permanent failures, infrastructure
+probes, and the recorded last cycle.
 
 ## 11. Data Model
 
@@ -637,7 +630,7 @@ flowchart LR
 Important deployment assumptions:
 
 - blockchain is already running on `dark-net`
-- API and all four workers share PostgreSQL
+- API and all three workers share PostgreSQL
 - API, metadata worker, and replication worker share metadata storage when filesystem backend is used
 - chain worker does not need local metadata payloads; it only needs target, authority, ARK identity, and CIDs
 - `.env.integration` is the preferred deployed config file
@@ -663,3 +656,20 @@ If you are onboarding to the codebase, this order works well:
 5. [`app/workers/publisher.py`](./app/workers/publisher.py)
 6. [`app/main_worker.py`](./app/main_worker.py)
 7. [`app/middleware/auth.py`](./app/middleware/auth.py)
+
+## 16. Pinning y publicación: comportamiento implementado
+
+Store API devuelve un CID después de aceptar el `add` en Cluster; no espera a
+que el primer pin sea visible. El `ReplicationReconciliationWorker` es quien
+observa posteriormente los estados `queued`, `pinning` y `pinned` de L1 y L2.
+
+Mientras falte cualquiera de los primeros pins, el ARK permanece en
+`AVAILABILITY/WAITING`. Cuando ambos CIDs alcanzan
+`REPLICATION_PUBLISH_AFTER_REPLICAS`, pasa a `CHAIN/READY`. Después de una
+publicación exitosa, continúa en `REPLICATION` hasta alcanzar
+`REPLICATION_TARGET_REPLICAS` para ambos CIDs; solo entonces se purga el
+payload local.
+
+La selección vigente usa páginas de 100 ARKs, prioridad para availability y
+capacidad restante para durabilidad. Los CIDs se deduplican y se consultan en
+lotes de hasta 200. No existe un reparto por cuotas en esta versión.

@@ -57,6 +57,7 @@ def _store_api_health(timeout_seconds: float) -> Dict[str, Any]:
         "backend_healthy": backend_healthy,
         "available_peers": body.get("available_cluster_peers"),
         "min_peers": body.get("min_cluster_peers"),
+        "duplicate_ipfs_peer_ids": body.get("duplicate_ipfs_peer_ids"),
         "last_error": error,
     }
 
@@ -84,6 +85,7 @@ def check_metadata_storage_health(
             error = result.get("last_error")
             available_peers = result.get("available_peers")
             min_peers = result.get("min_peers")
+            duplicate_ipfs_peer_ids = result.get("duplicate_ipfs_peer_ids")
             backend_healthy = result.get("backend_healthy")
         else:
             if storage is None:
@@ -94,6 +96,7 @@ def check_metadata_storage_health(
             available_peers = None
             min_peers = None
             backend_healthy = available
+            duplicate_ipfs_peer_ids = None
 
         if available:
             with _state_lock:
@@ -111,6 +114,7 @@ def check_metadata_storage_health(
                 "backend_healthy": backend_healthy,
                 "available_peers": available_peers,
                 "min_peers": min_peers,
+                "duplicate_ipfs_peer_ids": duplicate_ipfs_peer_ids,
             }
 
         raise RuntimeError(error or "Metadata storage is unavailable")
@@ -132,4 +136,5 @@ def check_metadata_storage_health(
             "backend_healthy": False,
             "available_peers": None,
             "min_peers": None,
+            "duplicate_ipfs_peer_ids": None,
         }
