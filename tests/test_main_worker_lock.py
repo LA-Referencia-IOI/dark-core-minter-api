@@ -89,7 +89,10 @@ def test_replication_worker_uses_its_own_runtime_identity_and_defaults():
         replication_worker_page_size=50,
         replication_worker_concurrency=2,
         replication_worker_sleep_seconds=30,
-        replication_worker_recheck_seconds=300,
+        replication_pinning_recheck_seconds=2,
+        replication_queued_recheck_seconds=5,
+        replication_visibility_recheck_seconds=3,
+        replication_max_recheck_seconds=30,
         replication_worker_storage_retry_seconds=10,
     )
     with patch("app.main_worker.get_settings", return_value=settings):
@@ -101,7 +104,14 @@ def test_replication_worker_uses_its_own_runtime_identity_and_defaults():
         "page_size": 50,
         "concurrency": 2,
         "sleep_seconds": 30,
-        "recheck_seconds": 300,
+        "pinning_recheck_seconds": 2,
+        "queued_recheck_seconds": 5,
+        "visibility_recheck_seconds": 3,
+        "max_recheck_seconds": 30,
+        "repair_grace_seconds": 120,
+        "repair_cooldown_seconds": 900,
+        "status_batch_size": 200,
+        "idle_sleep_seconds": 2,
         "storage_retry_seconds": 10,
     }
     assert _build_advisory_lock_key(runtime["worker_name"]) != _build_advisory_lock_key(

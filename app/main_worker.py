@@ -33,6 +33,7 @@ from app.dependencies import (
     shutdown_metadata_storage,
 )
 from app.repositories import WorkerRuntimeRepository
+from app.repositories.ark_repository import ARKRepository
 from app.utils.storage_health import check_metadata_storage_health
 from app.workers.publisher import (
     ChainPublisherWorker,
@@ -333,32 +334,23 @@ def _worker_runtime_config(worker_kind: str):
             "worker_name": settings.metadata_worker_runtime_name,
             "page_size": settings.metadata_worker_page_size,
             "concurrency": settings.metadata_worker_concurrency,
+            "min_concurrency": settings.metadata_worker_min_concurrency,
             "sleep_seconds": settings.metadata_worker_sleep_seconds,
             "storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
             "max_retries": settings.metadata_worker_max_retries,
             "backoff_base": settings.metadata_worker_retry_backoff_base,
         }
     if worker_kind == "replication":
-        if not hasattr(settings, "availability_recheck_seconds"):
-            return {
-                "enabled": settings.replication_worker_enabled,
-                "worker_name": settings.replication_worker_runtime_name,
-                "page_size": settings.replication_worker_page_size,
-                "concurrency": settings.replication_worker_concurrency,
-                "sleep_seconds": settings.replication_worker_sleep_seconds,
-                "recheck_seconds": settings.replication_worker_recheck_seconds,
-                "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
-            }
         return {
             "enabled": settings.replication_worker_enabled,
             "worker_name": settings.replication_worker_runtime_name,
             "page_size": settings.replication_worker_page_size,
             "concurrency": settings.replication_worker_concurrency,
             "sleep_seconds": settings.replication_worker_sleep_seconds,
-            "availability_recheck_seconds": getattr(settings, "availability_recheck_seconds", getattr(settings, "replication_worker_recheck_seconds", 10)),
-            "availability_max_recheck_seconds": getattr(settings, "availability_max_recheck_seconds", 60),
-            "replication_recheck_seconds": getattr(settings, "replication_recheck_seconds", getattr(settings, "replication_worker_recheck_seconds", 300)),
-            "replication_max_recheck_seconds": getattr(settings, "replication_max_recheck_seconds", 1800),
+            "pinning_recheck_seconds": getattr(settings, "replication_pinning_recheck_seconds", 2),
+            "queued_recheck_seconds": getattr(settings, "replication_queued_recheck_seconds", 5),
+            "visibility_recheck_seconds": getattr(settings, "replication_visibility_recheck_seconds", 3),
+            "max_recheck_seconds": getattr(settings, "replication_max_recheck_seconds", 30),
             "repair_grace_seconds": getattr(settings, "replication_repair_grace_seconds", 120),
             "repair_cooldown_seconds": getattr(settings, "replication_repair_cooldown_seconds", 900),
             "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
@@ -608,10 +600,10 @@ def run_worker(worker_kind: str = "chain") -> None:
                     metadata_storage=metadata_storage,
                     page_size=runtime["page_size"],
                     concurrency=runtime["concurrency"],
-                    availability_recheck_seconds=runtime["availability_recheck_seconds"],
-                    availability_max_recheck_seconds=runtime["availability_max_recheck_seconds"],
-                    replication_recheck_seconds=runtime["replication_recheck_seconds"],
-                    replication_max_recheck_seconds=runtime["replication_max_recheck_seconds"],
+                    pinning_recheck_seconds=runtime["pinning_recheck_seconds"],
+                    queued_recheck_seconds=runtime["queued_recheck_seconds"],
+                    visibility_recheck_seconds=runtime["visibility_recheck_seconds"],
+                    max_recheck_seconds=runtime["max_recheck_seconds"],
                     repair_grace_seconds=runtime["repair_grace_seconds"],
                     repair_cooldown_seconds=runtime["repair_cooldown_seconds"],
                     publish_after_replicas=settings.replication_publish_after_replicas,
@@ -782,6 +774,16 @@ def run_worker(worker_kind: str = "chain") -> None:
             set_heartbeat_state("RUNNING", None, None)
             if worker_kind == "chain":
                 publisher.run_publish_cycle(effective_page_size=cycle_page_size)
+            elif worker_kind == "metadata":
+                pressure_db = SessionLocal()()
+                try:
+                    availability = ARKRepository(pressure_db).availability_backlog_size()
+                finally:
+                    pressure_db.close()
+                # At saturation, reserve Store/Cluster capacity for first-pin
+                # observations. Restore full ingestion only after the queue drains.
+                effective = runtime["min_concurrency"] if availability > 2000 else runtime["concurrency"]
+                publisher.run_publish_cycle(effective_concurrency=effective)
             else:
                 publisher.run_publish_cycle()
 

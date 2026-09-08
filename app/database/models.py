@@ -148,6 +148,13 @@ class ARKRecord(Base):
             "next_action_at",
         ),
         Index(
+            "ix_ark_processing_active_due",
+            "processing_stage",
+            "next_action_at",
+            "id",
+            postgresql_where=processing_status.in_([int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)]),
+        ),
+        Index(
             "ix_ark_detail_active_rollup",
             "processing_stage",
             "processing_status",

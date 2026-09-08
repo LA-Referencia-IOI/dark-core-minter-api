@@ -8,6 +8,7 @@ and workers cannot process the same ARK concurrently.
 from __future__ import annotations
 
 import logging
+import hashlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -213,7 +214,7 @@ class MetadataPersistenceWorker(_Stats):
     def persist_single_ark(self, ark_id: str) -> bool:
         return self._persist(ark_id)
 
-    def run_publish_cycle(self) -> None:
+    def run_publish_cycle(self, effective_concurrency: Optional[int] = None) -> None:
         started, before = self._start()
         db = SessionLocal()()
         try:
@@ -226,7 +227,9 @@ class MetadataPersistenceWorker(_Stats):
         finally:
             db.close()
         self.stats["last_run_page_size"] = self.page_size
-        with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
+        concurrency = max(1, min(int(effective_concurrency or self.concurrency), self.concurrency))
+        self.stats["last_effective_concurrency"] = concurrency
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
             for future in as_completed([executor.submit(self._persist, ark) for ark in arks]):
                 self.stats["total_processed"] += 1
                 self.stats["total_succeeded" if future.result() else "total_failed"] += 1
@@ -241,10 +244,10 @@ class ReplicationReconciliationWorker(_Stats):
         metadata_storage: MetadataStorage,
         page_size: int = 50,
         concurrency: int = 2,
-        availability_recheck_seconds: int = 10,
-        availability_max_recheck_seconds: int = 60,
-        replication_recheck_seconds: int = 300,
-        replication_max_recheck_seconds: int = 1800,
+        pinning_recheck_seconds: int = 2,
+        queued_recheck_seconds: int = 5,
+        visibility_recheck_seconds: int = 3,
+        max_recheck_seconds: int = 30,
         repair_grace_seconds: int = 120,
         repair_cooldown_seconds: int = 900,
         publish_after_replicas: int = 1,
@@ -256,17 +259,45 @@ class ReplicationReconciliationWorker(_Stats):
         self.service = MetadataService(metadata_storage)
         self.page_size = max(int(page_size), 1)
         self.concurrency = max(int(concurrency), 1)
-        self.availability_recheck_seconds = max(int(availability_recheck_seconds), 0)
-        self.availability_max_recheck_seconds = max(int(availability_max_recheck_seconds), self.availability_recheck_seconds)
-        self.replication_recheck_seconds = max(int(replication_recheck_seconds), 0)
-        self.replication_max_recheck_seconds = max(int(replication_max_recheck_seconds), self.replication_recheck_seconds)
+        self.pinning_recheck_seconds = max(int(pinning_recheck_seconds), 1)
+        self.queued_recheck_seconds = max(int(queued_recheck_seconds), 1)
+        self.visibility_recheck_seconds = max(int(visibility_recheck_seconds), 1)
+        self.max_recheck_seconds = max(int(max_recheck_seconds), self.queued_recheck_seconds)
         self.repair_grace_seconds = max(int(repair_grace_seconds), 0)
         self.repair_cooldown_seconds = max(int(repair_cooldown_seconds), 0)
         self.publish_after = max(int(publish_after_replicas), 1)
         self.target_replicas = max(int(target_replicas), self.publish_after)
         self.status_batch_size = min(max(int(status_batch_size), 1), 200)
         self.idle_sleep_seconds = max(int(idle_sleep_seconds), 1)
+        self._recent_statuses: dict[str, tuple[datetime, Any]] = {}
         self._init_stats()
+
+    def _wait_schedule(
+        self,
+        ark: str,
+        reason: ProcessingWaitReason,
+        previous_reason: int | None,
+        previous_replicas: int,
+        replicas: int,
+        observations: int,
+    ) -> datetime:
+        """Schedule normal Cluster propagation with bounded exponential backoff.
+
+        The wait reason and confirmed count are persisted already, so no extra
+        state/table is required. A state/count change starts a fresh backoff.
+        """
+        base = {
+            ProcessingWaitReason.CLUSTER_PINNING: self.pinning_recheck_seconds,
+            ProcessingWaitReason.INITIAL_VISIBILITY: self.visibility_recheck_seconds,
+            ProcessingWaitReason.CLUSTER_QUEUED: self.queued_recheck_seconds,
+        }.get(reason, self.max_recheck_seconds)
+        changed = int(previous_reason or 0) != int(reason) or replicas > previous_replicas
+        exponent = 0 if changed else min(max(observations - 1, 0), 8)
+        seconds = min(base * (2 ** exponent), self.max_recheck_seconds)
+        # Stable +/- 10% jitter spreads a simultaneous batch without making
+        # behaviour nondeterministic or hard to diagnose.
+        jitter = ((int(hashlib.sha256(ark.encode("utf-8")).hexdigest()[:8], 16) % 21) - 10) / 100
+        return _now() + timedelta(seconds=max(1, seconds * (1 + jitter)))
 
     def _reconcile(self, ark: str, observed_statuses: Optional[dict[str, Any]] = None) -> dict[str, int]:
         result = {"checked": 1, "advanced": 0, "waiting": 0, "repaired": 0, "purged": 0, "failed": 0}
@@ -304,6 +335,10 @@ class ReplicationReconciliationWorker(_Stats):
                 level1_status = statuses.get(level1_cid)
                 if level2_status is None or level1_status is None:
                     raise ValueError("Store API batch status omitted a CID")
+                if str(level1_status.status).lower() == "unknown" or str(level2_status.status).lower() == "unknown":
+                    # Store API returns partial batch results. Requeue only
+                    # this ARK instead of failing unrelated CIDs in the page.
+                    raise TimeoutError("Store API did not complete this CID observation")
                 if (
                     level2_status.total_replicas == 0
                     and level2_status.status in {"unpinned", "error"}
@@ -345,6 +380,9 @@ class ReplicationReconciliationWorker(_Stats):
                     or current_metadata.original_cid != level2_cid
                 ):
                     return {**result, "checked": 0}
+                old_l1 = int(current_metadata.level1_replica_count or 0)
+                old_l2 = int(current_metadata.level2_replica_count or 0)
+                previous_reason = current.processing_wait_reason
                 current_metadata.level1_replica_count = max(int(level1_status.total_replicas), 0)
                 current_metadata.level2_replica_count = max(int(level2_status.total_replicas), 0)
                 current_metadata.replication_checked_at = now
@@ -364,16 +402,21 @@ class ReplicationReconciliationWorker(_Stats):
                         current.processing_wait_reason = int(ProcessingWaitReason.NONE)
                         result["advanced"] += 1
                     else:
-                        # Cluster propagation is a normal scheduled action.
-                        current.processing_status = int(ProcessingStatus.WAITING)
-                        current.next_action_at = None
-                        current.processing_wait_reason = int(
+                        statuses_seen = {str(level1_status.status).lower(), str(level2_status.status).lower()}
+                        reason = (
                             ProcessingWaitReason.CLUSTER_QUEUED
-                            if "queued" in {level1_status.status, level2_status.status}
+                            if "queued" in statuses_seen
                             else ProcessingWaitReason.CLUSTER_PINNING
-                            if "pinning" in {level1_status.status, level2_status.status}
+                            if "pinning" in statuses_seen
                             else ProcessingWaitReason.INITIAL_VISIBILITY
                         )
+                        # Cluster propagation is a normal scheduled action.
+                        current.processing_status = int(ProcessingStatus.WAITING)
+                        current.next_action_at = self._wait_schedule(
+                            ark, reason, previous_reason, min(old_l1, old_l2), replicas,
+                            int(current_metadata.replication_observation_count or 1),
+                        )
+                        current.processing_wait_reason = int(reason)
                         result["waiting"] += 1
                 elif replicas >= self.target_replicas:
                     current_metadata.level1_json = None
@@ -390,7 +433,7 @@ class ReplicationReconciliationWorker(_Stats):
                     # has not been reached yet.  Keep it in the normal
                     # replication queue and re-observe it later.
                     current.processing_status = int(ProcessingStatus.WAITING)
-                    current.next_action_at = None
+                    current.next_action_at = _now() + timedelta(seconds=self.max_recheck_seconds)
                     current.processing_wait_reason = int(ProcessingWaitReason.REPLICA_TARGET)
                     result["waiting"] += 1
                 db.commit()
@@ -402,7 +445,7 @@ class ReplicationReconciliationWorker(_Stats):
                     ark,
                     f"replication reconciliation failed: {exc}",
                     int(ProcessingErrorCode.REPLICATION_UNAVAILABLE),
-                    delay_seconds=self.availability_recheck_seconds,
+                    delay_seconds=self.pinning_recheck_seconds,
                 )
                 db.commit()
                 self._error(ark, f"replication reconciliation failed: {exc}")
@@ -414,25 +457,13 @@ class ReplicationReconciliationWorker(_Stats):
         maintenance = False
         try:
             repo = ARKRepository(db)
-            records = repo.get_metadata_pending_reconciliation(
-                self.page_size,
-                self.availability_recheck_seconds,
-                stage=int(ProcessingStage.AVAILABILITY),
-            )
+            records = repo.get_reconciliation_candidates(self.page_size, int(ProcessingStage.AVAILABILITY))
             if not records and not repo.has_critical_reconciliation_backlog():
                 maintenance = True
-                records = repo.get_metadata_pending_reconciliation(
-                    self.page_size,
-                    self.replication_recheck_seconds,
-                    stage=int(ProcessingStage.REPLICATION),
-                )
+                records = repo.get_reconciliation_candidates(self.page_size, int(ProcessingStage.REPLICATION))
             self.stats["last_reconciliation_mode"] = "maintenance" if maintenance else "first_pin"
             self.stats["last_maintenance_block_reason"] = None if maintenance or records else "critical_backlog"
-            ark_cids: dict[str, tuple[str, str]] = {}
-            for record in records:
-                metadata = ARKRepository(db).get_metadata_by_ark_id(record.id)
-                if metadata and metadata.level1_cid and metadata.original_cid:
-                    ark_cids[record.ark] = (metadata.level1_cid, metadata.original_cid)
+            ark_cids = {record.ark: (record.level1_cid, record.level2_cid) for record in records}
         finally:
             db.close()
         if maintenance and ark_cids:
@@ -449,14 +480,31 @@ class ReplicationReconciliationWorker(_Stats):
                 logger.warning("Durability promotion request failed: %s", exc)
         unique_cids = sorted({cid for pair in ark_cids.values() for cid in pair})
         observed: dict[str, Any] = {}
-        for offset in range(0, len(unique_cids), self.status_batch_size):
-            batch = unique_cids[offset:offset + self.status_batch_size]
+        observed_at = _now()
+        # A CID can be shared by records selected in adjacent cycles. Avoid a
+        # duplicate remote probe inside the two-second observation window.
+        for cid in unique_cids:
+            cached = self._recent_statuses.get(cid)
+            if cached and (observed_at - cached[0]).total_seconds() < 2:
+                observed[cid] = cached[1]
+        pending_cids = [cid for cid in unique_cids if cid not in observed]
+        batch_count = 0
+        batch_started = _now()
+        for offset in range(0, len(pending_cids), self.status_batch_size):
+            batch = pending_cids[offset:offset + self.status_batch_size]
             try:
-                observed.update(self.storage.get_replication_statuses(batch))
+                fresh = self.storage.get_replication_statuses(batch)
+                observed.update(fresh)
+                self._recent_statuses.update({cid: (_now(), status) for cid, status in fresh.items()})
+                batch_count += 1
             except Exception as exc:
                 # Leave this batch absent so each affected ARK is deferred by
                 # its normal retry path; unrelated CID batches can proceed.
                 logger.warning("Replication status batch failed (%s CIDs): %s", len(batch), exc)
+        self._recent_statuses = {
+            cid: value for cid, value in self._recent_statuses.items()
+            if (_now() - value[0]).total_seconds() < 2
+        }
         arks = list(ark_cids)
         totals = {"checked": 0, "advanced": 0, "waiting": 0, "repaired": 0, "purged": 0, "failed": 0}
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
@@ -477,7 +525,15 @@ class ReplicationReconciliationWorker(_Stats):
                 "last_reconciliation_repaired": totals["repaired"],
                 "last_reconciliation_purged": totals["purged"],
                 "last_reconciliation_failed": totals["failed"],
+                "last_reconciliation_unique_cids": len(unique_cids),
+                "last_reconciliation_batches": batch_count,
+                "last_reconciliation_status_seconds": (_now() - batch_started).total_seconds(),
             }
+        )
+        logger.info(
+            "Replication cycle mode=%s arks=%s unique_cids=%s batches=%s advanced=%s waiting=%s failed=%s",
+            self.stats["last_reconciliation_mode"], len(arks), len(unique_cids), batch_count,
+            totals["advanced"], totals["waiting"], totals["failed"],
         )
         self._finish(started, before)
 
@@ -486,10 +542,7 @@ class ReplicationReconciliationWorker(_Stats):
         db = SessionLocal()()
         try:
             repository = ARKRepository(db)
-            due = repository.get_metadata_pending_reconciliation(
-                1,
-                self.availability_recheck_seconds,
-            )
+            due = repository.get_reconciliation_candidates(1, int(ProcessingStage.AVAILABILITY))
             if due:
                 return 0, "continue_due_work"
             next_due = repository.get_next_reconciliation_action_at()
@@ -797,7 +850,13 @@ class ARKPublisher(_Stats):
             metadata_storage, page_size, 1, max_retries, backoff_base
         )
         self.replication_worker = ReplicationReconciliationWorker(
-            metadata_storage, page_size, 1, 0, 1, 1
+            metadata_storage=metadata_storage,
+            page_size=page_size,
+            concurrency=1,
+            pinning_recheck_seconds=1,
+            queued_recheck_seconds=1,
+            visibility_recheck_seconds=1,
+            max_recheck_seconds=1,
         )
         self.chain_worker = ChainPublisherWorker(
             corelib_client, page_size, max_retries, backoff_base

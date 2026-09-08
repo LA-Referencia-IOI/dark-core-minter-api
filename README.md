@@ -17,9 +17,14 @@ publication using `dark-core-lib`.
    - move ARKs into `DRAFT` or `UPDATE`
 2. asynchronous worker work
    - persist Level-2 and Level-1 metadata to the configured storage backend
-   - retain staged metadata until the configured topology target is observed
+   - confirm one real L1/L2 pin before publication; request final durability only after the critical queue is clear
    - publish `create_ark` or `update_ark` on-chain through `dark-core-lib`
    - finalize the ARK as `PUBLISHED`
+
+Normal Cluster states (`queued`, `pinning`, initial visibility) are scheduled
+with explicit bounded backoff through `next_action_at`; they are not errors.
+The deployer-level operational policy is documented in
+[`publication-latency-control.md`](../../../docs/publication-latency-control.md).
 
 This separation gives us better resilience, simpler retries, and a cleaner operational model.
 

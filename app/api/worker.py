@@ -9,7 +9,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import case, func
+from sqlalchemy import case, func, text
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -110,6 +110,11 @@ def _process(record, cfg: dict[str, Any], now: datetime, stale_after: int) -> di
         "no_progress_cycles": no_progress_cycles,
         "stalled_suspected": no_progress_cycles >= 3,
         "last_error": record.last_error,
+        "totals": {
+            "processed": int(record.total_processed or 0),
+            "advanced": int(record.total_succeeded or 0),
+            "failed": int(record.total_failed or 0),
+        },
     }
 
 
@@ -120,6 +125,7 @@ def _workload(db: Session) -> dict[str, Any]:
         name: {
             "ready_now": 0,
             "waiting": 0,
+            "oldest_wait_seconds": 0,
             "next_action_at": None,
             "waiting_reasons": {},
             "failed": 0,
@@ -129,10 +135,10 @@ def _workload(db: Session) -> dict[str, Any]:
     }
     owner = {int(stage): name for name, stages in WORKER_STAGES.items() for stage in stages}
     due = case((ARKRecord.next_action_at <= now, 1), else_=0)
-    rows = db.query(ARKRecord.processing_stage, ARKRecord.processing_status, ARKRecord.processing_wait_reason, due, func.count(), func.min(ARKRecord.next_action_at)).filter(
+    rows = db.query(ARKRecord.processing_stage, ARKRecord.processing_status, ARKRecord.processing_wait_reason, due, func.count(), func.min(ARKRecord.next_action_at), func.min(ARKRecord.created_at)).filter(
         ARKRecord.state.in_([ARKState.DRAFT.value, ARKState.UPDATE.value, ARKState.PUBLISHED.value])
     ).group_by(ARKRecord.processing_stage, ARKRecord.processing_status, ARKRecord.processing_wait_reason, due).all()
-    for stage, status, reason, is_due, count, earliest in rows:
+    for stage, status, reason, is_due, count, earliest, oldest_created in rows:
         name = owner.get(int(stage))
         if not name:
             continue
@@ -151,6 +157,8 @@ def _workload(db: Session) -> dict[str, Any]:
             item["waiting_reasons"][label] = item["waiting_reasons"].get(label, 0) + int(count)
             if earliest and (item["next_action_at"] is None or earliest < item["next_action_at"]):
                 item["next_action_at"] = earliest
+            if oldest_created:
+                item["oldest_wait_seconds"] = max(item["oldest_wait_seconds"], round((now - oldest_created).total_seconds(), 1))
         elif int(status) == int(ProcessingStatus.FAILED):
             item["failed"] += int(count)
             stage_totals["failed"] += int(count)
@@ -185,6 +193,12 @@ def _workload(db: Session) -> dict[str, Any]:
         "metadata_backlog" if critical_metadata else
         "first_pin_backlog" if critical_availability else None
     )
+    availability_total = result["replication"]["by_stage"].get("availability", {})
+    availability_pressure = int(availability_total.get("ready_now", 0) + availability_total.get("waiting", 0))
+    result["replication"]["availability_pressure"] = (
+        "saturated" if availability_pressure > 2000 or result["replication"]["oldest_wait_seconds"] > 300
+        else "busy" if availability_pressure >= 500 else "normal"
+    )
     return result
 
 
@@ -198,6 +212,32 @@ def _errors_summary(db: Session) -> dict[str, Any]:
         by_stage[stage_label] = by_stage.get(stage_label, 0) + int(count)
         by_code[code_label_value] = by_code.get(code_label_value, 0) + int(count)
     return {"total": sum(by_stage.values()), "by_stage": by_stage, "by_code": by_code}
+
+
+def _backlog_age_metrics(db: Session) -> dict[str, Any]:
+    """One bounded aggregate for the expensive diagnostic mode only."""
+    stages = [int(ProcessingStage.METADATA), int(ProcessingStage.AVAILABILITY), int(ProcessingStage.CHAIN)]
+    base = db.query(
+        func.count(ARKRecord.id),
+        func.min(ARKRecord.created_at),
+    ).filter(
+        ARKRecord.processing_stage.in_(stages),
+        ARKRecord.processing_status.in_([int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)]),
+    )
+    count, oldest = base.one()
+    result = {"count": int(count or 0), "oldest_seconds": round((_now() - oldest).total_seconds(), 1) if oldest else 0}
+    # Percentiles are PostgreSQL-specific. The deployment requires PostgreSQL;
+    # leave them explicit-but-unavailable for lightweight SQLite unit tests.
+    if db.bind and db.bind.dialect.name == "postgresql" and count:
+        p50, p95 = db.execute(text("""
+            SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at))),
+                   percentile_cont(0.95) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - created_at)))
+            FROM ark_records
+            WHERE processing_stage IN (1, 2, 4)
+              AND processing_status IN (1, 2)
+        """)).one()
+        result.update({"p50_seconds": round(float(p50 or 0), 1), "p95_seconds": round(float(p95 or 0), 1)})
+    return result
 
 
 def _simple_status(db: Session) -> dict[str, Any]:
@@ -219,11 +259,16 @@ def get_worker_status(detail: str = Query("simple", pattern="^(simple|workload|i
     if detail in {"workload", "full"}:
         response["workload"] = _workload(db)
         response["errors"] = _errors_summary(db)
+        response["backlog_age"] = _backlog_age_metrics(db)
         response["configuration"] = {
             "replication": {
                 "page_size": settings.replication_worker_page_size,
                 "status_batch_size": settings.replication_status_batch_size,
                 "idle_sleep_seconds": settings.replication_idle_sleep_seconds,
+                "pinning_recheck_seconds": settings.replication_pinning_recheck_seconds,
+                "queued_recheck_seconds": settings.replication_queued_recheck_seconds,
+                "visibility_recheck_seconds": settings.replication_visibility_recheck_seconds,
+                "max_recheck_seconds": settings.replication_max_recheck_seconds,
                 "publish_after_replicas": settings.replication_publish_after_replicas,
                 "target_replicas": settings.replication_target_replicas,
             }

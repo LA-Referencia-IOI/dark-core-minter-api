@@ -59,6 +59,7 @@ class Settings(BaseSettings):
     metadata_worker_enabled: bool = True
     metadata_worker_page_size: int = 100
     metadata_worker_concurrency: int = 4
+    metadata_worker_min_concurrency: int = 2
     metadata_worker_sleep_seconds: int = 2
     metadata_worker_storage_retry_seconds: int = 10
     metadata_worker_max_retries: int = 5
@@ -68,11 +69,11 @@ class Settings(BaseSettings):
     replication_worker_enabled: bool = True
     replication_worker_page_size: int = 100
     replication_worker_concurrency: int = 2
-    replication_worker_sleep_seconds: int = 30
-    availability_recheck_seconds: int = 10
-    availability_max_recheck_seconds: int = 60
-    replication_recheck_seconds: int = 300
-    replication_max_recheck_seconds: int = 1800
+    replication_worker_sleep_seconds: int = 2
+    replication_pinning_recheck_seconds: int = 2
+    replication_queued_recheck_seconds: int = 5
+    replication_visibility_recheck_seconds: int = 3
+    replication_max_recheck_seconds: int = 30
     replication_repair_grace_seconds: int = 120
     replication_repair_cooldown_seconds: int = 900
     replication_worker_storage_retry_seconds: int = 10
@@ -147,16 +148,14 @@ class Settings(BaseSettings):
                 "REPLICATION_PUBLISH_AFTER_REPLICAS"
             )
         for field_name in (
-            "availability_recheck_seconds", "availability_max_recheck_seconds",
-            "replication_recheck_seconds", "replication_max_recheck_seconds",
+            "replication_pinning_recheck_seconds", "replication_queued_recheck_seconds",
+            "replication_visibility_recheck_seconds", "replication_max_recheck_seconds",
             "replication_repair_grace_seconds", "replication_repair_cooldown_seconds",
         ):
             if getattr(self, field_name) < 0:
                 raise ValueError(f"{field_name.upper()} cannot be negative")
-        if self.availability_max_recheck_seconds < self.availability_recheck_seconds:
-            raise ValueError("AVAILABILITY_MAX_RECHECK_SECONDS must be >= AVAILABILITY_RECHECK_SECONDS")
-        if self.replication_max_recheck_seconds < self.replication_recheck_seconds:
-            raise ValueError("REPLICATION_MAX_RECHECK_SECONDS must be >= REPLICATION_RECHECK_SECONDS")
+        if self.metadata_worker_min_concurrency < 1 or self.metadata_worker_min_concurrency > self.metadata_worker_concurrency:
+            raise ValueError("METADATA_WORKER_MIN_CONCURRENCY must be between 1 and METADATA_WORKER_CONCURRENCY")
         if self.replication_status_batch_size < 1 or self.replication_status_batch_size > 200:
             raise ValueError("REPLICATION_STATUS_BATCH_SIZE must be between 1 and 200")
         if self.replication_idle_sleep_seconds < 1:

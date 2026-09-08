@@ -2,6 +2,7 @@
 ARK repository for database operations.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -11,6 +12,16 @@ from sqlalchemy.orm import Session
 from app.database.models import ARKRecord, ARKMetadata, ProcessingErrorCodeModel
 from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingWaitReason
 from app.models.states import ARKState
+
+
+@dataclass(frozen=True)
+class ReconciliationCandidate:
+    """Joined, bounded input for a single replication observation."""
+
+    ark: str
+    record_id: int
+    level1_cid: str
+    level2_cid: str
 
 
 def _utc_now() -> datetime:
@@ -407,10 +418,7 @@ class ARKRepository:
         """Return a work-conserving page, prioritizing first-pin work."""
         now = _utc_now()
         del recheck_seconds
-        normal_queue = or_(
-            ARKRecord.next_action_at.is_(None),
-            ARKRecord.next_action_at <= now,
-        )
+        normal_queue = _ready_for_processing_filter(now)
 
         def query_for(stage: int, quota: int) -> List[ARKRecord]:
             query = (
@@ -420,16 +428,12 @@ class ARKRepository:
                 ARKMetadata.level1_cid.isnot(None),
                 ARKMetadata.original_cid.isnot(None),
                 normal_queue,
-                ARKRecord.processing_status.in_([
-                    int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)
-                ]),
                 ARKRecord.processing_stage == stage,
             )
             .order_by(
                 ARKRecord.next_action_at.asc().nullsfirst(),
                 ARKMetadata.replication_checked_at.asc().nullsfirst(),
-                ARKRecord.authority_id.asc(),
-                ARKMetadata.updated_at.asc(),
+                ARKRecord.id.asc(),
             )
             )
             return self._claim_ready_records(query, quota, max_retries=0, backoff_base=1.0)
@@ -442,6 +446,33 @@ class ARKRepository:
         durability = query_for(int(ProcessingStage.REPLICATION), limit - len(availability))
         selected = availability + durability
         return selected[:limit]
+
+    def get_reconciliation_candidates(
+        self, limit: int, stage: int
+    ) -> List[ReconciliationCandidate]:
+        """Return CIDs with the selector in one SQL query, not N+1 lookups."""
+        now = _utc_now()
+        rows = (
+            self.db.query(ARKRecord, ARKMetadata)
+            .join(ARKMetadata, ARKMetadata.ark_record_id == ARKRecord.id)
+            .filter(
+                ARKMetadata.level1_cid.isnot(None),
+                ARKMetadata.original_cid.isnot(None),
+                _ready_for_processing_filter(now),
+                ARKRecord.processing_stage == int(stage),
+            )
+            .order_by(
+                ARKRecord.next_action_at.asc().nullsfirst(),
+                ARKMetadata.replication_checked_at.asc().nullsfirst(),
+                ARKRecord.id.asc(),
+            )
+            .limit(limit)
+            .all()
+        )
+        return [
+            ReconciliationCandidate(record.ark, record.id, metadata.level1_cid, metadata.original_cid)
+            for record, metadata in rows
+        ]
 
     def has_critical_reconciliation_backlog(self) -> bool:
         """Whether metadata persistence or first-pin work still exists."""
@@ -468,6 +499,13 @@ class ARKRepository:
             .first()
         )
         return availability is not None
+
+    def availability_backlog_size(self) -> int:
+        """Cheap count used only by the metadata worker pressure controller."""
+        return int(self.db.query(ARKRecord.id).filter(
+            ARKRecord.processing_stage == int(ProcessingStage.AVAILABILITY),
+            ARKRecord.processing_status.in_([int(ProcessingStatus.READY), int(ProcessingStatus.WAITING)]),
+        ).count())
 
     def get_next_reconciliation_action_at(self):
         """Return the next scheduled availability/durability observation."""

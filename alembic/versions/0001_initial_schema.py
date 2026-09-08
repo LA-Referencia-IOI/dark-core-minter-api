@@ -146,6 +146,13 @@ def upgrade() -> None:
     op.create_index("ix_state_authority", "ark_records", ["state", "authority_id"], unique=False)
     op.create_index("ix_ark_processing_queue", "ark_records", ["processing_stage", "processing_status", "next_action_at"], unique=False)
     op.create_index(
+        "ix_ark_processing_active_due",
+        "ark_records",
+        ["processing_stage", "next_action_at", "id"],
+        unique=False,
+        postgresql_where=sa.text("processing_status IN (1, 2)"),
+    )
+    op.create_index(
         "ix_ark_detail_active_rollup",
         "ark_records",
         ["processing_stage", "processing_status", "processing_wait_reason", "next_action_at"],
