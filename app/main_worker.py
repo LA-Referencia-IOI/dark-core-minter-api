@@ -194,6 +194,10 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
             "last_replication_promotion_candidates": 0,
             "last_replication_promotion_requested": 0,
             "last_replication_promotion_deferred": 0,
+            "last_replication_promotions_accepted": 0,
+            "last_replication_confirmed_cids": 0,
+            "last_replication_pending_cids": 0,
+            "last_replication_batch_latency_ms": 0,
         }
 
     raw_stats = publisher.stats
@@ -219,6 +223,10 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
         "last_replication_promotion_candidates": int(raw_stats.get("last_replication_promotion_candidates", 0) or 0),
         "last_replication_promotion_requested": int(raw_stats.get("last_replication_promotion_requested", 0) or 0),
         "last_replication_promotion_deferred": int(raw_stats.get("last_replication_promotion_deferred", 0) or 0),
+        "last_replication_promotions_accepted": int(raw_stats.get("last_replication_promotions_accepted", 0) or 0),
+        "last_replication_confirmed_cids": int(raw_stats.get("last_replication_confirmed_cids", 0) or 0),
+        "last_replication_pending_cids": int(raw_stats.get("last_replication_pending_cids", 0) or 0),
+        "last_replication_batch_latency_ms": int(raw_stats.get("last_replication_batch_latency_ms", 0) or 0),
     }
 
 
@@ -317,6 +325,10 @@ def _persist_worker_heartbeat(
             last_reconciliation_repaired=stats["last_reconciliation_repaired"],
             last_reconciliation_purged=stats["last_reconciliation_purged"],
             last_reconciliation_failed=stats["last_reconciliation_failed"],
+            last_replication_promotions_accepted=stats["last_replication_promotions_accepted"],
+            last_replication_confirmed_cids=stats["last_replication_confirmed_cids"],
+            last_replication_pending_cids=stats["last_replication_pending_cids"],
+            last_replication_batch_latency_ms=stats["last_replication_batch_latency_ms"],
             last_error=last_error,
             total_processed=stats["total_processed"],
             total_succeeded=stats["total_succeeded"],
@@ -345,6 +357,7 @@ def _worker_runtime_config(worker_kind: str):
             "storage_retry_seconds": settings.metadata_worker_storage_retry_seconds,
             "max_retries": settings.metadata_worker_max_retries,
             "backoff_base": settings.metadata_worker_retry_backoff_base,
+            "max_idle_sleep_seconds": getattr(settings, "worker_max_idle_sleep_seconds", 10),
         }
     if worker_kind == "replication":
         return {
@@ -363,9 +376,12 @@ def _worker_runtime_config(worker_kind: str):
             "repair_cooldown_seconds": getattr(settings, "replication_repair_cooldown_seconds", 900),
             "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
             "status_batch_size": getattr(settings, "replication_status_batch_size", 200),
-            "promotion_batch_size": getattr(settings, "replication_promotion_batch_size", 20),
+            "promotion_batch_size": getattr(settings, "replication_promotion_batch_size", 100),
             "maintenance_cycle_seconds": getattr(settings, "replication_maintenance_cycle_seconds", 5),
             "idle_sleep_seconds": getattr(settings, "replication_idle_sleep_seconds", 2),
+            "promotion_pressure_high_percent": getattr(settings, "replication_promotion_pressure_high_percent", 80),
+            "promotion_pressure_medium_percent": getattr(settings, "replication_promotion_pressure_medium_percent", 50),
+            "promotion_min_batch_size": getattr(settings, "replication_promotion_min_batch_size", 20),
         }
     if worker_kind == "chain":
         return {
@@ -382,6 +398,7 @@ def _worker_runtime_config(worker_kind: str):
             "healthy_cycles_before_growing": settings.chain_worker_healthy_cycles_before_growing,
             "max_retries": settings.chain_worker_max_retries,
             "backoff_base": settings.chain_worker_retry_backoff_base,
+            "max_idle_sleep_seconds": getattr(settings, "worker_max_idle_sleep_seconds", 10),
         }
     raise ValueError(f"Unsupported worker kind: {worker_kind}")
 
@@ -403,6 +420,20 @@ def _select_next_sleep_seconds(publisher: Optional[Any], runtime: Dict[str, Any]
     if _last_cycle_processed(publisher) >= page_size:
         return 0, "continue"
     return max(int(runtime["sleep_seconds"]), 0), "sleep"
+
+
+def _progressive_idle_sleep_seconds(worker_kind: str, processed: int, empty_cycles: int,
+                                    base_sleep_seconds: int, max_idle_sleep_seconds: int) -> tuple[int, int, str]:
+    """Back off empty Metadata/Chain loops without delaying discovered work."""
+    if worker_kind not in {"metadata", "chain"} or processed > 0:
+        return base_sleep_seconds, 0, "sleep" if base_sleep_seconds else "continue"
+    empty_cycles += 1
+    cap = max(int(max_idle_sleep_seconds), 1)
+    if empty_cycles >= 10:
+        return min(10, cap), empty_cycles, "idle_backoff_10s"
+    if empty_cycles >= 3:
+        return min(5, cap), empty_cycles, "idle_backoff_5s"
+    return base_sleep_seconds, empty_cycles, "idle_minimum"
 
 
 def _rpc_pause_sleep_seconds(runtime: Dict[str, Any]) -> int:
@@ -625,6 +656,9 @@ def run_worker(worker_kind: str = "chain") -> None:
                     promotion_batch_size=runtime["promotion_batch_size"],
                     maintenance_cycle_seconds=runtime["maintenance_cycle_seconds"],
                     idle_sleep_seconds=runtime["idle_sleep_seconds"],
+                    promotion_pressure_high_percent=runtime["promotion_pressure_high_percent"],
+                    promotion_pressure_medium_percent=runtime["promotion_pressure_medium_percent"],
+                    promotion_min_batch_size=runtime["promotion_min_batch_size"],
                 )
         else:
             logger.info("Chain worker will initialize blockchain client after RPC is available")
@@ -696,6 +730,7 @@ def run_worker(worker_kind: str = "chain") -> None:
         )
         heartbeat_supervisor.start()
 
+        empty_cycle_count = 0
         while not _shutdown_event.is_set():
             cycle_page_size = None
             if worker_kind == "chain":
@@ -823,6 +858,12 @@ def run_worker(worker_kind: str = "chain") -> None:
             persist_current_heartbeat()
 
             sleep_seconds, sleep_reason = _select_next_sleep_seconds(publisher, runtime)
+            sleep_seconds, empty_cycle_count, idle_reason = _progressive_idle_sleep_seconds(
+                worker_kind, _last_cycle_processed(publisher), empty_cycle_count,
+                sleep_seconds, int(runtime.get("max_idle_sleep_seconds", 10)),
+            )
+            if idle_reason.startswith("idle_"):
+                sleep_reason = idle_reason
             logger.info(
                 f"Worker cycle finished (processed: {_last_cycle_processed(publisher)}, "
                 f"sleep: {sleep_seconds}s, reason: {sleep_reason})"

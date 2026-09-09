@@ -923,3 +923,9 @@ Remember the split responsibility:
 - [noid.md](./noid.md)
 - [minter-architecture.md](./minter-architecture.md)
 - [notebooks/README.md](./notebooks/README.md)
+Replication heartbeats also expose four bounded last-cycle aggregates:
+`promotions_accepted`, `confirmed_cids`, `pending_cids`, and
+`batch_latency_ms`. Technical per-cycle deferrals are named
+`transient_deferred`; they are not permanent ARK errors. Promotion pressure is
+derived from the already-fetched Cluster batch and can reduce the durability
+budget from 100 to 50 or 20 without affecting first-pin priority.

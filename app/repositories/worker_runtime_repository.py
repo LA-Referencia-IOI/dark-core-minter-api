@@ -58,6 +58,10 @@ class WorkerRuntimeRepository:
         last_reconciliation_repaired: int = 0,
         last_reconciliation_purged: int = 0,
         last_reconciliation_failed: int = 0,
+        last_replication_promotions_accepted: int = 0,
+        last_replication_confirmed_cids: int = 0,
+        last_replication_pending_cids: int = 0,
+        last_replication_batch_latency_ms: int = 0,
         last_error: Optional[str] = None,
         total_processed: int = 0,
         total_succeeded: int = 0,
@@ -93,6 +97,10 @@ class WorkerRuntimeRepository:
                 last_reconciliation_repaired=last_reconciliation_repaired,
                 last_reconciliation_purged=last_reconciliation_purged,
                 last_reconciliation_failed=last_reconciliation_failed,
+                last_replication_promotions_accepted=last_replication_promotions_accepted,
+                last_replication_confirmed_cids=last_replication_confirmed_cids,
+                last_replication_pending_cids=last_replication_pending_cids,
+                last_replication_batch_latency_ms=last_replication_batch_latency_ms,
                 last_error=last_error,
                 total_processed=total_processed,
                 total_succeeded=total_succeeded,
@@ -121,6 +129,10 @@ class WorkerRuntimeRepository:
         record.last_reconciliation_repaired = last_reconciliation_repaired
         record.last_reconciliation_purged = last_reconciliation_purged
         record.last_reconciliation_failed = last_reconciliation_failed
+        record.last_replication_promotions_accepted = last_replication_promotions_accepted
+        record.last_replication_confirmed_cids = last_replication_confirmed_cids
+        record.last_replication_pending_cids = last_replication_pending_cids
+        record.last_replication_batch_latency_ms = last_replication_batch_latency_ms
         record.last_error = last_error
         attempted = int(last_cycle_processed or 0)
         if worker_name and last_reconciliation_at is not None:

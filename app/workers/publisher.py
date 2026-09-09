@@ -88,6 +88,14 @@ class _Stats:
             "last_reconciliation_mode": "first_pin",
             "last_maintenance_block_reason": None,
             "last_replication_promotions": 0,
+            "last_replication_promotions_accepted": 0,
+            "last_replication_confirmed_cids": 0,
+            "last_replication_pending_cids": 0,
+            "last_replication_batch_latency_ms": 0,
+            "last_replication_assigned_target": 0,
+            "last_replication_queued_cids": 0,
+            "last_replication_pinning_cids": 0,
+            "last_replication_remote_cids": 0,
         }
 
     def get_stats(self) -> dict[str, Any]:
@@ -254,7 +262,10 @@ class ReplicationReconciliationWorker(_Stats):
         publish_after_replicas: int = 1,
         target_replicas: int = 2,
         status_batch_size: int = 200,
-        promotion_batch_size: int = 20,
+        promotion_batch_size: int = 100,
+        promotion_pressure_high_percent: int = 80,
+        promotion_pressure_medium_percent: int = 50,
+        promotion_min_batch_size: int = 20,
         maintenance_cycle_seconds: int = 5,
         idle_sleep_seconds: int = 2,
     ):
@@ -282,10 +293,42 @@ class ReplicationReconciliationWorker(_Stats):
         self.target_replicas = max(int(target_replicas), self.publish_after)
         self.status_batch_size = min(max(int(status_batch_size), 1), 200)
         self.promotion_batch_size = min(max(int(promotion_batch_size), 1), 200)
+        self.promotion_pressure_high_percent = min(max(int(promotion_pressure_high_percent), 1), 100)
+        self.promotion_pressure_medium_percent = min(max(int(promotion_pressure_medium_percent), 1), self.promotion_pressure_high_percent - 1)
+        self.promotion_min_batch_size = min(max(int(promotion_min_batch_size), 1), self.promotion_batch_size)
+        self._effective_promotion_batch_size = self.promotion_batch_size
+        self._low_pressure_cycles = 0
         self.maintenance_cycle_seconds = max(int(maintenance_cycle_seconds), 1)
         self.idle_sleep_seconds = max(int(idle_sleep_seconds), 1)
         self._recent_statuses: dict[str, tuple[datetime, Any]] = {}
         self._init_stats()
+
+    def _update_promotion_budget(self, pressure_percent: float) -> int:
+        """Size the next durability promotion using only this cycle's sample."""
+        if pressure_percent >= self.promotion_pressure_high_percent:
+            self._effective_promotion_batch_size = self.promotion_min_batch_size
+            self._low_pressure_cycles = 0
+        elif pressure_percent >= self.promotion_pressure_medium_percent:
+            self._effective_promotion_batch_size = max(
+                self.promotion_min_batch_size, self.promotion_batch_size // 2
+            )
+            self._low_pressure_cycles = 0
+        elif pressure_percent < 25:
+            self._low_pressure_cycles += 1
+            if self._low_pressure_cycles >= 3:
+                self._effective_promotion_batch_size = self.promotion_batch_size
+        else:
+            self._low_pressure_cycles = 0
+            self._effective_promotion_batch_size = self.promotion_batch_size
+        return self._effective_promotion_batch_size
+
+    def _promotion_candidates(self, cids: list[str], observed: dict[str, Any]) -> list[str]:
+        """Return only CIDs whose observed Cluster allocation is below target."""
+        return [
+            cid for cid in cids
+            if (status := observed.get(cid)) is not None
+            and int(getattr(status, "assigned_replicas", 0) or 0) < self.target_replicas
+        ]
 
     @staticmethod
     def _scheduled_delay(observations: int, first: int, second: int, later: int) -> int:
@@ -545,41 +588,83 @@ class ReplicationReconciliationWorker(_Stats):
             cid: value for cid, value in self._recent_statuses.items()
             if (_now() - value[0]).total_seconds() < 2
         }
+        status_latency_ms = int(max((_now() - batch_started).total_seconds(), 0) * 1000)
+        confirmed_cids = sum(
+            int(getattr(status, "total_replicas", 0) or 0) >= self.target_replicas
+            for status in observed.values()
+        )
+        assigned_target = sum(
+            int(getattr(status, "assigned_replicas", 0) or 0) >= self.target_replicas
+            for status in observed.values()
+        )
+        queued_cids = sum(int(getattr(status, "queued_replicas", 0) or 0) > 0 for status in observed.values())
+        pinning_cids = sum(int(getattr(status, "pinning_replicas", 0) or 0) > 0 for status in observed.values())
+        error_cids = sum(int(getattr(status, "error_replicas", 0) or 0) > 0 for status in observed.values())
+        remote_cids = sum(
+            max(
+                int(getattr(status, "assigned_replicas", 0) or 0)
+                - int(getattr(status, "total_replicas", 0) or 0)
+                - int(getattr(status, "queued_replicas", 0) or 0)
+                - int(getattr(status, "pinning_replicas", 0) or 0)
+                - int(getattr(status, "error_replicas", 0) or 0),
+                0,
+            ) > 0
+            for status in observed.values()
+        )
+        pressured_cids = sum(
+            int(getattr(status, "queued_replicas", 0) or 0) > 0
+            or int(getattr(status, "pinning_replicas", 0) or 0) > 0
+            for status in observed.values()
+        )
+        pressure_percent = (100.0 * pressured_cids / len(observed)) if observed else 0.0
+        self._update_promotion_budget(pressure_percent)
+        promotion_failures = 0
         if maintenance:
+            self.stats["last_replication_promotions"] = 0
             # Observe first.  Only CIDs whose actual Cluster allocation is
             # below the policy target need a promotion command.  A successful
             # 2/2 allocation is never re-submitted merely because it is being
             # checked again; a still-underallocated CID is retried on its
             # scheduled maintenance observation.
-            promotion_candidates = [
-                cid
-                for cid in unique_cids
-                if (status := observed.get(cid)) is not None
-                and int(getattr(status, "assigned_replicas", 0) or 0) < self.target_replicas
-            ]
+            promotion_candidates = self._promotion_candidates(unique_cids, observed)
             # A Cluster allocation is asynchronous.  Sending every
             # under-allocated CID from a 100-ARK page made the reconciler
             # create thousands of queued pins while Cluster was still working
             # on its previous requests.  Keep promotion bounded; the remaining
             # CIDs stay scheduled for a later maintenance pass.
-            promotion_cids = promotion_candidates[:self.promotion_batch_size]
+            promotion_cids = promotion_candidates[:self._effective_promotion_batch_size]
             self.stats["last_replication_promotion_candidates"] = len(promotion_candidates)
             self.stats["last_replication_promotion_deferred"] = max(
                 len(promotion_candidates) - len(promotion_cids), 0
             )
             self.stats["last_replication_promotion_requested"] = len(promotion_cids)
+            promotion_started = _now()
             if promotion_cids:
                 try:
                     promotion_results = self.storage.ensure_replication(
                         promotion_cids,
                         self.target_replicas,
+                        assigned_replicas={
+                            cid: int(getattr(observed[cid], "assigned_replicas", 0) or 0)
+                            for cid in promotion_cids
+                        },
                     )
                     self.stats["last_replication_promotions"] = sum(
-                        value in {"promotion_requested", "already_durable"}
-                        for value in promotion_results.values()
+                        value == "promotion_requested" for value in promotion_results.values()
+                    )
+                    promotion_failures = sum(
+                        value == "promotion_failed" for value in promotion_results.values()
                     )
                 except Exception as exc:
                     logger.warning("Durability promotion request failed: %s", exc)
+                    promotion_failures = len(promotion_cids)
+            promotion_latency_ms = int(max((_now() - promotion_started).total_seconds(), 0) * 1000)
+        else:
+            promotion_latency_ms = 0
+            self.stats["last_replication_promotions"] = 0
+            self.stats["last_replication_promotion_candidates"] = 0
+            self.stats["last_replication_promotion_deferred"] = 0
+            self.stats["last_replication_promotion_requested"] = 0
         arks = list(ark_cids)
         totals = {"checked": 0, "advanced": 0, "waiting": 0, "repaired": 0, "purged": 0, "failed": 0}
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
@@ -599,18 +684,31 @@ class ReplicationReconciliationWorker(_Stats):
                 "last_reconciliation_waiting": totals["waiting"],
                 "last_reconciliation_repaired": totals["repaired"],
                 "last_reconciliation_purged": totals["purged"],
-                "last_reconciliation_failed": totals["failed"],
+                "last_reconciliation_failed": totals["failed"] + promotion_failures,
                 "last_reconciliation_unique_cids": len(unique_cids),
                 "last_reconciliation_batches": batch_count,
-                "last_reconciliation_status_seconds": (_now() - batch_started).total_seconds(),
+                "last_reconciliation_status_seconds": status_latency_ms / 1000,
+                "last_replication_promotions_accepted": int(self.stats.get("last_replication_promotions", 0) or 0),
+                "last_replication_confirmed_cids": confirmed_cids,
+                "last_replication_pending_cids": max(len(observed) - confirmed_cids, 0),
+                "last_replication_batch_latency_ms": status_latency_ms + promotion_latency_ms,
+                "last_replication_assigned_target": assigned_target,
+                "last_replication_queued_cids": queued_cids,
+                "last_replication_pinning_cids": pinning_cids,
+                "last_replication_remote_cids": remote_cids,
+                "last_replication_error_cids": error_cids,
+                "last_replication_pressure_percent": round(pressure_percent, 1),
+                "last_replication_effective_promotion_batch_size": self._effective_promotion_batch_size,
             }
         )
         logger.info(
-            "Replication cycle mode=%s arks=%s unique_cids=%s batches=%s promotions=%s/%s advanced=%s waiting=%s failed=%s",
-            self.stats["last_reconciliation_mode"], len(arks), len(unique_cids), batch_count,
-            self.stats.get("last_replication_promotion_requested", 0),
-            self.stats.get("last_replication_promotion_candidates", 0),
-            totals["advanced"], totals["waiting"], totals["failed"],
+            "Replication cycle mode=%s arks=%s observed_cids=%s assigned_target=%s pinned=%s remote=%s queued=%s pinning=%s batches=%s promotions_requested=%s promotions_accepted=%s durable_arks=%s waiting=%s transient_deferred=%s status_latency_ms=%s promotion_latency_ms=%s pressure=%.1f%% promotion_budget=%s",
+            self.stats["last_reconciliation_mode"], len(arks), len(unique_cids),
+            assigned_target, confirmed_cids, remote_cids, queued_cids, pinning_cids,
+            batch_count, self.stats.get("last_replication_promotion_requested", 0),
+            self.stats.get("last_replication_promotions", 0), totals["purged"],
+            totals["waiting"], totals["failed"] + promotion_failures, status_latency_ms, promotion_latency_ms,
+            pressure_percent, self._effective_promotion_batch_size,
         )
         self._finish(started, before)
 

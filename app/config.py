@@ -87,7 +87,10 @@ class Settings(BaseSettings):
     # Durability is a maintenance operation.  Limit how many CIDs may be
     # promoted in one maintenance pass so a large published backlog cannot
     # flood IPFS Cluster while it is still pinning earlier requests.
-    replication_promotion_batch_size: int = 20
+    replication_promotion_batch_size: int = 100
+    replication_promotion_pressure_high_percent: int = 80
+    replication_promotion_pressure_medium_percent: int = 50
+    replication_promotion_min_batch_size: int = 20
     # Durability is deliberately paced.  First-pin availability remains
     # immediate, while maintenance leaves room for Cluster's asynchronous
     # pin tracker to complete the allocations it already accepted.
@@ -96,6 +99,7 @@ class Settings(BaseSettings):
     replication_worker_runtime_name: str = "replication-reconciler"
     replication_publish_after_replicas: int = 1
     replication_target_replicas: int = 2
+    worker_max_idle_sleep_seconds: int = 10
 
     chain_worker_enabled: bool = True
     # Claim a larger database page, but bound each authority's RPC/nonce
@@ -190,6 +194,12 @@ class Settings(BaseSettings):
             raise ValueError("REPLICATION_STATUS_BATCH_SIZE must be between 1 and 200")
         if self.replication_promotion_batch_size < 1 or self.replication_promotion_batch_size > 200:
             raise ValueError("REPLICATION_PROMOTION_BATCH_SIZE must be between 1 and 200")
+        if not (0 < self.replication_promotion_pressure_medium_percent < self.replication_promotion_pressure_high_percent <= 100):
+            raise ValueError("replication promotion pressure thresholds must satisfy 0 < medium < high <= 100")
+        if self.replication_promotion_min_batch_size < 1 or self.replication_promotion_min_batch_size > self.replication_promotion_batch_size:
+            raise ValueError("REPLICATION_PROMOTION_MIN_BATCH_SIZE must be between 1 and REPLICATION_PROMOTION_BATCH_SIZE")
+        if self.worker_max_idle_sleep_seconds < 1:
+            raise ValueError("WORKER_MAX_IDLE_SLEEP_SECONDS must be at least 1")
         if self.replication_maintenance_cycle_seconds < 1:
             raise ValueError("REPLICATION_MAINTENANCE_CYCLE_SECONDS must be at least 1")
         if self.replication_idle_sleep_seconds < 1:

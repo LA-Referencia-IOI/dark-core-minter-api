@@ -21,6 +21,7 @@ from app.main_worker import (
     _next_higher_page_size,
     _page_size_levels,
     _rpc_pause_sleep_seconds,
+    _progressive_idle_sleep_seconds,
     _release_worker_pid,
     _select_next_sleep_seconds,
     _shutdown_event,
@@ -115,14 +116,27 @@ def test_replication_worker_uses_its_own_runtime_identity_and_defaults():
         "repair_grace_seconds": 120,
         "repair_cooldown_seconds": 900,
         "status_batch_size": 200,
-        "promotion_batch_size": 20,
+        "promotion_batch_size": 100,
         "maintenance_cycle_seconds": 5,
         "idle_sleep_seconds": 2,
+        "promotion_pressure_high_percent": 80,
+        "promotion_pressure_medium_percent": 50,
+        "promotion_min_batch_size": 20,
         "storage_retry_seconds": 10,
     }
     assert _build_advisory_lock_key(runtime["worker_name"]) != _build_advisory_lock_key(
         "metadata-publisher"
     )
+
+
+def test_metadata_and_chain_progressively_back_off_empty_cycles():
+    assert _progressive_idle_sleep_seconds("metadata", 0, 2, 2, 10) == (
+        5, 3, "idle_backoff_5s"
+    )
+    assert _progressive_idle_sleep_seconds("chain", 0, 9, 2, 10) == (
+        10, 10, "idle_backoff_10s"
+    )
+    assert _progressive_idle_sleep_seconds("chain", 1, 10, 2, 10) == (2, 0, "sleep")
 
 
 def test_replication_pidfile_blocks_duplicate_local_process(tmp_path):

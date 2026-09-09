@@ -45,6 +45,10 @@ def test_full_status_separates_process_and_workload(client, test_db):
         worker_name="replication-reconciler", instance_id="test", host="test", pid=1,
         status="RUNNING", started_at=now, last_heartbeat_at=now,
         last_cycle_at=now,
+        last_replication_promotions_accepted=7,
+        last_replication_confirmed_cids=12,
+        last_replication_pending_cids=4,
+        last_replication_batch_latency_ms=125,
     )
     test_db.add_all([ready, waiting, runtime])
     test_db.commit()
@@ -56,6 +60,13 @@ def test_full_status_separates_process_and_workload(client, test_db):
     assert data["workload"]["replication"]["waiting"] == 1
     assert data["workload"]["replication"]["waiting_reasons"] == {"replica_target": 1}
     assert data["workers"]["replication"]["process_state"] == "SLEEPING"
+    assert data["workers"]["replication"]["replication_metrics"] == {
+        "promotions_accepted": 7,
+        "confirmed_cids": 12,
+        "pending_cids": 4,
+        "batch_latency_ms": 125,
+    }
+    assert data["workload"]["replication"]["arks_awaiting_durability"] == 2
 
 
 def test_errors_list_only_permanent_failures(client, test_db):

@@ -95,7 +95,7 @@ def _process(record, cfg: dict[str, Any], now: datetime, stale_after: int) -> di
             "advanced": record.last_reconciliation_advanced or 0,
             "waiting": record.last_reconciliation_waiting or 0,
             "repaired": record.last_reconciliation_repaired or 0,
-            "failed": record.last_reconciliation_failed or 0,
+            "transient_deferred": record.last_reconciliation_failed or 0,
         })
     no_progress_cycles = int(getattr(record, "consecutive_no_progress_cycles", 0) or 0)
     return {
@@ -110,6 +110,12 @@ def _process(record, cfg: dict[str, Any], now: datetime, stale_after: int) -> di
         "no_progress_cycles": no_progress_cycles,
         "stalled_suspected": no_progress_cycles >= 3,
         "last_error": record.last_error,
+        "replication_metrics": ({
+            "promotions_accepted": int(record.last_replication_promotions_accepted or 0),
+            "confirmed_cids": int(record.last_replication_confirmed_cids or 0),
+            "pending_cids": int(record.last_replication_pending_cids or 0),
+            "batch_latency_ms": int(record.last_replication_batch_latency_ms or 0),
+        } if cfg.get("kind") == "replication" else None),
         "totals": {
             "processed": int(record.total_processed or 0),
             "advanced": int(record.total_succeeded or 0),
@@ -189,6 +195,7 @@ def _workload(db: Session) -> dict[str, Any]:
         ]),
     ).scalar() or 0
     result["replication"]["maintenance_ready"] = int(published_replication)
+    result["replication"]["arks_awaiting_durability"] = int(published_replication)
     result["replication"]["maintenance_blocked_by"] = (
         "metadata_backlog" if critical_metadata else
         "first_pin_backlog" if critical_availability else None
@@ -265,6 +272,9 @@ def get_worker_status(detail: str = Query("simple", pattern="^(simple|workload|i
                 "page_size": settings.replication_worker_page_size,
                 "status_batch_size": settings.replication_status_batch_size,
                 "promotion_batch_size": settings.replication_promotion_batch_size,
+                "promotion_pressure_medium_percent": settings.replication_promotion_pressure_medium_percent,
+                "promotion_pressure_high_percent": settings.replication_promotion_pressure_high_percent,
+                "promotion_min_batch_size": settings.replication_promotion_min_batch_size,
                 "maintenance_cycle_seconds": settings.replication_maintenance_cycle_seconds,
                 "idle_sleep_seconds": settings.replication_idle_sleep_seconds,
                 "first_pin_rechecks_seconds": [
@@ -279,7 +289,8 @@ def get_worker_status(detail: str = Query("simple", pattern="^(simple|workload|i
                 ],
                 "publish_after_replicas": settings.replication_publish_after_replicas,
                 "target_replicas": settings.replication_target_replicas,
-            }
+            },
+            "worker_max_idle_sleep_seconds": settings.worker_max_idle_sleep_seconds,
         }
     if detail in {"infrastructure", "full"}:
         response["infrastructure"] = {"rpc": check_rpc_health(), "storage": check_metadata_storage_health()}

@@ -675,3 +675,8 @@ payload local.
 La selección vigente usa páginas de 100 ARKs, prioridad para availability y
 capacidad restante para durabilidad. Los CIDs se deduplican y se consultan en
 lotes de hasta 200. No existe un reparto por cuotas en esta versión.
+The reconciler treats Cluster allocation and confirmed pinning separately. An
+allocated CID is not promoted again merely because it remains `remote`,
+`queued`, or `pinning`; it is observed on the configured 5 minute, 15 minute,
+and hourly cadence. Runtime persistence is limited to four aggregate metrics
+per cycle and does not add promotion columns to ARK rows.

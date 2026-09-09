@@ -244,6 +244,10 @@ class WorkerRuntimeStatus(Base):
     last_reconciliation_repaired = Column(Integer, nullable=False, default=0, server_default="0")
     last_reconciliation_purged = Column(Integer, nullable=False, default=0, server_default="0")
     last_reconciliation_failed = Column(Integer, nullable=False, default=0, server_default="0")
+    last_replication_promotions_accepted = Column(Integer, nullable=False, default=0, server_default="0")
+    last_replication_confirmed_cids = Column(Integer, nullable=False, default=0, server_default="0")
+    last_replication_pending_cids = Column(Integer, nullable=False, default=0, server_default="0")
+    last_replication_batch_latency_ms = Column(Integer, nullable=False, default=0, server_default="0")
     last_error = Column(Text, nullable=True)
     consecutive_no_progress_cycles = Column(SmallInteger, nullable=False, default=0, server_default="0")
 

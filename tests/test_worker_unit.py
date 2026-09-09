@@ -41,6 +41,29 @@ def test_cluster_wait_uses_the_explicit_first_pin_cadence():
     assert 3599 <= (durability_later - now).total_seconds() <= 3601
 
 
+def test_replication_promotion_budget_follows_observed_pressure():
+    worker = ReplicationReconciliationWorker(
+        Mock(), promotion_batch_size=100, promotion_min_batch_size=20,
+        promotion_pressure_medium_percent=50, promotion_pressure_high_percent=80,
+    )
+    assert worker._update_promotion_budget(50) == 50
+    assert worker._update_promotion_budget(80) == 20
+    assert worker._update_promotion_budget(20) == 20
+    assert worker._update_promotion_budget(20) == 20
+    assert worker._update_promotion_budget(20) == 100
+    assert worker._update_promotion_budget(40) == 100
+
+
+def test_replication_promotes_only_underallocated_cids_regardless_of_pin_state():
+    worker = ReplicationReconciliationWorker(Mock(), target_replicas=2)
+    observed = {
+        "remote-at-target": Mock(assigned_replicas=2, total_replicas=1),
+        "queued-at-target": Mock(assigned_replicas=2, total_replicas=0),
+        "underallocated": Mock(assigned_replicas=1, total_replicas=1),
+    }
+    assert worker._promotion_candidates(list(observed), observed) == ["underallocated"]
+
+
 def test_chain_reconciliation_requires_exact_target_and_level1_cid():
     core = Mock()
     core.get_ark.return_value = Mock(url="https://example.org/object", cid="bafy-l1")
