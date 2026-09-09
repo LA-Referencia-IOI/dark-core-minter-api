@@ -264,11 +264,19 @@ def get_worker_status(detail: str = Query("simple", pattern="^(simple|workload|i
             "replication": {
                 "page_size": settings.replication_worker_page_size,
                 "status_batch_size": settings.replication_status_batch_size,
+                "promotion_batch_size": settings.replication_promotion_batch_size,
+                "maintenance_cycle_seconds": settings.replication_maintenance_cycle_seconds,
                 "idle_sleep_seconds": settings.replication_idle_sleep_seconds,
-                "pinning_recheck_seconds": settings.replication_pinning_recheck_seconds,
-                "queued_recheck_seconds": settings.replication_queued_recheck_seconds,
-                "visibility_recheck_seconds": settings.replication_visibility_recheck_seconds,
-                "max_recheck_seconds": settings.replication_max_recheck_seconds,
+                "first_pin_rechecks_seconds": [
+                    settings.replication_first_pin_recheck_seconds,
+                    settings.replication_first_pin_second_recheck_seconds,
+                    settings.replication_first_pin_max_recheck_seconds,
+                ],
+                "durability_rechecks_seconds": [
+                    settings.replication_durability_recheck_seconds,
+                    settings.replication_durability_second_recheck_seconds,
+                    settings.replication_durability_max_recheck_seconds,
+                ],
                 "publish_after_replicas": settings.replication_publish_after_replicas,
                 "target_replicas": settings.replication_target_replicas,
             }

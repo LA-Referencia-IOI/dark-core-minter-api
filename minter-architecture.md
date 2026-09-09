@@ -312,10 +312,12 @@ sequenceDiagram
     end
 ```
 
-`pin_queued` and `pinning` are normal Cluster progress. The worker revisits
-them through its global idle scheduler; there are no normal per-ARK recheck
-cadences. Repairs are attempted only with evidence of a real Cluster error or
-missing pin, never while Cluster still owns an assignment.
+`pin_queued` and `pinning` are normal Cluster progress. Each ARK receives a
+persisted per-ARK audit time: first pins are revisited after 15 seconds, one
+minute and then five minutes; post-publication durability is revisited after
+five minutes, fifteen minutes and then hourly. Repairs are attempted only with
+evidence of a real Cluster error or missing pin, never while Cluster still owns
+an assignment.
 
 ### Chain Publication Cycle
 

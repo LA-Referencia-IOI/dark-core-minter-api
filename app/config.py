@@ -70,21 +70,38 @@ class Settings(BaseSettings):
     replication_worker_page_size: int = 100
     replication_worker_concurrency: int = 2
     replication_worker_sleep_seconds: int = 2
-    replication_pinning_recheck_seconds: int = 2
-    replication_queued_recheck_seconds: int = 5
-    replication_visibility_recheck_seconds: int = 3
-    replication_max_recheck_seconds: int = 30
+    # First-pin confirmation controls the critical path to Chain.  It is
+    # deliberately sparse: 15 seconds, then one minute, then five minutes.
+    replication_first_pin_recheck_seconds: int = 15
+    replication_first_pin_second_recheck_seconds: int = 60
+    replication_first_pin_max_recheck_seconds: int = 300
+    # Final durability is asynchronous Cluster maintenance.  Once requested,
+    # it is audited at five minutes, fifteen minutes and then hourly.
+    replication_durability_recheck_seconds: int = 300
+    replication_durability_second_recheck_seconds: int = 900
+    replication_durability_max_recheck_seconds: int = 3600
     replication_repair_grace_seconds: int = 120
     replication_repair_cooldown_seconds: int = 900
     replication_worker_storage_retry_seconds: int = 10
     replication_status_batch_size: int = 200
+    # Durability is a maintenance operation.  Limit how many CIDs may be
+    # promoted in one maintenance pass so a large published backlog cannot
+    # flood IPFS Cluster while it is still pinning earlier requests.
+    replication_promotion_batch_size: int = 20
+    # Durability is deliberately paced.  First-pin availability remains
+    # immediate, while maintenance leaves room for Cluster's asynchronous
+    # pin tracker to complete the allocations it already accepted.
+    replication_maintenance_cycle_seconds: int = 5
     replication_idle_sleep_seconds: int = 2
     replication_worker_runtime_name: str = "replication-reconciler"
     replication_publish_after_replicas: int = 1
     replication_target_replicas: int = 2
 
     chain_worker_enabled: bool = True
-    chain_worker_page_size: int = 20
+    # Claim a larger database page, but bound each authority's RPC/nonce
+    # pipeline so a single call never overloads Besu.
+    chain_worker_page_size: int = 100
+    chain_worker_rpc_batch_size: int = 50
     chain_worker_sleep_seconds: int = 5
     chain_worker_rpc_retry_seconds: int = 10
     chain_worker_congestion_retry_seconds: int = 30
@@ -148,18 +165,43 @@ class Settings(BaseSettings):
                 "REPLICATION_PUBLISH_AFTER_REPLICAS"
             )
         for field_name in (
-            "replication_pinning_recheck_seconds", "replication_queued_recheck_seconds",
-            "replication_visibility_recheck_seconds", "replication_max_recheck_seconds",
+            "replication_first_pin_recheck_seconds", "replication_first_pin_second_recheck_seconds",
+            "replication_first_pin_max_recheck_seconds", "replication_durability_recheck_seconds",
+            "replication_durability_second_recheck_seconds", "replication_durability_max_recheck_seconds",
             "replication_repair_grace_seconds", "replication_repair_cooldown_seconds",
         ):
             if getattr(self, field_name) < 0:
                 raise ValueError(f"{field_name.upper()} cannot be negative")
+        if not (
+            self.replication_first_pin_recheck_seconds
+            <= self.replication_first_pin_second_recheck_seconds
+            <= self.replication_first_pin_max_recheck_seconds
+        ):
+            raise ValueError("first-pin replication rechecks must be nondecreasing")
+        if not (
+            self.replication_durability_recheck_seconds
+            <= self.replication_durability_second_recheck_seconds
+            <= self.replication_durability_max_recheck_seconds
+        ):
+            raise ValueError("durability replication rechecks must be nondecreasing")
         if self.metadata_worker_min_concurrency < 1 or self.metadata_worker_min_concurrency > self.metadata_worker_concurrency:
             raise ValueError("METADATA_WORKER_MIN_CONCURRENCY must be between 1 and METADATA_WORKER_CONCURRENCY")
         if self.replication_status_batch_size < 1 or self.replication_status_batch_size > 200:
             raise ValueError("REPLICATION_STATUS_BATCH_SIZE must be between 1 and 200")
+        if self.replication_promotion_batch_size < 1 or self.replication_promotion_batch_size > 200:
+            raise ValueError("REPLICATION_PROMOTION_BATCH_SIZE must be between 1 and 200")
+        if self.replication_maintenance_cycle_seconds < 1:
+            raise ValueError("REPLICATION_MAINTENANCE_CYCLE_SECONDS must be at least 1")
         if self.replication_idle_sleep_seconds < 1:
             raise ValueError("REPLICATION_IDLE_SLEEP_SECONDS must be at least 1")
+        if self.chain_worker_page_size < 1:
+            raise ValueError("CHAIN_WORKER_PAGE_SIZE must be at least 1")
+        if self.chain_worker_rpc_batch_size < 1:
+            raise ValueError("CHAIN_WORKER_RPC_BATCH_SIZE must be at least 1")
+        if self.chain_worker_rpc_batch_size > self.chain_worker_page_size:
+            raise ValueError(
+                "CHAIN_WORKER_RPC_BATCH_SIZE cannot exceed CHAIN_WORKER_PAGE_SIZE"
+            )
         return self
 
     def validate_blockchain_config(self) -> None:

@@ -191,6 +191,9 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
             "last_reconciliation_repaired": 0,
             "last_reconciliation_purged": 0,
             "last_reconciliation_failed": 0,
+            "last_replication_promotion_candidates": 0,
+            "last_replication_promotion_requested": 0,
+            "last_replication_promotion_deferred": 0,
         }
 
     raw_stats = publisher.stats
@@ -213,6 +216,9 @@ def _extract_runtime_stats(publisher: Optional[Any]) -> Dict[str, Any]:
         "last_reconciliation_repaired": int(raw_stats.get("last_reconciliation_repaired", 0) or 0),
         "last_reconciliation_purged": int(raw_stats.get("last_reconciliation_purged", 0) or 0),
         "last_reconciliation_failed": int(raw_stats.get("last_reconciliation_failed", 0) or 0),
+        "last_replication_promotion_candidates": int(raw_stats.get("last_replication_promotion_candidates", 0) or 0),
+        "last_replication_promotion_requested": int(raw_stats.get("last_replication_promotion_requested", 0) or 0),
+        "last_replication_promotion_deferred": int(raw_stats.get("last_replication_promotion_deferred", 0) or 0),
     }
 
 
@@ -347,14 +353,18 @@ def _worker_runtime_config(worker_kind: str):
             "page_size": settings.replication_worker_page_size,
             "concurrency": settings.replication_worker_concurrency,
             "sleep_seconds": settings.replication_worker_sleep_seconds,
-            "pinning_recheck_seconds": getattr(settings, "replication_pinning_recheck_seconds", 2),
-            "queued_recheck_seconds": getattr(settings, "replication_queued_recheck_seconds", 5),
-            "visibility_recheck_seconds": getattr(settings, "replication_visibility_recheck_seconds", 3),
-            "max_recheck_seconds": getattr(settings, "replication_max_recheck_seconds", 30),
+            "first_pin_recheck_seconds": settings.replication_first_pin_recheck_seconds,
+            "first_pin_second_recheck_seconds": settings.replication_first_pin_second_recheck_seconds,
+            "first_pin_max_recheck_seconds": settings.replication_first_pin_max_recheck_seconds,
+            "durability_recheck_seconds": settings.replication_durability_recheck_seconds,
+            "durability_second_recheck_seconds": settings.replication_durability_second_recheck_seconds,
+            "durability_max_recheck_seconds": settings.replication_durability_max_recheck_seconds,
             "repair_grace_seconds": getattr(settings, "replication_repair_grace_seconds", 120),
             "repair_cooldown_seconds": getattr(settings, "replication_repair_cooldown_seconds", 900),
             "storage_retry_seconds": settings.replication_worker_storage_retry_seconds,
             "status_batch_size": getattr(settings, "replication_status_batch_size", 200),
+            "promotion_batch_size": getattr(settings, "replication_promotion_batch_size", 20),
+            "maintenance_cycle_seconds": getattr(settings, "replication_maintenance_cycle_seconds", 5),
             "idle_sleep_seconds": getattr(settings, "replication_idle_sleep_seconds", 2),
         }
     if worker_kind == "chain":
@@ -362,6 +372,7 @@ def _worker_runtime_config(worker_kind: str):
             "enabled": settings.chain_worker_enabled,
             "worker_name": settings.chain_worker_runtime_name,
             "page_size": settings.chain_worker_page_size,
+            "rpc_batch_size": settings.chain_worker_rpc_batch_size,
             "sleep_seconds": settings.chain_worker_sleep_seconds,
             "rpc_retry_seconds": settings.chain_worker_rpc_retry_seconds,
             "congestion_retry_seconds": settings.chain_worker_congestion_retry_seconds,
@@ -600,15 +611,19 @@ def run_worker(worker_kind: str = "chain") -> None:
                     metadata_storage=metadata_storage,
                     page_size=runtime["page_size"],
                     concurrency=runtime["concurrency"],
-                    pinning_recheck_seconds=runtime["pinning_recheck_seconds"],
-                    queued_recheck_seconds=runtime["queued_recheck_seconds"],
-                    visibility_recheck_seconds=runtime["visibility_recheck_seconds"],
-                    max_recheck_seconds=runtime["max_recheck_seconds"],
+                    first_pin_recheck_seconds=runtime["first_pin_recheck_seconds"],
+                    first_pin_second_recheck_seconds=runtime["first_pin_second_recheck_seconds"],
+                    first_pin_max_recheck_seconds=runtime["first_pin_max_recheck_seconds"],
+                    durability_recheck_seconds=runtime["durability_recheck_seconds"],
+                    durability_second_recheck_seconds=runtime["durability_second_recheck_seconds"],
+                    durability_max_recheck_seconds=runtime["durability_max_recheck_seconds"],
                     repair_grace_seconds=runtime["repair_grace_seconds"],
                     repair_cooldown_seconds=runtime["repair_cooldown_seconds"],
                     publish_after_replicas=settings.replication_publish_after_replicas,
                     target_replicas=settings.replication_target_replicas,
                     status_batch_size=runtime["status_batch_size"],
+                    promotion_batch_size=runtime["promotion_batch_size"],
+                    maintenance_cycle_seconds=runtime["maintenance_cycle_seconds"],
                     idle_sleep_seconds=runtime["idle_sleep_seconds"],
                 )
         else:
@@ -668,6 +683,7 @@ def run_worker(worker_kind: str = "chain") -> None:
             publisher = ChainPublisherWorker(
                 corelib_client=corelib_client,
                 page_size=runtime["page_size"],
+                rpc_batch_size=runtime["rpc_batch_size"],
                 max_retries=runtime["max_retries"],
                 backoff_base=runtime["backoff_base"],
             )

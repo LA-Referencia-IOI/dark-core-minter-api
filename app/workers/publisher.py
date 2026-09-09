@@ -8,7 +8,6 @@ and workers cannot process the same ARK concurrently.
 from __future__ import annotations
 
 import logging
-import hashlib
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -244,60 +243,79 @@ class ReplicationReconciliationWorker(_Stats):
         metadata_storage: MetadataStorage,
         page_size: int = 50,
         concurrency: int = 2,
-        pinning_recheck_seconds: int = 2,
-        queued_recheck_seconds: int = 5,
-        visibility_recheck_seconds: int = 3,
-        max_recheck_seconds: int = 30,
+        first_pin_recheck_seconds: int = 15,
+        first_pin_second_recheck_seconds: int = 60,
+        first_pin_max_recheck_seconds: int = 300,
+        durability_recheck_seconds: int = 300,
+        durability_second_recheck_seconds: int = 900,
+        durability_max_recheck_seconds: int = 3600,
         repair_grace_seconds: int = 120,
         repair_cooldown_seconds: int = 900,
         publish_after_replicas: int = 1,
         target_replicas: int = 2,
         status_batch_size: int = 200,
+        promotion_batch_size: int = 20,
+        maintenance_cycle_seconds: int = 5,
         idle_sleep_seconds: int = 2,
     ):
         self.storage = metadata_storage
         self.service = MetadataService(metadata_storage)
         self.page_size = max(int(page_size), 1)
         self.concurrency = max(int(concurrency), 1)
-        self.pinning_recheck_seconds = max(int(pinning_recheck_seconds), 1)
-        self.queued_recheck_seconds = max(int(queued_recheck_seconds), 1)
-        self.visibility_recheck_seconds = max(int(visibility_recheck_seconds), 1)
-        self.max_recheck_seconds = max(int(max_recheck_seconds), self.queued_recheck_seconds)
+        self.first_pin_recheck_seconds = max(int(first_pin_recheck_seconds), 1)
+        self.first_pin_second_recheck_seconds = max(
+            int(first_pin_second_recheck_seconds), self.first_pin_recheck_seconds
+        )
+        self.first_pin_max_recheck_seconds = max(
+            int(first_pin_max_recheck_seconds), self.first_pin_second_recheck_seconds
+        )
+        self.durability_recheck_seconds = max(int(durability_recheck_seconds), 1)
+        self.durability_second_recheck_seconds = max(
+            int(durability_second_recheck_seconds), self.durability_recheck_seconds
+        )
+        self.durability_max_recheck_seconds = max(
+            int(durability_max_recheck_seconds), self.durability_second_recheck_seconds
+        )
         self.repair_grace_seconds = max(int(repair_grace_seconds), 0)
         self.repair_cooldown_seconds = max(int(repair_cooldown_seconds), 0)
         self.publish_after = max(int(publish_after_replicas), 1)
         self.target_replicas = max(int(target_replicas), self.publish_after)
         self.status_batch_size = min(max(int(status_batch_size), 1), 200)
+        self.promotion_batch_size = min(max(int(promotion_batch_size), 1), 200)
+        self.maintenance_cycle_seconds = max(int(maintenance_cycle_seconds), 1)
         self.idle_sleep_seconds = max(int(idle_sleep_seconds), 1)
         self._recent_statuses: dict[str, tuple[datetime, Any]] = {}
         self._init_stats()
 
-    def _wait_schedule(
-        self,
-        ark: str,
-        reason: ProcessingWaitReason,
-        previous_reason: int | None,
-        previous_replicas: int,
-        replicas: int,
-        observations: int,
-    ) -> datetime:
-        """Schedule normal Cluster propagation with bounded exponential backoff.
+    @staticmethod
+    def _scheduled_delay(observations: int, first: int, second: int, later: int) -> int:
+        """Return a human-readable three-step audit cadence.
 
-        The wait reason and confirmed count are persisted already, so no extra
-        state/table is required. A state/count change starts a fresh backoff.
+        Cluster already owns a pin once it has accepted its allocation.  More
+        frequent polling cannot make it execute sooner, so both phases use a
+        fixed progressive schedule rather than an opaque exponential curve.
         """
-        base = {
-            ProcessingWaitReason.CLUSTER_PINNING: self.pinning_recheck_seconds,
-            ProcessingWaitReason.INITIAL_VISIBILITY: self.visibility_recheck_seconds,
-            ProcessingWaitReason.CLUSTER_QUEUED: self.queued_recheck_seconds,
-        }.get(reason, self.max_recheck_seconds)
-        changed = int(previous_reason or 0) != int(reason) or replicas > previous_replicas
-        exponent = 0 if changed else min(max(observations - 1, 0), 8)
-        seconds = min(base * (2 ** exponent), self.max_recheck_seconds)
-        # Stable +/- 10% jitter spreads a simultaneous batch without making
-        # behaviour nondeterministic or hard to diagnose.
-        jitter = ((int(hashlib.sha256(ark.encode("utf-8")).hexdigest()[:8], 16) % 21) - 10) / 100
-        return _now() + timedelta(seconds=max(1, seconds * (1 + jitter)))
+        if observations <= 1:
+            return first
+        if observations == 2:
+            return second
+        return later
+
+    def _first_pin_wait_at(self, observations: int) -> datetime:
+        return _now() + timedelta(seconds=self._scheduled_delay(
+            observations,
+            self.first_pin_recheck_seconds,
+            self.first_pin_second_recheck_seconds,
+            self.first_pin_max_recheck_seconds,
+        ))
+
+    def _durability_wait_at(self, observations: int) -> datetime:
+        return _now() + timedelta(seconds=self._scheduled_delay(
+            observations,
+            self.durability_recheck_seconds,
+            self.durability_second_recheck_seconds,
+            self.durability_max_recheck_seconds,
+        ))
 
     def _reconcile(self, ark: str, observed_statuses: Optional[dict[str, Any]] = None) -> dict[str, int]:
         result = {"checked": 1, "advanced": 0, "waiting": 0, "repaired": 0, "purged": 0, "failed": 0}
@@ -383,10 +401,10 @@ class ReplicationReconciliationWorker(_Stats):
                 old_l1 = int(current_metadata.level1_replica_count or 0)
                 old_l2 = int(current_metadata.level2_replica_count or 0)
                 previous_reason = current.processing_wait_reason
+                previous_replicas = min(old_l1, old_l2)
                 current_metadata.level1_replica_count = max(int(level1_status.total_replicas), 0)
                 current_metadata.level2_replica_count = max(int(level2_status.total_replicas), 0)
                 current_metadata.replication_checked_at = now
-                current_metadata.replication_observation_count = int(current_metadata.replication_observation_count or 0) + 1
                 if result["repaired"]:
                     current_metadata.last_repair_at = now
                 current_metadata.replication_error_code = None
@@ -400,6 +418,9 @@ class ReplicationReconciliationWorker(_Stats):
                         current.processing_status = int(ProcessingStatus.READY)
                         current.next_action_at = None
                         current.processing_wait_reason = int(ProcessingWaitReason.NONE)
+                        # Durability starts its own cadence after Chain.  Do
+                        # not carry first-pin observations into that phase.
+                        current_metadata.replication_observation_count = 0
                         result["advanced"] += 1
                     else:
                         statuses_seen = {str(level1_status.status).lower(), str(level2_status.status).lower()}
@@ -410,12 +431,19 @@ class ReplicationReconciliationWorker(_Stats):
                             if "pinning" in statuses_seen
                             else ProcessingWaitReason.INITIAL_VISIBILITY
                         )
-                        # Cluster propagation is a normal scheduled action.
-                        current.processing_status = int(ProcessingStatus.WAITING)
-                        current.next_action_at = self._wait_schedule(
-                            ark, reason, previous_reason, min(old_l1, old_l2), replicas,
-                            int(current_metadata.replication_observation_count or 1),
+                        changed = (
+                            int(previous_reason or 0) != int(reason)
+                            or replicas > previous_replicas
                         )
+                        observations = 1 if changed else int(
+                            current_metadata.replication_observation_count or 0
+                        ) + 1
+                        current_metadata.replication_observation_count = observations
+                        # First-pin propagation is the critical path, but
+                        # still uses 15 s -> 1 min -> 5 min rather than a
+                        # continuous Cluster polling loop.
+                        current.processing_status = int(ProcessingStatus.WAITING)
+                        current.next_action_at = self._first_pin_wait_at(observations)
                         current.processing_wait_reason = int(reason)
                         result["waiting"] += 1
                 elif replicas >= self.target_replicas:
@@ -432,9 +460,24 @@ class ReplicationReconciliationWorker(_Stats):
                     # The content is available, but the target replica count
                     # has not been reached yet.  Keep it in the normal
                     # replication queue and re-observe it later.
-                    current.processing_status = int(ProcessingStatus.WAITING)
-                    current.next_action_at = _now() + timedelta(seconds=self.max_recheck_seconds)
-                    current.processing_wait_reason = int(ProcessingWaitReason.REPLICA_TARGET)
+                    # A payload repaired from an unpinned/error state was
+                    # re-added with the initial 1/1 policy.  Put it back in
+                    # READY so the next maintenance cycle requests its final
+                    # target allocation exactly once again.
+                    if result["repaired"]:
+                        current.processing_status = int(ProcessingStatus.READY)
+                        current.next_action_at = None
+                        current.processing_wait_reason = int(ProcessingWaitReason.NONE)
+                        current_metadata.replication_observation_count = 0
+                    else:
+                        # Cluster has already accepted the durability
+                        # allocation.  Audit it at 5 min -> 15 min -> hourly;
+                        # a status probe never re-submits the same pin.
+                        observations = int(current_metadata.replication_observation_count or 0) + 1
+                        current_metadata.replication_observation_count = observations
+                        current.processing_status = int(ProcessingStatus.WAITING)
+                        current.next_action_at = self._durability_wait_at(observations)
+                        current.processing_wait_reason = int(ProcessingWaitReason.REPLICA_TARGET)
                     result["waiting"] += 1
                 db.commit()
                 return result
@@ -445,7 +488,7 @@ class ReplicationReconciliationWorker(_Stats):
                     ark,
                     f"replication reconciliation failed: {exc}",
                     int(ProcessingErrorCode.REPLICATION_UNAVAILABLE),
-                    delay_seconds=self.pinning_recheck_seconds,
+                    delay_seconds=self.first_pin_recheck_seconds,
                 )
                 db.commit()
                 self._error(ark, f"replication reconciliation failed: {exc}")
@@ -460,24 +503,21 @@ class ReplicationReconciliationWorker(_Stats):
             records = repo.get_reconciliation_candidates(self.page_size, int(ProcessingStage.AVAILABILITY))
             if not records and not repo.has_critical_reconciliation_backlog():
                 maintenance = True
-                records = repo.get_reconciliation_candidates(self.page_size, int(ProcessingStage.REPLICATION))
+                # A durability ARK has two CIDs.  Bound the observation page
+                # to the promotion budget as well: querying 200 CIDs per
+                # second to promote only a small subset was itself enough to
+                # saturate Store API and Cluster.
+                maintenance_page_size = max(1, min(
+                    self.page_size, (self.promotion_batch_size + 1) // 2
+                ))
+                records = repo.get_reconciliation_candidates(
+                    maintenance_page_size, int(ProcessingStage.REPLICATION)
+                )
             self.stats["last_reconciliation_mode"] = "maintenance" if maintenance else "first_pin"
             self.stats["last_maintenance_block_reason"] = None if maintenance or records else "critical_backlog"
             ark_cids = {record.ark: (record.level1_cid, record.level2_cid) for record in records}
         finally:
             db.close()
-        if maintenance and ark_cids:
-            try:
-                promotion_results = self.storage.ensure_replication(
-                    [cid for pair in ark_cids.values() for cid in pair],
-                    self.target_replicas,
-                )
-                self.stats["last_replication_promotions"] = sum(
-                    value in {"promotion_requested", "already_durable"}
-                    for value in promotion_results.values()
-                )
-            except Exception as exc:
-                logger.warning("Durability promotion request failed: %s", exc)
         unique_cids = sorted({cid for pair in ark_cids.values() for cid in pair})
         observed: dict[str, Any] = {}
         observed_at = _now()
@@ -505,6 +545,41 @@ class ReplicationReconciliationWorker(_Stats):
             cid: value for cid, value in self._recent_statuses.items()
             if (_now() - value[0]).total_seconds() < 2
         }
+        if maintenance:
+            # Observe first.  Only CIDs whose actual Cluster allocation is
+            # below the policy target need a promotion command.  A successful
+            # 2/2 allocation is never re-submitted merely because it is being
+            # checked again; a still-underallocated CID is retried on its
+            # scheduled maintenance observation.
+            promotion_candidates = [
+                cid
+                for cid in unique_cids
+                if (status := observed.get(cid)) is not None
+                and int(getattr(status, "assigned_replicas", 0) or 0) < self.target_replicas
+            ]
+            # A Cluster allocation is asynchronous.  Sending every
+            # under-allocated CID from a 100-ARK page made the reconciler
+            # create thousands of queued pins while Cluster was still working
+            # on its previous requests.  Keep promotion bounded; the remaining
+            # CIDs stay scheduled for a later maintenance pass.
+            promotion_cids = promotion_candidates[:self.promotion_batch_size]
+            self.stats["last_replication_promotion_candidates"] = len(promotion_candidates)
+            self.stats["last_replication_promotion_deferred"] = max(
+                len(promotion_candidates) - len(promotion_cids), 0
+            )
+            self.stats["last_replication_promotion_requested"] = len(promotion_cids)
+            if promotion_cids:
+                try:
+                    promotion_results = self.storage.ensure_replication(
+                        promotion_cids,
+                        self.target_replicas,
+                    )
+                    self.stats["last_replication_promotions"] = sum(
+                        value in {"promotion_requested", "already_durable"}
+                        for value in promotion_results.values()
+                    )
+                except Exception as exc:
+                    logger.warning("Durability promotion request failed: %s", exc)
         arks = list(ark_cids)
         totals = {"checked": 0, "advanced": 0, "waiting": 0, "repaired": 0, "purged": 0, "failed": 0}
         with ThreadPoolExecutor(max_workers=self.concurrency) as executor:
@@ -531,8 +606,10 @@ class ReplicationReconciliationWorker(_Stats):
             }
         )
         logger.info(
-            "Replication cycle mode=%s arks=%s unique_cids=%s batches=%s advanced=%s waiting=%s failed=%s",
+            "Replication cycle mode=%s arks=%s unique_cids=%s batches=%s promotions=%s/%s advanced=%s waiting=%s failed=%s",
             self.stats["last_reconciliation_mode"], len(arks), len(unique_cids), batch_count,
+            self.stats.get("last_replication_promotion_requested", 0),
+            self.stats.get("last_replication_promotion_candidates", 0),
             totals["advanced"], totals["waiting"], totals["failed"],
         )
         self._finish(started, before)
@@ -545,6 +622,13 @@ class ReplicationReconciliationWorker(_Stats):
             due = repository.get_reconciliation_candidates(1, int(ProcessingStage.AVAILABILITY))
             if due:
                 return 0, "continue_due_work"
+            # Maintenance must never run ahead of a first-pin backlog.  When
+            # it is eligible, pace pages even if a historical backlog makes
+            # many records due at once.
+            if not repository.has_critical_reconciliation_backlog():
+                due = repository.get_reconciliation_candidates(1, int(ProcessingStage.REPLICATION))
+                if due:
+                    return self.maintenance_cycle_seconds, "maintenance_paced"
             next_due = repository.get_next_reconciliation_action_at()
         finally:
             db.close()
@@ -561,11 +645,13 @@ class ChainPublisherWorker(_Stats):
         self,
         corelib_client: DARKCoreClient,
         page_size: int = 20,
+        rpc_batch_size: int = 50,
         max_retries: int = 5,
         backoff_base: float = 2.0,
     ):
         self.corelib_client = corelib_client
         self.page_size = max(int(page_size), 1)
+        self.rpc_batch_size = min(max(int(rpc_batch_size), 1), self.page_size)
         self.max_retries = max(int(max_retries), 1)
         self.backoff_base = float(backoff_base)
         self._init_stats()
@@ -781,57 +867,71 @@ class ChainPublisherWorker(_Stats):
             grouped[item["authority_id"]].append(item)
 
         for authority_id, group in grouped.items():
-            operations = [item["operation"] for item in group]
-            try:
-                results = self.corelib_client.publish_ark_operations(
-                    uuid=authority_id,
-                    operations=operations,
-                    pipeline_size=page_size,
+            # A worker page can hold 100 ARKs, while each authority's nonce
+            # pipeline is deliberately capped at 50.  For one authority that
+            # produces two RPC pipelines of 50; multiple authorities retain
+            # their required independent signer/nonces.
+            for start in range(0, len(group), self.rpc_batch_size):
+                rpc_group = group[start : start + self.rpc_batch_size]
+                operations = [item["operation"] for item in rpc_group]
+                logger.info(
+                    "Submitting chain RPC pipeline authority=%s records=%s page=%s rpc_batch=%s offset=%s",
+                    authority_id,
+                    len(rpc_group),
+                    page_size,
+                    self.rpc_batch_size,
+                    start,
                 )
-                results_by_ref = {result.ref: result for result in results}
-            except Exception as exc:
-                logger.error("Pipeline publish failed for authority %s: %s", authority_id, exc)
-                results_by_ref = {
-                    item["ark"]: ARKPublishResult(
-                        ref=item["ark"],
-                        action=item["action"],
-                        status="failed",
-                        error=str(exc),
+                try:
+                    results = self.corelib_client.publish_ark_operations(
+                        uuid=authority_id,
+                        operations=operations,
+                        pipeline_size=self.rpc_batch_size,
                     )
-                    for item in group
-                }
+                    results_by_ref = {result.ref: result for result in results}
+                except Exception as exc:
+                    logger.error("Pipeline publish failed for authority %s: %s", authority_id, exc)
+                    results_by_ref = {
+                        item["ark"]: ARKPublishResult(
+                            ref=item["ark"],
+                            action=item["action"],
+                            status="failed",
+                            error=str(exc),
+                        )
+                        for item in rpc_group
+                    }
 
-            for item in group:
-                self.stats["total_processed"] += 1
-                result = results_by_ref.get(item["ark"])
-                if result is None:
-                    result = ARKPublishResult(
-                        ref=item["ark"],
-                        action=item["action"],
-                        status="ambiguous",
-                        error="Missing pipeline result from core-lib",
-                    )
-                if result.status == "confirmed":
-                    with acquire_ark_lock(item["ark"]) as result_db:
-                        if result_db is None:
-                            self.stats["total_failed"] += 1
-                            continue
-                        result_repo = ARKRepository(result_db)
-                        if not self._finalize_pipeline_confirmation(result_repo, item):
-                            self.stats["total_failed"] += 1
-                            continue
-                        result_db.commit()
-                    self.stats["total_succeeded"] += 1
-                else:
-                    with acquire_ark_lock(item["ark"]) as result_db:
-                        if result_db is not None:
+                for item in rpc_group:
+                    self.stats["total_processed"] += 1
+                    result = results_by_ref.get(item["ark"])
+                    if result is None:
+                        result = ARKPublishResult(
+                            ref=item["ark"],
+                            action=item["action"],
+                            status="ambiguous",
+                            error="Missing pipeline result from core-lib",
+                        )
+                    if result.status == "confirmed":
+                        with acquire_ark_lock(item["ark"]) as result_db:
+                            if result_db is None:
+                                self.stats["total_failed"] += 1
+                                continue
                             result_repo = ARKRepository(result_db)
-                            if self._handle_pipeline_result(result_repo, item, result):
-                                result_db.commit()
-                                self.stats["total_succeeded"] += 1
+                            if not self._finalize_pipeline_confirmation(result_repo, item):
+                                self.stats["total_failed"] += 1
                                 continue
                             result_db.commit()
-                    self.stats["total_failed"] += 1
+                        self.stats["total_succeeded"] += 1
+                    else:
+                        with acquire_ark_lock(item["ark"]) as result_db:
+                            if result_db is not None:
+                                result_repo = ARKRepository(result_db)
+                                if self._handle_pipeline_result(result_repo, item, result):
+                                    result_db.commit()
+                                    self.stats["total_succeeded"] += 1
+                                    continue
+                                result_db.commit()
+                        self.stats["total_failed"] += 1
         self._finish(started, before)
 
 
@@ -853,13 +953,19 @@ class ARKPublisher(_Stats):
             metadata_storage=metadata_storage,
             page_size=page_size,
             concurrency=1,
-            pinning_recheck_seconds=1,
-            queued_recheck_seconds=1,
-            visibility_recheck_seconds=1,
-            max_recheck_seconds=1,
+            first_pin_recheck_seconds=15,
+            first_pin_second_recheck_seconds=60,
+            first_pin_max_recheck_seconds=300,
+            durability_recheck_seconds=300,
+            durability_second_recheck_seconds=900,
+            durability_max_recheck_seconds=3600,
         )
         self.chain_worker = ChainPublisherWorker(
-            corelib_client, page_size, max_retries, backoff_base
+            corelib_client=corelib_client,
+            page_size=page_size,
+            rpc_batch_size=min(50, page_size),
+            max_retries=max_retries,
+            backoff_base=backoff_base,
         )
         self._init_stats()
 

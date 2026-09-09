@@ -6,7 +6,6 @@ from datetime import datetime, timezone
 from dark_core_lib import ARKPublishResult
 
 from app.workers.publisher import ChainPublisherWorker, ReplicationReconciliationWorker
-from app.models.processing import ProcessingWaitReason
 
 
 def test_replication_policy_never_allows_purge_before_publication():
@@ -17,21 +16,29 @@ def test_replication_policy_never_allows_purge_before_publication():
     assert worker.target_replicas == 2
 
 
-def test_cluster_wait_is_scheduled_with_bounded_deterministic_backoff():
+def test_cluster_wait_uses_the_explicit_first_pin_cadence():
     worker = ReplicationReconciliationWorker(
-        Mock(), pinning_recheck_seconds=2, max_recheck_seconds=10
+        Mock(),
+        first_pin_recheck_seconds=15,
+        first_pin_second_recheck_seconds=60,
+        first_pin_max_recheck_seconds=300,
+        durability_recheck_seconds=300,
+        durability_second_recheck_seconds=900,
+        durability_max_recheck_seconds=3600,
     )
-    first = worker._wait_schedule(
-        "ark:12345/2000000x", ProcessingWaitReason.CLUSTER_PINNING,
-        int(ProcessingWaitReason.NONE), 0, 0, 1,
-    )
-    repeated = worker._wait_schedule(
-        "ark:12345/2000000x", ProcessingWaitReason.CLUSTER_PINNING,
-        int(ProcessingWaitReason.CLUSTER_PINNING), 0, 0, 4,
-    )
+    first = worker._first_pin_wait_at(1)
+    second = worker._first_pin_wait_at(2)
+    later = worker._first_pin_wait_at(3)
+    durability_first = worker._durability_wait_at(1)
+    durability_second = worker._durability_wait_at(2)
+    durability_later = worker._durability_wait_at(3)
     now = datetime.now(timezone.utc).replace(tzinfo=None)
-    assert 1 <= (first - now).total_seconds() <= 3
-    assert 7 <= (repeated - now).total_seconds() <= 11
+    assert 14 <= (first - now).total_seconds() <= 16
+    assert 59 <= (second - now).total_seconds() <= 61
+    assert 299 <= (later - now).total_seconds() <= 301
+    assert 299 <= (durability_first - now).total_seconds() <= 301
+    assert 899 <= (durability_second - now).total_seconds() <= 901
+    assert 3599 <= (durability_later - now).total_seconds() <= 3601
 
 
 def test_chain_reconciliation_requires_exact_target_and_level1_cid():

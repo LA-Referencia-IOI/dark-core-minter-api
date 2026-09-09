@@ -51,10 +51,10 @@ When both CIDs have at least `REPLICATION_PUBLISH_AFTER_REPLICAS` confirmed
 the replication worker continues observing until both CIDs reach
 `REPLICATION_TARGET_REPLICAS`; only then are local payloads purged.
 
-The current selector uses pages of 100 by default, prioritizes all eligible
-`AVAILABILITY` records, and fills unused page capacity with `REPLICATION`
-records. It batches up to 200 unique CIDs. There is no quota split or normal
-per-ARK recheck timer in the current implementation.
+The current selector uses pages of 100 by default and batches up to 200 unique
+CIDs. First-pin work has priority. A persisted per-ARK schedule avoids polling
+Cluster continuously: first pins use 15 s, 1 min and then 5 min; final
+durability uses 5 min, 15 min and then hourly.
 
 The current two-phase policy requests one initial Cluster allocation. After
 publication, the replication worker promotes existing pins to the configured
