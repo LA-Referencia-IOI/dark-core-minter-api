@@ -9,16 +9,16 @@ RUN apt-get update \
 # Build context is expected to be components so dark-core-lib is available.
 # Example:
 # docker build -f services/dark-core-minter-api/Dockerfile -t dark-core-minter-api .
-COPY services/dark-core-minter-api/requirements.txt /tmp/requirements.txt
-COPY libraries/dark-core-lib /tmp/dark-core-lib
+COPY dark-core-minter-api/requirements.txt /tmp/requirements.txt
+COPY dark-core-lib /tmp/dark-core-lib
 RUN pip install --no-cache-dir -r /tmp/requirements.txt \
     && pip install --no-cache-dir /tmp/dark-core-lib
 
 # Copy application and alembic
-COPY services/dark-core-minter-api/app/ ./app/
-COPY services/dark-core-minter-api/alembic/ ./alembic/
-COPY services/dark-core-minter-api/alembic.ini .
-COPY services/dark-core-minter-api/docker-entrypoint.sh /usr/local/bin/minter-entrypoint
+COPY dark-core-minter-api/app/ ./app/
+COPY dark-core-minter-api/alembic/ ./alembic/
+COPY dark-core-minter-api/alembic.ini .
+COPY dark-core-minter-api/docker-entrypoint.sh /usr/local/bin/minter-entrypoint
 
 # Create non-root user and set ownership
 RUN useradd -m appuser \
