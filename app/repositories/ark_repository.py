@@ -34,7 +34,8 @@ def parse_ark(ark: str) -> Tuple[str, str]:
     Parse full ARK identifier into naan and name components.
 
     Args:
-        ark: Full ARK identifier (e.g., "ark:12345/abc123")
+        ark: Full ARK identifier in either accepted form:
+            ``ark:12345/abc123`` or ``ark:/12345/abc123``.
 
     Returns:
         Tuple of (naan, name)
@@ -45,8 +46,14 @@ def parse_ark(ark: str) -> Tuple[str, str]:
     if not ark.startswith("ark:"):
         raise ValueError(f"Invalid ARK format: {ark}")
 
-    parts = ark[4:].split("/", 1)  # Remove "ark:" prefix and split
-    if len(parts) != 2:
+    # ARK URI notation commonly includes an optional slash after ``ark:``.
+    # Stored records use the compact form, but callers must be able to send
+    # either spelling without changing the parsed NAAN or checkdigit payload.
+    identifier = ark[4:]
+    if identifier.startswith("/"):
+        identifier = identifier[1:]
+    parts = identifier.split("/", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
         raise ValueError(f"Invalid ARK format: {ark}")
 
     return parts[0], parts[1]

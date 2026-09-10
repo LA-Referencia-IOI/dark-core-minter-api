@@ -75,6 +75,17 @@ def test_reserve_ark_persists_to_db(client, test_db, mock_corelib):
     assert db_ark.naan == "12345"
 
 
+@pytest.mark.parametrize(
+    "identifier",
+    ("ark:12345/2000000000c", "ark:/12345/2000000000c"),
+)
+def test_parse_ark_accepts_compact_and_uri_forms(identifier):
+    """Both public ARK spellings resolve to the same persisted components."""
+    from app.repositories.ark_repository import parse_ark
+
+    assert parse_ark(identifier) == ("12345", "2000000000c")
+
+
 def test_reserve_ark_uses_counter_sequence(client, mock_corelib):
     """Reserved ARKs should use deterministic sequence values per namespace."""
     mock_corelib.is_authorized_for_naan.return_value = True
