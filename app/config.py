@@ -4,6 +4,7 @@ Configuration settings for dARK Core API.
 Uses pydantic-settings for environment variable loading and validation.
 """
 
+import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
@@ -150,11 +151,11 @@ class Settings(BaseSettings):
     @field_validator("minter_shoulder")
     @classmethod
     def validate_minter_shoulder(cls, value: str) -> str:
-        """Require the DARK 2 shoulder format: version ``2`` plus minter code."""
-        if len(value) != 3 or not value.isascii() or not value.isdigit() or not value.startswith("2"):
+        """Require the DARK 2 shoulder: ``2`` plus two lowercase alphanumerics."""
+        if not re.fullmatch(r"2[0-9a-z]{2}", value):
             raise ValueError(
-                "MINTER_SHOULDER must be exactly three digits in the format 2MM "
-                "(2 = DARK version; MM = minter code)"
+                "MINTER_SHOULDER must use the 2xx format "
+                "(2 = DARK version; x = lowercase alphanumeric minter code)"
             )
         return value
 

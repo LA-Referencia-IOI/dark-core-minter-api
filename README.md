@@ -840,7 +840,7 @@ These values are required for blockchain operations. DB-only API endpoints and w
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MINTER_SHOULDER` | DARK 2 prefix in format `2MM`; `MM` uniquely identifies the minter per NAAN | `200` |
+| `MINTER_SHOULDER` | DARK 2 prefix in format `2xx`; `xx` is lowercase alphanumeric and uniquely identifies the minter per NAAN | `200` |
 | `MINTER_NOID_LENGTH` | Generated-part length | `7` |
 | `MINTER_NOID_CHECKDIGIT` | Append and validate checkdigit | `true` |
 | `AUTH_CACHE_TTL` | NAAN authorization cache TTL | `60` |

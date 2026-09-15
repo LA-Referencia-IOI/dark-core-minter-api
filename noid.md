@@ -29,7 +29,7 @@ Current `name`:
 
 Where:
 
-- `shoulder`: DARK 2 minter prefix (`2MM`)
+- `shoulder`: DARK 2 minter prefix (`2xx`)
 - `counter_part`: base29-encoded counter with fixed length `7`
 - `checkdigit`: character computed over `"{naan}/{shoulder}{counter_part}"`
 
@@ -64,10 +64,11 @@ Variables:
 Important note:
 
 - Current policy operates it as fixed length (recommended `7`).
-- The shoulder is exactly three decimal digits in the form `2MM`: `2` denotes
-  DARK 2 and `MM` is the minter code. The historical `00*` prefix space is
-  reserved for DARK 1 and is rejected by the minter configuration.
-- Assign each `MM` code uniquely among minters that can issue under the same
+- The shoulder is exactly three lowercase ASCII alphanumeric characters in the
+  form `2xx`: `2` denotes DARK 2 and each `x` is a minter-code character. The
+  historical `00*` prefix space is reserved for DARK 1 and is rejected by the
+  minter configuration.
+- Assign each `xx` code uniquely among minters that can issue under the same
   NAAN. `200` is the default allocation.
 
 ## 5. Namespace Capacity
