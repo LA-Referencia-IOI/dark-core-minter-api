@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "dARK Core Minter API - REST service for minting and lifecycle operations via dark-core-lib"
 readme = "README.md"
 license = {text = "AGPL-3.0-or-later"}
-requires-python = ">=3.10"
+requires-python = ">=3.14,<3.15"
 authors = [
     {name = "dARK Team"}
 ]
@@ -14,9 +14,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
     "Framework :: FastAPI",
     "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
     "Topic :: Scientific/Engineering",
@@ -27,8 +25,8 @@ dependencies = [
     "pydantic==2.12.5",
     "pydantic-settings==2.13.1",
     "python-dotenv==1.2.2",
-    "web3==6.20.0",
-    "eth-account==0.11.2",
+    "web3>=7.16,<8",
+    "eth-account>=0.14,<0.15",
     "cryptography==46.0.5",
     "sqlalchemy==2.0.48",
     "alembic==1.18.4",

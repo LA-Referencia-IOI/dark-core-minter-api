@@ -4,7 +4,7 @@ REST API and background workers for ARK reservation, metadata staging,
 metadata persistence, IPFS replication reconciliation, and on-chain
 publication using `dark-core-lib`.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.14](https://img.shields.io/badge/python-3.14-blue.svg)](https://www.python.org/downloads/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.109+-green.svg)](https://fastapi.tiangolo.com/)
 
 ## Overview
