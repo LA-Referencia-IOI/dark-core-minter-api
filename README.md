@@ -23,8 +23,8 @@ publication using `dark-core-lib`.
 
 Normal Cluster states (`queued`, `pinning`, initial visibility) are scheduled
 with explicit bounded backoff through `next_action_at`; they are not errors.
-The deployer-level operational policy is documented in
-[`publication-latency-control.md`](../../../docs/publication-latency-control.md).
+The deployer-level operational policy is archived in the dark-deployer repo:
+`docs/old/publication-latency-control.md` (archived).
 
 This separation gives us better resilience, simpler retries, and a cleaner operational model.
 
@@ -37,6 +37,9 @@ Use the docs in this order, depending on what you need:
 - [minter-architecture.md](./minter-architecture.md)
   - technical implementation details, module map, concurrency model, worker internals
 - [notebooks/README.md](./notebooks/README.md)
+  - notebook index, expected environment variables, execution notes
+- [noid.md](./noid.md)
+  - detailed NOID generation rules and rationale
 
 ## Current storage and worker sequence
 
@@ -61,9 +64,6 @@ publication, the replication worker promotes existing pins to the configured
 target only when SQL shows no metadata persistence backlog and no pending
 first-pin availability work. This promotion is asynchronous; the worker then
 observes the pins and purges only after both CIDs reach the target.
-  - notebook index, expected environment variables, execution notes
-- [noid.md](./noid.md)
-  - detailed NOID generation rules and rationale
 
 ## Direct Import and NAAN Audit Commands
 
@@ -388,7 +388,7 @@ Important points:
   each cycle. If Store API/IPFS is unavailable, they pause as
   `PAUSED_STORAGE_UNAVAILABLE` without claiming or modifying ARKs.
 - the chain worker calls `dark-core-lib` through `publish_ark_operations(...)`, grouping ARKs by `authority_id` and sending individual create/update transactions with sequential pending nonces.
-- `CHAIN_WORKER_PAGE_SIZE` is the nominal maximum chain page size; the default is `20`. Before each cycle, the worker asks `dark-core-lib` for `get_chain_capacity(...)` and may temporarily use a smaller effective page size for both DB claim and the core-lib pipeline window.
+- `CHAIN_WORKER_PAGE_SIZE` is the nominal maximum chain page size; the default is `100`. Before each cycle, the worker asks `dark-core-lib` for `get_chain_capacity(...)` and may temporarily use a smaller effective page size for both DB claim and the core-lib pipeline window.
 - the chain worker pauses before claiming ARKs if core-lib reports RPC unavailable, stalled block production, or critical chain congestion. It also pauses after a full effective page of infrastructure-deferred receipt failures, which protects QBFT/Besu from repeated saturated pages.
 - the chain worker only reads blockchain during error handling. Reconcile never creates a different operation; it only confirms that the failed/ambiguous write already produced the expected `target` + `level1_cid`, or classifies the failure for retry/permanent handling.
 
@@ -534,6 +534,13 @@ For the chain worker, `last_cycle_full_page=true` means the worker will continue
 
 Worker heartbeats are emitted by a lightweight supervisor thread, so a full chain batch can take longer than `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` without incorrectly marking the worker stale.
 
+Replication heartbeats also expose four bounded last-cycle aggregates:
+`promotions_accepted`, `confirmed_cids`, `pending_cids`, and
+`batch_latency_ms`. Technical per-cycle deferrals are named
+`transient_deferred`; they are not permanent ARK errors. Promotion pressure is
+derived from the already-fetched Cluster batch and can reduce the durability
+budget from 100 to 50 or 20 without affecting first-pin priority.
+
 API mutations and worker attempts acquire the same PostgreSQL advisory lock per ARK before reading the record. A physical connection remains checked out until unlock, across commits and rollbacks; a lost connection cannot reconnect and write an unlocked result. Workers recheck stage, state and retry eligibility after acquiring the lock. Metadata updates, tombstones and manual rescue return `409 Conflict` when an ARK is busy. Updates require `PUBLISHED`; initial metadata submission still allows `RESERVED → DRAFT`. No revision counter or lease is stored: content cannot change during a worker attempt. PostgreSQL releases the lock when its connection terminates. Clients should retry a busy response later; pending `DRAFT`/`UPDATE` records must finish their workflow before accepting another metadata update.
 
 The detailed `config.chain.worker_page_size` field shows the active chain transaction pipeline window because chain page size and core-lib pipeline size are intentionally the same value. Cycle counters describe only the latest observation round, not lifetime totals or queue size.
@@ -644,14 +651,14 @@ erDiagram
 
 ## Quick Start
 
-### Inside `dark-developer`
+### Inside `dark-deployer`
 
 ```bash
-cd /Users/lmatas/source/dark-developer
+cd /Users/lmatas/source/dark-deployer
 source venv/bin/activate
-pip install -r components/services/dark-core-minter-api/requirements.txt
-pip install -e components/core/dark-core-lib
-pip install -e components/services/dark-core-minter-api
+pip install -r components/dark-core-minter-api/requirements.txt
+pip install -e components/dark-core-lib
+pip install -e components/dark-core-minter-api
 ```
 
 ### Standalone Local Development
@@ -685,45 +692,9 @@ python -m app.main_worker chain
 dark-core-worker-status
 ```
 
-## Docker Deployment in the Monorepo
+## Deployment
 
-The recommended local stack uses separate compose projects:
-- blockchain in `components/blockchain/dark-env`
-- minter in `components/services/dark-core-minter-api`
-
-```mermaid
-flowchart LR
-    ENV["dark-env compose"] --> NET["dark-net"]
-    MINTER["minter compose"] --> NET
-    MINTER --> PG["postgres"]
-    MINTER --> API["minter-api"]
-    MINTER --> MW["minter-metadata-worker"]
-    MINTER --> RW["minter-replication-worker"]
-    MINTER --> CW["minter-chain-worker"]
-```
-
-### Start Order
-
-```bash
-cd /Users/lmatas/source/dark-developer/components/blockchain/dark-env
-docker compose up -d
-
-cd /Users/lmatas/source/dark-developer/components/services/dark-core-minter-api
-docker compose run --rm minter-api migrate
-docker compose up -d --build
-```
-
-### Docker Notes
-
-- `minter-api`, `minter-metadata-worker`, `minter-replication-worker`, and `minter-chain-worker` join the external application and backbone networks.
-- `DARK_RPC_URL` comes from `.env.integration` as generated by dark-deployer: `http://rpc01:8545` when blockchain runs on this same `dark-net` (co-located install), or the real external RPC address for a decoupled/remote blockchain tier.
-- PostgreSQL runs as a sibling service in the same compose project.
-- The API and the three worker processes share PostgreSQL.
-- `minter-api`, `minter-metadata-worker`, and `minter-replication-worker` share the `metadata-storage` Docker volume mounted at `/app/metadata_storage` when `METADATA_STORAGE_TYPE=filesystem`.
-- `.env.integration` is preferred automatically when present.
-- Alembic migrations are explicit: run `docker compose run --rm minter-api migrate` after schema changes or a fresh database.
-- `minter-api` defaults to two Uvicorn workers. `MINTER_API_WORKERS` only affects the API process; it does not create extra metadata, replication, or chain worker processes.
-- The API starts without requiring RPC. The chain worker pauses as `PAUSED_RPC_UNAVAILABLE` while RPC is unavailable and resumes after recovery.
+dark-core-minter-api is deployed by the [dark-deployer](../../README.md) using the deployment v3 pipeline: an operator inventory (see [examples/operator-inventory/](../../examples/operator-inventory/)) is resolved, planned, and rendered into per-machine Docker Compose bundles, then applied with `./deploy.sh install` (locally) or `prepare`/`push`/`apply` (remote hosts). The runtime image version and the component checkout branch are pinned in `deployment_v3/catalog_data/dark-platform-baseline-v1.0.json`. There is no standalone docker-compose file in this component.
 
 ## Metadata Backends
 
@@ -785,7 +756,7 @@ The app prefers `.env.integration` over `.env`.
 | `REPLICATION_PUBLISH_AFTER_REPLICAS` | Minimum real pins required before the record is publishable | `1` |
 | `REPLICATION_TARGET_REPLICAS` | Desired global pin count before local payload purge | `2` |
 | `CHAIN_WORKER_ENABLED` | Enable blockchain publication worker | `true` |
-| `CHAIN_WORKER_PAGE_SIZE` | ARKs per chain cycle and max in-flight core-lib transaction window | `20` |
+| `CHAIN_WORKER_PAGE_SIZE` | ARKs per chain cycle and max in-flight core-lib transaction window | `100` |
 | `CHAIN_WORKER_SLEEP_SECONDS` | Chain sleep after an empty or partial page | `5` |
 | `CHAIN_WORKER_RPC_RETRY_SECONDS` | Sleep while chain worker is paused for unavailable RPC | `10` |
 | `CHAIN_WORKER_CONGESTION_RETRY_SECONDS` | Sleep while chain worker is paused for stalled/congested chain conditions | `30` |
@@ -880,8 +851,8 @@ The notebooks directory contains both focused notebooks and a simpler consolidat
 - [notebooks/minter_07_chain_import_optional.ipynb](./notebooks/minter_07_chain_import_optional.ipynb)
 - [notebooks/minter_08_resolver_end_to_end.ipynb](./notebooks/minter_08_resolver_end_to_end.ipynb)
   - simple direct-HTTP flow from authority creation to resolver lookup
-- `/Users/lmatas/source/dark-developer/notebooks/dark_e2e_authority_to_resolver.ipynb`
-  - root-level copy of the same simple end-to-end notebook for monorepo use
+- `notebooks/dark_e2e_authority_to_resolver.ipynb` at the dark-deployer repo root
+  - repo-level end-to-end notebook from authority creation to resolver lookup
 
 See [notebooks/README.md](./notebooks/README.md) for execution notes and environment variables.
 
@@ -925,9 +896,3 @@ Remember the split responsibility:
 - [noid.md](./noid.md)
 - [minter-architecture.md](./minter-architecture.md)
 - [notebooks/README.md](./notebooks/README.md)
-Replication heartbeats also expose four bounded last-cycle aggregates:
-`promotions_accepted`, `confirmed_cids`, `pending_cids`, and
-`batch_latency_ms`. Technical per-cycle deferrals are named
-`transient_deferred`; they are not permanent ARK errors. Promotion pressure is
-derived from the already-fetched Cluster batch and can reduce the durability
-budget from 100 to 50 or 20 without affecting first-pin priority.
