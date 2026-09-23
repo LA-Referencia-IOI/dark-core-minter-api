@@ -433,6 +433,7 @@ flowchart TD
 - After metadata persistence succeeds, PostgreSQL keeps CIDs and schema/media-type fields but purges `level1_json` and `original_content`.
 - `GET /api/v1/arks/{ark}` returns `minimal_metadata` from local DB when available; after purge it best-effort loads Level-1 from the configured storage backend using `level1_cid`.
 - If that storage lookup fails, `GET /api/v1/arks/{ark}` still returns state, target, CIDs, and schema without `minimal_metadata`.
+- `POST /api/v1/arks/status/batch` is the versioned (`version: "v1"`) mTLS-protected reconciliation read API. It accepts `{"arks": ["ark:..."]}` with 1--100 values and returns ordered `results`, each with the requested `ark` and either `status` (the GET representation) or `{ "error": { "code", "message", "retryable" } }`. Invalid, missing, and blockchain-failed values do not abort sibling results. It is distinct from `POST /api/v1/arks/batch`, which reserves identifiers.
 - The storage backend stores the immutable content addressed versions.
 - The storage backend interface and Level-1 schema are shared with the resolver through `dark-core-lib`.
 
@@ -552,6 +553,7 @@ and can be filtered by `stage`, `authority_id`, and `error_code`.
 |----------|--------|---------|
 | `/api/v1/arks` | `POST` | Reserve one ARK |
 | `/api/v1/arks/batch` | `POST` | Reserve multiple ARKs |
+| `/api/v1/arks/status/batch` | `POST` | mTLS-protected batch status lookup for up to 100 ARKs; per-item results/errors |
 | `/api/v1/arks/{ark}` | `GET` | Read local ARK state plus metadata/CIDs, with best-effort storage fallback |
 | `/api/v1/arks/{ark}` | `PUT` | Stage metadata and move to `DRAFT` or `UPDATE` |
 | `/api/v1/arks/{ark}` | `DELETE` | Tombstone an ARK locally |
