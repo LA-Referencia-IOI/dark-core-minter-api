@@ -54,6 +54,38 @@ class ARKBatchResponse(BaseModel):
     )
 
 
+class ARKStatusBatchError(BaseModel):
+    """Structured per-ARK failure returned by the status batch endpoint."""
+
+    code: Literal["not_found", "invalid_ark", "blockchain_error", "internal_error"]
+    message: str = Field(..., description="Human-readable failure description")
+    retryable: bool = Field(False, description="Whether retrying this ARK may succeed")
+
+
+class ARKStatusBatchResult(BaseModel):
+    """One independently resolved ARK in a version 1 status-batch response."""
+
+    ark: str = Field(..., description="ARK value supplied by the caller")
+    status: Optional[ARKResponse] = Field(
+        None,
+        description="The same ARK representation returned by GET /api/v1/arks/{ark}",
+    )
+    error: Optional[ARKStatusBatchError] = Field(
+        None,
+        description="Per-ARK failure. Present only when status is absent.",
+    )
+
+
+class ARKStatusBatchResponse(BaseModel):
+    """Versioned response for POST /api/v1/arks/status/batch."""
+
+    version: Literal["v1"] = Field("v1", description="Batch status contract version")
+    results: list[ARKStatusBatchResult] = Field(
+        ...,
+        description="Results in the same order as the requested ARKs",
+    )
+
+
 
 
 

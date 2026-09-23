@@ -33,11 +33,15 @@ from app.repositories import ARKRepository, NoidCounterRepository
 from app.models.requests import (
     ReserveARKRequest,
     ReserveBatchRequest,
+    ARKStatusBatchRequest,
     UpdateARKMetadataRequest,
 )
 from app.models.responses import (
     ARKResponse,
     ARKBatchResponse,
+    ARKStatusBatchError,
+    ARKStatusBatchResponse,
+    ARKStatusBatchResult,
 )
 from app.config import get_settings
 
@@ -385,6 +389,120 @@ async def batch_reserve_ark(
     )
 
 
+def _get_ark_status(
+    ark: str,
+    corelib_client: DARKCoreClient,
+    storage: MetadataStorage,
+    db: Session,
+) -> ARKResponse:
+    """Resolve one ARK using the public GET endpoint's read semantics."""
+    from app.repositories.ark_repository import parse_ark
+
+    try:
+        naan, name = parse_ark(ark)
+        _validate_ark_checkdigit_if_enabled(naan, name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ARK format. Expected ark:NAAN/suffix",
+        ) from exc
+
+    ark_repo = ARKRepository(db)
+    db_ark = ark_repo.get_by_ark(ark)
+
+    if db_ark:
+        db_metadata = ark_repo.get_metadata_by_ark_id(db_ark.id)
+        metadata_cid = db_metadata.level1_cid if db_metadata else None
+        metadata_schema = db_metadata.original_schema if db_metadata else None
+        minimal_metadata = _resolve_minimal_metadata(db_metadata, storage)
+
+        if db_ark.state in [ARKState.RESERVED, ARKState.DRAFT, ARKState.UPDATE]:
+            return ARKResponse(
+                ark=db_ark.ark, state=db_ark.state, target=db_ark.target,
+                metadata_cid=metadata_cid, metadata_schema=metadata_schema,
+                minimal_metadata=minimal_metadata,
+                level1_cid=db_metadata.level1_cid if db_metadata else None,
+                level2_cid=db_metadata.original_cid if db_metadata else None,
+                client_item_id=db_ark.client_item_id,
+            )
+        if db_ark.state == ARKState.PUBLISHED:
+            try:
+                info = corelib_client.get_ark(naan, name)
+                chain_minimal_metadata = minimal_metadata or _resolve_minimal_metadata(
+                    db_metadata, storage, fallback_level1_cid=info.cid,
+                )
+                return ARKResponse(
+                    ark=ark, state=ARKState.PUBLISHED, target=info.url,
+                    metadata_cid=info.cid, metadata_schema=metadata_schema,
+                    minimal_metadata=chain_minimal_metadata,
+                    level1_cid=db_metadata.level1_cid if db_metadata else None,
+                    level2_cid=db_metadata.original_cid if db_metadata else None,
+                    client_item_id=db_ark.client_item_id,
+                )
+            except Exception as exc:
+                # Preserve GET's best-effort fallback to locally persisted data.
+                logger.warning(f"Blockchain query failed for {ark}: {exc}")
+        return ARKResponse(
+            ark=db_ark.ark, state=db_ark.state, target=db_ark.target,
+            metadata_cid=metadata_cid, metadata_schema=metadata_schema,
+            minimal_metadata=minimal_metadata,
+            level1_cid=db_metadata.level1_cid if db_metadata else None,
+            level2_cid=db_metadata.original_cid if db_metadata else None,
+            client_item_id=db_ark.client_item_id,
+        )
+
+    if not corelib_client.ark_exists(naan, name):
+        raise HTTPException(status_code=404, detail="ARK not found")
+    info = corelib_client.get_ark(naan, name)
+    return ARKResponse(
+        ark=ark, state=ARKState.PUBLISHED, target=info.url, metadata_cid=info.cid,
+    )
+
+
+def _status_batch_error(exc: Exception) -> ARKStatusBatchError:
+    """Translate an isolated lookup failure without leaking it to sibling ARKs."""
+    if isinstance(exc, HTTPException):
+        if exc.status_code == 400:
+            return ARKStatusBatchError(code="invalid_ark", message=str(exc.detail))
+        if exc.status_code == 404:
+            return ARKStatusBatchError(code="not_found", message=str(exc.detail))
+        return ARKStatusBatchError(
+            code="blockchain_error" if exc.status_code >= 500 else "internal_error",
+            message=str(exc.detail), retryable=exc.status_code >= 500,
+        )
+    return ARKStatusBatchError(code="blockchain_error", message=str(exc), retryable=True)
+
+
+@router.post(
+    "/status/batch",
+    response_model=ARKStatusBatchResponse,
+    response_model_exclude_none=True,
+    summary="Batch ARK status lookup",
+    description=(
+        "Version v1. Resolves up to 100 ARKs using GET /arks/{ark} semantics. "
+        "Each result is independent: malformed, absent, and blockchain-failed "
+        "ARKs are represented by a structured per-item error."
+    ),
+)
+async def batch_get_ark_status(
+    request: ARKStatusBatchRequest,
+    cert_info: dict = Depends(require_mtls),
+    corelib_client: DARKCoreClient = Depends(get_corelib_client),
+    storage: MetadataStorage = Depends(get_metadata_storage),
+    db: Session = Depends(get_db),
+) -> ARKStatusBatchResponse:
+    """Read up to 100 ARKs without allowing one failed lookup to abort the batch."""
+    del cert_info
+    results = []
+    for ark in request.arks:
+        try:
+            results.append(ARKStatusBatchResult(ark=ark, status=_get_ark_status(ark, corelib_client, storage, db)))
+        except Exception as exc:
+            logger.warning("Batch status lookup failed for %s: %s", ark, exc)
+            results.append(ARKStatusBatchResult(ark=ark, error=_status_batch_error(exc)))
+    return ARKStatusBatchResponse(results=results)
+
+
 @router.get(
     "/{ark:path}",
     response_model=ARKResponse,
@@ -402,98 +520,7 @@ async def get_ark(
     """
     Get ARK details from database or blockchain.
     """
-    # Parse ARK to get NAAN/Name
-    from app.repositories.ark_repository import parse_ark
-    try:
-        naan, name = parse_ark(ark)
-        _validate_ark_checkdigit_if_enabled(naan, name)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid ARK format. Expected ark:NAAN/suffix")
-    
-    # 1. Try database first
-    ark_repo = ARKRepository(db)
-    db_ark = ark_repo.get_by_ark(ark)
-    
-    if db_ark:
-        db_metadata = ark_repo.get_metadata_by_ark_id(db_ark.id)
-        metadata_cid = db_metadata.level1_cid if db_metadata else None
-        metadata_schema = db_metadata.original_schema if db_metadata else None
-        minimal_metadata = _resolve_minimal_metadata(db_metadata, storage)
-
-        # Found in database
-        if db_ark.state in [ARKState.RESERVED, ARKState.DRAFT, ARKState.UPDATE]:
-            # Return from DB directly (not yet on blockchain)
-            return ARKResponse(
-                ark=db_ark.ark,
-                state=db_ark.state,
-                target=db_ark.target,
-                metadata_cid=metadata_cid,
-                metadata_schema=metadata_schema,
-                minimal_metadata=minimal_metadata,
-                level1_cid=db_metadata.level1_cid if db_metadata else None,
-                level2_cid=db_metadata.original_cid if db_metadata else None,
-                client_item_id=db_ark.client_item_id,
-            )
-        elif db_ark.state == ARKState.PUBLISHED:
-            # Combine DB metadata with blockchain data
-            try:
-                info = corelib_client.get_ark(naan, name)
-                chain_minimal_metadata = minimal_metadata or _resolve_minimal_metadata(
-                    db_metadata,
-                    storage,
-                    fallback_level1_cid=info.cid,
-                )
-                return ARKResponse(
-                    ark=ark,
-                    state=ARKState.PUBLISHED,
-                    target=info.url,  # From blockchain
-                    metadata_cid=info.cid,  # From blockchain
-                    metadata_schema=metadata_schema,  # From DB
-                    minimal_metadata=chain_minimal_metadata,
-                    level1_cid=db_metadata.level1_cid if db_metadata else None,
-                    level2_cid=db_metadata.original_cid if db_metadata else None,
-                    client_item_id=db_ark.client_item_id,
-                )
-            except Exception as e:
-                # Blockchain query failed, return DB data
-                logger.warning(f"Blockchain query failed for {ark}: {e}")
-                return ARKResponse(
-                    ark=db_ark.ark,
-                    state=db_ark.state,
-                    target=db_ark.target,
-                    metadata_cid=metadata_cid,
-                    metadata_schema=metadata_schema,
-                    minimal_metadata=minimal_metadata,
-                    level1_cid=db_metadata.level1_cid if db_metadata else None,
-                    level2_cid=db_metadata.original_cid if db_metadata else None,
-                    client_item_id=db_ark.client_item_id,
-                )
-        elif db_ark.state == ARKState.TOMBSTONE:
-            # Tombstoned
-            return ARKResponse(
-                ark=db_ark.ark,
-                state=db_ark.state,
-                target=db_ark.target,
-                metadata_cid=metadata_cid,
-                metadata_schema=metadata_schema,
-                minimal_metadata=minimal_metadata,
-                level1_cid=db_metadata.level1_cid if db_metadata else None,
-                level2_cid=db_metadata.original_cid if db_metadata else None,
-                client_item_id=db_ark.client_item_id,
-            )
-    
-    # 2. Fallback: Query blockchain (ARK might have been created outside this API)
-    if not corelib_client.ark_exists(naan, name):
-        raise HTTPException(status_code=404, detail="ARK not found")
-    
-    info = corelib_client.get_ark(naan, name)
-    
-    return ARKResponse(
-        ark=ark,
-        state=ARKState.PUBLISHED,
-        target=info.url,
-        metadata_cid=info.cid,
-    )
+    return _get_ark_status(ark, corelib_client, storage, db)
 
 
 @router.put(

@@ -63,6 +63,23 @@ class ReserveBatchRequest(BaseModel):
     )
 
 
+class ARKStatusBatchRequest(BaseModel):
+    """Version 1 request for a bounded batch ARK-status lookup."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    arks: list[str] = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+        description=(
+            "Full ARK identifiers to resolve. Each value is independently "
+            "validated, so an invalid ARK is reported in its result without "
+            "aborting the batch."
+        ),
+    )
+
+
 class UpdateARKMetadataRequest(BaseModel):
     """
     Request to update ARK metadata and transition to DRAFT state.
