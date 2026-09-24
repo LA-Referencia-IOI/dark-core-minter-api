@@ -36,7 +36,7 @@ async def get_authority(
     """
     Get authority information by UUID.
     """
-    logger.info(f"Getting authority: {uuid}")
+    logger.debug("Getting authority: %s", uuid)
     
     authority = corelib_client.get_authority_by_uuid(uuid)
     
@@ -62,7 +62,7 @@ async def get_authority_naans(
     """
     Get list of authorized NAANs for an authority.
     """
-    logger.info(f"Getting NAANs for authority: {uuid}")
+    logger.debug("Getting NAANs for authority: %s", uuid)
     
     naans = corelib_client.get_authorized_naans(uuid)
     
@@ -87,7 +87,7 @@ async def check_authority_authorization(
     """
     Check if authority is authorized for a specific NAAN.
     """
-    logger.info(f"Checking authorization: {uuid} for NAAN {naan}")
+    logger.debug("Checking authorization: %s for NAAN %s", uuid, naan)
     
     authorized = corelib_client.is_authorized_for_naan(uuid, naan)
     

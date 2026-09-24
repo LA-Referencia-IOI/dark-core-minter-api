@@ -146,13 +146,13 @@ class MTLSAuthenticator:
             )
         
         if not cert_info.get("verified"):
-            logger.warning(f"Client certificate verification failed: {cert_info}")
+            logger.warning("Client certificate verification failed")
             raise HTTPException(
                 status_code=403,
                 detail="Invalid client certificate",
             )
         
-        logger.info(f"Client authenticated: {cert_info.get('dn')}")
+        logger.debug("Client authenticated via mTLS")
         return cert_info
 
 

@@ -35,6 +35,7 @@ from app.dependencies import (
 from app.repositories import WorkerRuntimeRepository
 from app.repositories.ark_repository import ARKRepository
 from app.utils.storage_health import check_metadata_storage_health
+from app.utils.logging import WarningRateLimiter, configure_logging
 from app.workers.publisher import (
     ChainPublisherWorker,
     MetadataPersistenceWorker,
@@ -42,14 +43,7 @@ from app.workers.publisher import (
 )
 
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("worker.log"),
-    ],
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 _shutdown_event = threading.Event()
@@ -604,6 +598,7 @@ def run_worker(worker_kind: str = "chain") -> None:
     heartbeat_supervisor: Optional[_HeartbeatSupervisor] = None
     effective_chain_page_size = max(int(runtime.get("page_size", 1)), 1)
     healthy_capacity_cycles = 0
+    warning_limiter = WarningRateLimiter(get_settings().minter_log_warning_repeat_seconds)
 
     logger.info(f"Starting dARK Core {worker_kind} worker...")
 
@@ -710,7 +705,7 @@ def run_worker(worker_kind: str = "chain") -> None:
                 error = f"RPC unavailable while initializing chain worker: {exc}"
                 set_heartbeat_state("PAUSED_RPC_UNAVAILABLE", error[:1000])
                 persist_current_heartbeat()
-                logger.warning(error)
+                warning_limiter.warning(logger, "chain-rpc-initialization", error)
                 return False
 
             logger.info(f"Connected to blockchain at block {corelib_client.get_block_number()}")
@@ -765,7 +760,9 @@ def run_worker(worker_kind: str = "chain") -> None:
                     error = f"Chain capacity {capacity_state}: {capacity_reason}"
                     set_heartbeat_state(status, error[:1000])
                     persist_current_heartbeat()
-                    logger.warning(
+                    warning_limiter.warning(
+                        logger,
+                        f"chain-capacity-{capacity_state}-{capacity_reason}",
                         "Chain worker paused because core-lib capacity is %s; retrying in %ss: %s",
                         capacity_state,
                         sleep_seconds,
@@ -814,7 +811,9 @@ def run_worker(worker_kind: str = "chain") -> None:
                     set_heartbeat_state("PAUSED_STORAGE_UNAVAILABLE", error[:1000])
                     persist_current_heartbeat()
                     sleep_seconds = _storage_pause_sleep_seconds(runtime)
-                    logger.warning(
+                    warning_limiter.warning(
+                        logger,
+                        f"{worker_kind}-storage-unavailable",
                         "%s worker paused because storage is unavailable; retrying in %ss",
                         worker_kind.capitalize(),
                         sleep_seconds,
@@ -848,7 +847,9 @@ def run_worker(worker_kind: str = "chain") -> None:
                 set_heartbeat_state("PAUSED_CHAIN_CONGESTED", error[:1000])
                 persist_current_heartbeat()
                 sleep_seconds = _congestion_pause_sleep_seconds(runtime)
-                logger.warning(
+                warning_limiter.warning(
+                    logger,
+                    "chain-congestion-saturated",
                     "Chain worker paused after a full infrastructure-failed page; retrying in %ss",
                     sleep_seconds,
                 )
@@ -864,7 +865,7 @@ def run_worker(worker_kind: str = "chain") -> None:
             )
             if idle_reason.startswith("idle_"):
                 sleep_reason = idle_reason
-            logger.info(
+            logger.debug(
                 f"Worker cycle finished (processed: {_last_cycle_processed(publisher)}, "
                 f"sleep: {sleep_seconds}s, reason: {sleep_reason})"
             )

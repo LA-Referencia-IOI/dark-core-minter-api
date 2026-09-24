@@ -23,12 +23,16 @@ fi
 HOST="${MINTER_API_HOST:-${CORE_API_HOST:-0.0.0.0}}"
 PORT="${MINTER_API_PORT:-${CORE_API_PORT:-8001}}"
 API_WORKERS="${MINTER_API_WORKERS:-2}"
+ACCESS_LOG_ARGS="--no-access-log"
+if [ "${MINTER_UVICORN_ACCESS_LOG:-false}" = "true" ]; then
+  ACCESS_LOG_ARGS=""
+fi
 
 MODE="${1:-api}"
 
 case "$MODE" in
   api)
-    run_as_appuser "uvicorn app.main:app --host '$HOST' --port '$PORT' --workers '$API_WORKERS'"
+    run_as_appuser "uvicorn app.main:app --host '$HOST' --port '$PORT' --workers '$API_WORKERS' $ACCESS_LOG_ARGS"
     ;;
   migrate)
     run_as_appuser "python -m app.database migrate"

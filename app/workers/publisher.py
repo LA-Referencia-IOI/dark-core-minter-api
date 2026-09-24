@@ -33,6 +33,7 @@ from app.models.processing import (
 )
 from app.models.states import ARKState
 from app.repositories.ark_repository import ARKRepository, _ready_for_processing, parse_ark
+from app.utils.logging import rate_limited_warning
 
 logger = logging.getLogger(__name__)
 
@@ -583,7 +584,13 @@ class ReplicationReconciliationWorker(_Stats):
             except Exception as exc:
                 # Leave this batch absent so each affected ARK is deferred by
                 # its normal retry path; unrelated CID batches can proceed.
-                logger.warning("Replication status batch failed (%s CIDs): %s", len(batch), exc)
+                rate_limited_warning(
+                    logger,
+                    f"replication-status-batch-{type(exc).__name__}",
+                    "Replication status batch failed (%s CIDs): %s",
+                    len(batch),
+                    exc,
+                )
         self._recent_statuses = {
             cid: value for cid, value in self._recent_statuses.items()
             if (_now() - value[0]).total_seconds() < 2
@@ -656,7 +663,12 @@ class ReplicationReconciliationWorker(_Stats):
                         value == "promotion_failed" for value in promotion_results.values()
                     )
                 except Exception as exc:
-                    logger.warning("Durability promotion request failed: %s", exc)
+                    rate_limited_warning(
+                        logger,
+                        f"replication-promotion-{type(exc).__name__}",
+                        "Durability promotion request failed: %s",
+                        exc,
+                    )
                     promotion_failures = len(promotion_cids)
             promotion_latency_ms = int(max((_now() - promotion_started).total_seconds(), 0) * 1000)
         else:
@@ -701,7 +713,7 @@ class ReplicationReconciliationWorker(_Stats):
                 "last_replication_effective_promotion_batch_size": self._effective_promotion_batch_size,
             }
         )
-        logger.info(
+        logger.debug(
             "Replication cycle mode=%s arks=%s observed_cids=%s assigned_target=%s pinned=%s remote=%s queued=%s pinning=%s batches=%s promotions_requested=%s promotions_accepted=%s durable_arks=%s waiting=%s transient_deferred=%s status_latency_ms=%s promotion_latency_ms=%s pressure=%.1f%% promotion_budget=%s",
             self.stats["last_reconciliation_mode"], len(arks), len(unique_cids),
             assigned_target, confirmed_cids, remote_cids, queued_cids, pinning_cids,
@@ -826,7 +838,7 @@ class ChainPublisherWorker(_Stats):
         naan, name = parse_ark(item["ark"])
         try:
             if self._chain_matches(naan, name, item["target"], item["cid"]):
-                logger.info("reconciled successful pipeline write for %s", item["ark"])
+                logger.debug("reconciled successful pipeline write for %s", item["ark"])
                 return self._finalize_pipeline_confirmation(repo, item)
         except Exception as exc:
             # We cannot safely classify a result while the chain is unreadable.
@@ -902,7 +914,7 @@ class ChainPublisherWorker(_Stats):
                     # The chain operation can be accepted while its HTTP/RPC reply is lost.
                     if not self._chain_matches(naan, name, target, level1_cid):
                         raise exc
-                    logger.info("reconciled successful chain write for %s", ark)
+                    logger.debug("reconciled successful chain write for %s", ark)
                 current = db.query(ARKRecord).filter_by(id=record.id).with_for_update().one()
                 current_metadata = repo.get_metadata_by_ark_id(current.id)
                 if (
@@ -972,7 +984,7 @@ class ChainPublisherWorker(_Stats):
             for start in range(0, len(group), self.rpc_batch_size):
                 rpc_group = group[start : start + self.rpc_batch_size]
                 operations = [item["operation"] for item in rpc_group]
-                logger.info(
+                logger.debug(
                     "Submitting chain RPC pipeline authority=%s records=%s page=%s rpc_batch=%s offset=%s",
                     authority_id,
                     len(rpc_group),

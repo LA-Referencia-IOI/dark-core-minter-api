@@ -4,6 +4,7 @@ Configuration settings for dARK Core API.
 Uses pydantic-settings for environment variable loading and validation.
 """
 
+import logging
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -42,6 +43,16 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MINTER_API_PORT", "CORE_API_PORT"),
     )
     minter_api_workers: int = 2
+
+    # Logging. Containers log to stdout by default; an optional rotating file
+    # handler is available only when an operator explicitly configures it.
+    minter_log_level: str = "INFO"
+    minter_log_json: bool = False
+    minter_log_file: Optional[str] = None
+    minter_log_file_max_bytes: int = 10 * 1024 * 1024
+    minter_log_file_backup_count: int = 5
+    minter_log_warning_repeat_seconds: int = 300
+    minter_uvicorn_access_log: bool = False
     
     # Batch processing
     batch_size_limit: int = 100
@@ -159,6 +170,14 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("minter_log_level")
+    @classmethod
+    def validate_minter_log_level(cls, value: str) -> str:
+        normalized = value.strip().upper()
+        if normalized not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("MINTER_LOG_LEVEL must be DEBUG, INFO, WARNING, ERROR, or CRITICAL")
+        return normalized
+
     @model_validator(mode="after")
     def validate_replication_thresholds(self) -> "Settings":
         """Require a publication threshold no greater than the durability target."""
@@ -213,6 +232,12 @@ class Settings(BaseSettings):
             raise ValueError(
                 "CHAIN_WORKER_RPC_BATCH_SIZE cannot exceed CHAIN_WORKER_PAGE_SIZE"
             )
+        if self.minter_log_file_max_bytes < 1:
+            raise ValueError("MINTER_LOG_FILE_MAX_BYTES must be at least 1")
+        if self.minter_log_file_backup_count < 0:
+            raise ValueError("MINTER_LOG_FILE_BACKUP_COUNT cannot be negative")
+        if self.minter_log_warning_repeat_seconds < 1:
+            raise ValueError("MINTER_LOG_WARNING_REPEAT_SECONDS must be at least 1")
         return self
 
     def validate_blockchain_config(self) -> None:

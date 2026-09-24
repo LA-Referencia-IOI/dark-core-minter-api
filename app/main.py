@@ -5,6 +5,7 @@ FastAPI application with lifespan management, middleware, and routing.
 """
 
 import logging
+
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends
@@ -16,17 +17,9 @@ from app.dependencies import init_corelib_client, shutdown_corelib_client, get_c
 from app.api.router import api_router
 from app.exceptions.handlers import register_exception_handlers
 from app.utils.rpc_health import check_rpc_health
+from app.utils.logging import configure_logging
 
-# Configure logging
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler("api.log"),
-    ]
-)
+configure_logging()
 logger = logging.getLogger(__name__)
 
 
@@ -201,4 +194,5 @@ def run_server():
         port=settings.minter_api_port,
         reload=False,
         workers=settings.minter_api_workers,
+        access_log=settings.minter_uvicorn_access_log,
     )
