@@ -521,6 +521,27 @@ full result intentionally remains bounded: one aggregate per stage/status/wait
 reason, plus the earliest next action, permanent failures, infrastructure
 probes, and the recorded last cycle.
 
+## Logging Policy
+
+API and worker processes write to stdout by default so the deployment runtime
+can collect and rotate container logs. `MINTER_LOG_FILE` is optional and uses a
+rotating handler; it should only be enabled when a local file is explicitly
+needed. `MINTER_LOG_LEVEL` controls the root threshold and accepts `DEBUG`,
+`INFO`, `WARNING`, `ERROR`, or `CRITICAL`. `MINTER_LOG_JSON=true` emits records
+with timestamp, level, logger, message, and exception fields for structured
+collectors.
+
+At the default `INFO` level, lifecycle events, successful mutating operations,
+and operational failures remain visible. High-volume successful reads, idle
+worker cycles, per-ARK reconciliation details, chain pipeline submissions,
+and detailed replication summaries are `DEBUG` only. Repeating worker pause
+warnings are rate-limited by `MINTER_LOG_WARNING_REPEAT_SECONDS` (300 seconds
+by default), while state changes and failures remain visible immediately.
+
+Uvicorn access logs are disabled by default with `MINTER_UVICORN_ACCESS_LOG=false`
+when the edge proxy already owns request logging. `DATABASE_ECHO=false` should
+remain set in production to avoid SQL statement logging.
+
 ## 11. Data Model
 
 ```mermaid

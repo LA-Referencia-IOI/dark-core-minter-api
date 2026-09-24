@@ -800,6 +800,24 @@ These values are required for blockchain operations. DB-only API endpoints and w
 | `DATABASE_POOL_SIZE` | Pool size | `5` |
 | `DATABASE_MAX_OVERFLOW` | Overflow connections | `10` |
 
+### Logging
+
+Production logs go to stdout by default. Successful requests, idle worker
+cycles, per-ARK reconciliation, and detailed replication summaries are emitted
+only at `DEBUG`; repeating pause warnings are rate-limited while the condition
+persists. Keep `MINTER_UVICORN_ACCESS_LOG=false` when the edge proxy already
+keeps access logs.
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MINTER_LOG_LEVEL` | Application log threshold (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) | `INFO` |
+| `MINTER_LOG_JSON` | Emit structured JSON records to stdout and the optional file | `false` |
+| `MINTER_LOG_FILE` | Optional rotating log-file path; unset keeps logs on stdout only | unset |
+| `MINTER_LOG_FILE_MAX_BYTES` | Maximum bytes per optional log file before rotation | `10485760` |
+| `MINTER_LOG_FILE_BACKUP_COUNT` | Retained rotated log files | `5` |
+| `MINTER_LOG_WARNING_REPEAT_SECONDS` | Minimum interval for repeating worker pause warnings | `300` |
+| `MINTER_UVICORN_ACCESS_LOG` | Enable Uvicorn per-request access logs | `false` |
+
 ### Metadata Storage
 
 | Variable | Description | Default |
