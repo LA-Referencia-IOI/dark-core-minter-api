@@ -21,8 +21,7 @@ from app.utils.error_headers import (
 logger = logging.getLogger(__name__)
 
 AUTHORITY_ID_HEADER_CANDIDATES = (
-    "X-Authority-Id",
-    "X-Authority-UUID",
+    "X-DARK-Authority-Id",
 )
 
 
@@ -184,43 +183,19 @@ async def require_authority_identity(
     request: Request,
     authenticator: MTLSAuthenticator = Depends(get_mtls_authenticator),
 ) -> dict:
+    """Verify a signed mutation, or resolve explicit identity when disabled.
+
+    Disabling signatures retains authority/ownership/NAAN checks. Certificate
+    metadata and forwarded identity do not select the mutation authentication mode.
     """
-    Resolve an authenticated authority identity for mutating endpoints.
-
-    Behavior:
-    - When mTLS is enabled: require a valid client certificate and extract the
-      authority ID from trusted headers or the certificate DN.
-    - When mTLS is disabled: require an explicit authority header so requests
-      are not anonymous in local/dev mode.
-    """
-    cert_info = await authenticator(request)
-    authority_id = extract_authority_id(request, cert_info)
-
-    if authority_id:
-        return {
-            "authority_id": authority_id,
-            "auth_mode": "mtls" if authenticator.enabled else "header",
-            "cert": cert_info,
-        }
-
-    if authenticator.enabled:
-        raise dark_http_exception(
-            status_code=401,
-            detail=(
-                "Authority identity required. Provide a trusted authority header "
-                "or include it in the certificate subject."
-            ),
-            error_code=AUTHORITY_IDENTITY_REQUIRED,
-            retryable=False,
-        )
-
-    header_names = ", ".join(AUTHORITY_ID_HEADER_CANDIDATES)
-    raise dark_http_exception(
-        status_code=401,
-        detail=f"Authority identity required. Set one of: {header_names}",
-        error_code=AUTHORITY_IDENTITY_REQUIRED,
-        retryable=False,
-    )
+    if get_settings().minter_signed_auth_enabled:
+        from app.middleware.signed_auth import authenticate
+        return await authenticate(request)
+    authority_id = extract_authority_id(request)
+    if not authority_id:
+        raise dark_http_exception(status_code=401, detail="Authority header required",
+            error_code=AUTHORITY_IDENTITY_REQUIRED, retryable=False)
+    return {"authority_id": authority_id, "auth_mode": "header"}
 
 
 def enforce_authority_match(identity: dict, authority_id: str) -> str:

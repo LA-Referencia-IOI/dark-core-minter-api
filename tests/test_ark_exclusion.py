@@ -42,7 +42,7 @@ def engine(monkeypatch):
             values = [{"id": int(value), "code": value.name.lower(), "description": value.name} for value in enum]
             if name == "processing_error_codes":
                 for row in values:
-                    row["retryable"] = True
+                    row["retryable"] = row["id"] in (100, 101, 200, 201, 300, 900)
             conn.execute(table.insert(), values)
     monkeypatch.setattr(ark_locks, "get_engine", lambda: engine)
     yield engine
@@ -178,8 +178,8 @@ def test_reconciler_holds_lock_through_external_io(engine, client):
     storage = Mock()
     def observe(cid):
         assert client.put(f"/arks/{ARK}", json=payload()).status_code == 409
-        return SimpleNamespace(total_replicas=2)
-    storage.get_replication_status.side_effect = observe
+        return SimpleNamespace(total_replicas=2, status="pinned")
+    storage.get_replication_statuses.side_effect = lambda cids: {cid: observe(cid) for cid in cids}
     result = ReplicationReconciliationWorker(storage)._reconcile(ARK)
     assert result["purged"] == 1
     assert client.put(f"/arks/{ARK}", json=payload()).status_code == 200
@@ -188,10 +188,10 @@ def test_reconciler_holds_lock_through_external_io(engine, client):
 def test_async_cluster_pin_wait_is_a_normal_wait(engine):
     seed(engine, state="D", stage=ProcessingStage.AVAILABILITY)
     storage = Mock()
-    storage.get_replication_status.return_value = SimpleNamespace(total_replicas=1)
+    storage.get_replication_statuses.side_effect = lambda cids: {cid: SimpleNamespace(total_replicas=1, status="pinned") for cid in cids}
 
     result = ReplicationReconciliationWorker(
-        storage, recheck_seconds=10, publish_after_replicas=2
+        storage, first_pin_recheck_seconds=10, publish_after_replicas=2
     )._reconcile(ARK)
 
     assert result["failed"] == 0
@@ -208,12 +208,10 @@ def test_async_cluster_pin_wait_is_a_normal_wait(engine):
 def test_cluster_pinning_never_repairs_payload_before_it_settles(engine):
     seed(engine, state="D", stage=ProcessingStage.AVAILABILITY)
     storage = Mock()
-    storage.get_replication_status.return_value = SimpleNamespace(
-        total_replicas=0, status="pinning"
-    )
+    storage.get_replication_statuses.side_effect = lambda cids: {cid: SimpleNamespace(total_replicas=0, status="pinning") for cid in cids}
 
     result = ReplicationReconciliationWorker(
-        storage, recheck_seconds=10, pinning_grace_seconds=0
+        storage, first_pin_recheck_seconds=10, repair_grace_seconds=0
     )._reconcile(ARK)
 
     assert result["failed"] == 0
@@ -233,3 +231,53 @@ def test_legacy_rescue_endpoint_is_removed(engine, client):
 
 def test_schema_has_no_revision():
     assert "content_revision" not in ARKRecord.__table__.columns
+
+
+def test_classic_and_compact_ark_share_the_same_lock(engine):
+    with ark_locks.acquire_ark_lock(ARK) as db:
+        assert db is not None
+        with ark_locks.acquire_ark_lock(ARK.replace('ark:', 'ark:/')) as other:
+            assert other is None
+
+
+def test_new_owner_archives_old_payload_transactionally(engine):
+    # Exercise the real JSON insert and FK ordering on PostgreSQL.
+    with engine.begin() as conn:
+        conn.execute(text('CREATE TABLE superseded_ark_jobs (id SERIAL PRIMARY KEY, ark VARCHAR(255) NOT NULL, original_authority_id VARCHAR(255) NOT NULL, replacement_authority_id VARCHAR(255) NOT NULL, snapshot JSON NOT NULL, created_at TIMESTAMP DEFAULT now())'))
+    seed(engine, state='U', stage=ProcessingStage.CHAIN)
+    core = Mock()
+    core.get_authority_by_uuid.return_value = SimpleNamespace(active=True, wallet_address='0xbbb')
+    core.get_ark.return_value = SimpleNamespace(owner='0xbbb', url='https://example.org/on-chain', cid='chain-cid')
+    core.is_authorized_for_naan.return_value = True
+    for commit in (False, True):
+        with ark_locks.acquire_ark_lock(ARK) as db:
+            repo = ARKRepository(db)
+            record = repo.get_by_ark(ARK)
+            arks._reconcile_local_owner(core, db, repo, record, 'replacement', '12345', 'exclusion-test', ARK)
+            assert record.authority_id == 'replacement'
+            assert record.state == 'P'
+            assert record.target == 'https://example.org/on-chain'
+            assert repo.get_metadata_by_ark_id(record.id) is None
+            audit = db.execute(text('SELECT original_authority_id, replacement_authority_id, snapshot FROM superseded_ark_jobs')).one()
+            assert audit.original_authority_id == 'authority'
+            assert audit.snapshot['metadata']['original_content'] == 'old'
+            assert audit.snapshot['record']['authority_id'] == 'authority'
+            if commit:
+                db.commit()
+            else:
+                db.rollback()
+                assert repo.get_by_ark(ARK).authority_id == 'authority'
+                assert repo.get_metadata_by_ark_id(record.id).original_content == 'old'
+                assert db.scalar(text('SELECT count(*) FROM superseded_ark_jobs')) == 0
+    with Session(engine) as db:
+        assert db.scalar(text('SELECT count(*) FROM superseded_ark_jobs')) == 1
+
+
+
+def test_replication_unassigned_authority_returns_cycle_counters(engine, monkeypatch):
+    seed(engine)
+    monkeypatch.setattr('app.workers.publisher.get_settings', lambda: SimpleNamespace(authority_is_assigned=lambda uuid: False))
+    result = ReplicationReconciliationWorker(Mock())._reconcile(ARK)
+    assert result['failed'] == 1
+    with Session(engine) as db:
+        assert ARKRepository(db).get_by_ark(ARK).processing_status == int(ProcessingStatus.FAILED)

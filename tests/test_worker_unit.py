@@ -1,6 +1,9 @@
 """Unit coverage for worker policy that does not require a database server."""
 
 from unittest.mock import Mock
+from types import SimpleNamespace
+import pytest
+from app.models.processing import ProcessingStage, ProcessingErrorCode
 from datetime import datetime, timezone
 
 from dark_core_lib import ARKPublishResult
@@ -85,7 +88,13 @@ def test_uncertain_pipeline_result_is_deferred_without_consuming_retry_budget():
         "ark": "ark:12345/2000000x",
         "target": "https://example.org/object",
         "cid": "bafy-l1",
+        "authority_id": "original",
+        "state": "D",
     }
+    repo.get_by_ark.return_value = SimpleNamespace(id=1, authority_id="original", state="D", target=item["target"], processing_stage=int(ProcessingStage.CHAIN))
+    repo.get_metadata_by_ark_id.return_value = SimpleNamespace(level1_cid=item["cid"])
+    core.get_authority_by_uuid.return_value = SimpleNamespace(active=True, wallet_address="0xaaa")
+    core.is_authorized_for_naan.return_value = True
 
     published = worker._handle_pipeline_result(
         repo,
@@ -111,7 +120,13 @@ def test_reverted_pipeline_result_remains_permanent_after_exact_chain_check():
         "ark": "ark:12345/2000000x",
         "target": "https://example.org/object",
         "cid": "bafy-l1",
+        "authority_id": "original",
+        "state": "D",
     }
+    repo.get_by_ark.return_value = SimpleNamespace(id=1, authority_id="original", state="D", target=item["target"], processing_stage=int(ProcessingStage.CHAIN))
+    repo.get_metadata_by_ark_id.return_value = SimpleNamespace(level1_cid=item["cid"])
+    core.get_authority_by_uuid.return_value = SimpleNamespace(active=True, wallet_address="0xaaa")
+    core.is_authorized_for_naan.return_value = True
 
     published = worker._handle_pipeline_result(
         repo,
@@ -122,3 +137,49 @@ def test_reverted_pipeline_result_remains_permanent_after_exact_chain_check():
     assert not published
     repo.mark_processing_failed.assert_called_once()
     repo.defer_processing_retry.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["confirmed", "reverted", "ambiguous"])
+@pytest.mark.parametrize("changed", ["authority_id", "target", "state", "cid"])
+def test_old_pipeline_result_cannot_mutate_replacement_payload(status, changed):
+    core, repo = Mock(), Mock()
+    worker = ChainPublisherWorker(core)
+    item = dict(ark="ark:12345/test", authority_id="original", state="U", target="old-url", cid="old-cid")
+    values = dict(id=1, authority_id="original", state="U", target="old-url", processing_stage=int(ProcessingStage.CHAIN))
+    metadata = SimpleNamespace(level1_cid="old-cid")
+    if changed == "cid":
+        metadata.level1_cid = "new-cid"
+    else:
+        values[changed] = "replacement"
+    repo.get_by_ark.return_value = SimpleNamespace(**values)
+    repo.get_metadata_by_ark_id.return_value = metadata
+    result = ARKPublishResult(ref=item["ark"], action="update", status=status)
+    assert not worker._handle_pipeline_result(repo, item, result)
+    repo.mark_processing_failed.assert_not_called()
+    repo.defer_processing_retry.assert_not_called()
+    repo.update_to_published.assert_not_called()
+    core.get_ark.assert_not_called()
+
+
+def test_failed_old_owner_is_permanent_and_keeps_identity():
+    core, repo = Mock(), Mock()
+    worker = ChainPublisherWorker(core)
+    record = SimpleNamespace(authority_id="original")
+    repo.get_by_ark.return_value = record
+    core.get_authority_by_uuid.return_value = SimpleNamespace(active=True, wallet_address="0xaaa")
+    core.get_ark.return_value = SimpleNamespace(owner="0xbbb")
+    assert worker._reconcile_failed_identity(repo, "ark:12345/test")
+    assert record.authority_id == "original"
+    assert repo.mark_processing_failed.call_args.args[2] == int(ProcessingErrorCode.CHAIN_STATE_CONFLICT)
+    assert repo.mark_processing_failed.call_args.kwargs["is_permanent"]
+    repo.defer_processing_retry.assert_not_called()
+
+
+def test_unavailable_chain_never_proves_ownership_loss():
+    core, repo = Mock(), Mock()
+    worker = ChainPublisherWorker(core)
+    repo.get_by_ark.return_value = SimpleNamespace(authority_id="original")
+    core.get_authority_by_uuid.side_effect = TimeoutError()
+    assert worker._reconcile_failed_identity(repo, "ark:12345/test")
+    repo.defer_processing_retry.assert_called_once()
+    repo.mark_processing_failed.assert_not_called()

@@ -87,14 +87,14 @@ def test_status_batch_limits_request_to_100_and_keeps_order(client, test_db):
     assert response.status_code == 422
 
 
-def test_status_batch_requires_mtls_authentication(client):
+def test_status_batch_is_public_even_when_legacy_mtls_would_reject(client):
     async def reject_mtls():
         raise HTTPException(status_code=401, detail="Client certificate required")
 
     app.dependency_overrides[require_mtls] = reject_mtls
     try:
         response = client.post(ENDPOINT, json={"arks": [_ark(30)]})
-        assert response.status_code == 401
+        assert response.status_code == 200
     finally:
         app.dependency_overrides.pop(require_mtls, None)
 

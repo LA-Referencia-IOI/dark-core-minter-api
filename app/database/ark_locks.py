@@ -13,11 +13,13 @@ from sqlalchemy import event, text
 from sqlalchemy.orm import Session
 
 from app.database.connection import get_engine
+from dark_core_lib.ark_id import parse_ark_id
 
 
 def ark_lock_key(ark: str) -> int:
     """Return a stable signed bigint advisory-lock key for an ARK."""
-    digest = blake2b(ark.encode("utf-8"), digest_size=8, person=b"dark-ark").digest()
+    canonical = parse_ark_id(ark).compact
+    digest = blake2b(canonical.encode("utf-8"), digest_size=8, person=b"dark-ark").digest()
     return int.from_bytes(digest, byteorder="big", signed=True)
 
 

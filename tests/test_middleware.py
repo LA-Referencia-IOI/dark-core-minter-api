@@ -208,7 +208,7 @@ class TestAuthorityIdentityHelpers:
 
     def test_extract_authority_id_from_header(self):
         request = MagicMock()
-        request.headers = {"X-Authority-Id": "test-uuid"}
+        request.headers = {"X-DARK-Authority-Id": "test-uuid"}
 
         assert extract_authority_id(request) == "test-uuid"
 
@@ -239,10 +239,9 @@ class TestRequireAuthorityIdentity:
     @pytest.mark.asyncio
     async def test_disabled_requires_header(self):
         request = MagicMock()
-        request.headers = {"X-Authority-Id": "test-uuid"}
+        request.headers = {"X-DARK-Authority-Id": "test-uuid"}
         authenticator = MagicMock()
         authenticator.enabled = False
-        authenticator.return_value = AsyncMock(return_value=None)()
 
         identity = await require_authority_identity(request, authenticator)
 
@@ -255,7 +254,6 @@ class TestRequireAuthorityIdentity:
         request.headers = {}
         authenticator = MagicMock()
         authenticator.enabled = False
-        authenticator.return_value = AsyncMock(return_value=None)()
 
         with pytest.raises(HTTPException) as exc_info:
             await require_authority_identity(request, authenticator)
@@ -263,19 +261,13 @@ class TestRequireAuthorityIdentity:
         assert exc_info.value.status_code == 401
 
     @pytest.mark.asyncio
-    async def test_enabled_uses_cert_and_dn(self):
+    async def test_disabled_does_not_trust_certificate_identity(self):
         request = MagicMock()
         request.headers = {}
-        authenticator = MagicMock()
-        authenticator.enabled = True
-        authenticator.return_value = AsyncMock(
-            return_value={"verified": True, "dn": "CN=test,UID=test-uuid,O=Test Org"}
-        )()
+        with pytest.raises(HTTPException) as exc:
+            await require_authority_identity(request, MagicMock())
+        assert exc.value.status_code == 401
 
-        identity = await require_authority_identity(request, authenticator)
-
-        assert identity["authority_id"] == "test-uuid"
-        assert identity["auth_mode"] == "mtls"
 
 
 class TestMTLSIntegration:

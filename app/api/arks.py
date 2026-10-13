@@ -19,7 +19,6 @@ from app.database.ark_locks import acquire_ark_lock
 from app.middleware.auth import (
     enforce_authority_match,
     require_authority_identity,
-    require_mtls,
 )
 from app.utils.noid import mint_ark_id, validate_name_checkdigit
 from app.utils.auth_cache import AuthorizationCheckUnavailable, check_authorization_cached
@@ -43,6 +42,7 @@ from app.models.responses import (
     ARKStatusBatchResponse,
     ARKStatusBatchResult,
 )
+from app.middleware.authority_lifecycle import require_mutation_identity, require_current_owner
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
@@ -176,7 +176,7 @@ def _ensure_authorized_for_naan(
 )
 async def reserve_ark(
     request: ReserveARKRequest,
-    identity: dict = Depends(require_authority_identity),
+    identity: dict = Depends(require_mutation_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> ARKResponse:
@@ -273,7 +273,7 @@ async def reserve_ark(
 )
 async def batch_reserve_ark(
     request: ReserveBatchRequest,
-    identity: dict = Depends(require_authority_identity),
+    identity: dict = Depends(require_mutation_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_db),
 ) -> ARKBatchResponse:
@@ -486,13 +486,11 @@ def _status_batch_error(exc: Exception) -> ARKStatusBatchError:
 )
 async def batch_get_ark_status(
     request: ARKStatusBatchRequest,
-    cert_info: dict = Depends(require_mtls),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     storage: MetadataStorage = Depends(get_metadata_storage),
     db: Session = Depends(get_db),
 ) -> ARKStatusBatchResponse:
     """Read up to 100 ARKs without allowing one failed lookup to abort the batch."""
-    del cert_info
     results = []
     for ark in request.arks:
         try:
@@ -512,7 +510,6 @@ async def batch_get_ark_status(
 )
 async def get_ark(
     ark: str = Path(..., description="Full ARK identifier (e.g. ark:/12345/xyz)"),
-    cert_info: dict = Depends(require_mtls),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     storage: MetadataStorage = Depends(get_metadata_storage),
     db: Session = Depends(get_db),
@@ -521,6 +518,44 @@ async def get_ark(
     Get ARK details from database or blockchain.
     """
     return _get_ark_status(ark, corelib_client, storage, db)
+
+
+def _reconcile_local_owner(client, db, repo, record, authority_id, naan, name, ark):
+    """After a local ownership rejection, import the current owner's record.
+
+    Caller holds the ARK lock. Superseded content is audit-only, never a job
+    signed by the replacement authority. The surrounding request commits it.
+    """
+    chain_info = require_current_owner(client, authority_id, naan, name)
+    from sqlalchemy import text
+    from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingWaitReason
+    import json
+    previous_metadata = repo.get_metadata_by_ark_id(record.id)
+    def snapshot(row):
+        return {column.name: getattr(row, column.name) for column in row.__table__.columns} if row else None
+    # Retain old payload under its original identity for audit/manual review.
+    # It is never converted into a new-owner worker job.
+    db.execute(text("INSERT INTO superseded_ark_jobs(ark,original_authority_id,replacement_authority_id,snapshot) VALUES (:ark,:source,:target,CAST(:snapshot AS JSON))"),
+        {'ark': ark, 'source': record.authority_id, 'target': authority_id,
+         'snapshot': json.dumps({'record':snapshot(record), 'metadata':snapshot(previous_metadata)}, default=str)})
+    if previous_metadata is not None:
+        db.delete(previous_metadata)
+        db.flush()
+    record.authority_id = authority_id
+    record.state = ARKState.PUBLISHED.value
+    record.target = chain_info.url
+    record.tombstoned_at = None
+    record.client_item_id = None
+    record.processing_stage = int(ProcessingStage.NONE)
+    record.processing_status = int(ProcessingStatus.DONE)
+    record.processing_wait_reason = int(ProcessingWaitReason.NONE)
+    record.processing_attempt_count = 0
+    record.processing_error_code = None
+    record.processing_error_detail = None
+    record.next_action_at = None
+    db.flush()
+
+    return chain_info
 
 
 @router.put(
@@ -533,7 +568,7 @@ async def get_ark(
 async def update_ark_metadata(
     request: UpdateARKMetadataRequest,
     ark: str = Path(..., description="Full ARK identifier"),
-    identity: dict = Depends(require_authority_identity),
+    identity: dict = Depends(require_mutation_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_locked_ark_db),
     storage: MetadataStorage = Depends(get_metadata_storage),
@@ -609,6 +644,11 @@ async def update_ark_metadata(
             if not db_ark:
                 db.rollback()
                 raise HTTPException(status_code=500, detail="Failed to import ARK from blockchain")
+
+    if db_ark.authority_id != authority_id:
+        chain_info = _reconcile_local_owner(corelib_client, db, ark_repo, db_ark,
+                                           authority_id, naan, name, ark)
+        known_chain_cid = chain_info.cid
 
     # 3. Tombstone records cannot be modified.
     if db_ark.state == ARKState.TOMBSTONE:
@@ -723,7 +763,7 @@ async def update_ark_metadata(
 )
 async def delete_ark(
     ark: str = Path(..., description="Full ARK identifier"),
-    identity: dict = Depends(require_authority_identity),
+    identity: dict = Depends(require_mutation_identity),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
     db: Session = Depends(get_locked_ark_db),
 ) -> None:
@@ -745,9 +785,15 @@ async def delete_ark(
     if not db_ark:
         raise HTTPException(status_code=404, detail="ARK not found")
 
+    if identity['authority_id'] != db_ark.authority_id:
+        _reconcile_local_owner(corelib_client, db, ark_repo, db_ark,
+                               identity['authority_id'], naan, name, ark)
     authenticated_authority = enforce_authority_match(identity, db_ark.authority_id)
     logger.info(f"Authenticated authority {authenticated_authority} requested tombstone for {ark}")
     
+    require_current_owner(corelib_client, authenticated_authority, naan, name,
+                          allow_missing=db_ark.state in (ARKState.RESERVED, ARKState.DRAFT))
+
     # Update to TOMBSTONE state
     try:
         ark_repo.update_to_tombstone(ark)

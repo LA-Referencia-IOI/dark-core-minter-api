@@ -308,3 +308,10 @@ class ARKMetadata(Base):
             f"<ARKMetadata(id={self.id}, ark_record_id={self.ark_record_id}, "
             f"schema={self.original_schema}, media_type={self.original_media_type})>"
         )
+
+
+class AuthorityRequestNonce(Base):
+    __tablename__ = "authority_request_nonces"
+    authority_id = Column(String(255), primary_key=True)
+    nonce = Column(String(36), primary_key=True)
+    expires_at = Column(DateTime(timezone=True), nullable=False, index=True)

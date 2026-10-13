@@ -574,24 +574,55 @@ and can be filtered by `stage`, `authority_id`, and `error_code`.
 
 ## Authentication and Authorization
 
-### Current Behavior
+Set `MINTER_SIGNED_AUTH_ENABLED=true` to require Ed25519 request signatures on
+ARK mutations and administrative retries. Set it to `false` (default) to use
+`X-DARK-Authority-Id` without cryptographic verification. Both
+modes retain authority matching, ARK ownership and NAAN checks. Restart the API
+after changing the setting. Legacy mTLS settings do not select this mode.
 
-- Mutating endpoints
-  - `POST /api/v1/arks`
-  - `POST /api/v1/arks/batch`
-  - `PUT /api/v1/arks/{ark}`
-  - `DELETE /api/v1/arks/{ark}`
-- When `MTLS_ENABLED=false`
-  - the caller must send `X-Authority-Id` or `X-Authority-UUID`
-  - that identity must match the `authority_id` in the request body when applicable
-- When `MTLS_ENABLED=true`
-  - the request must pass the mTLS gate
-  - the service also resolves authority identity from trusted request data
-- Authorization checks are performed against `dark-core-lib` and cached locally for NAAN authorization decisions.
+Queries are public, including `POST /api/v1/arks/status/batch`. Use HTTPS at the
+gateway; protect direct access to the upstream API. The signed-auth feature does
+not configure server TLS or trust arbitrary forwarded-protocol headers.
 
-### Important Operational Note
+Enabling requires the updated Authority contract/ABI, a registered public key,
+and migration
+`0002_authority_request_nonces`. Missing contract support fails closed. Multiple
+replicas of one logical endpoint must share PostgreSQL.
 
-The current codebase supports local developer mode with header-based authority identity when mTLS is disabled. That is useful for notebooks and local stacks, but production deployments should put the service behind a trusted TLS terminator or enforce stronger identity guarantees.
+Key cache idle TTL defaults to 60 seconds and is configurable through
+`MINTER_CLIENT_KEY_CACHE_IDLE_TTL_SECONDS`. Valid accepted signatures renew it;
+invalid requests/replays do not. Cached key and active status remain trusted
+while in use, even after an on-chain change. An authenticated new fingerprint
+refreshes the entry. Existing business authorization checks remain independent.
+
+Timestamps are Unix seconds, with a configurable 300-second symmetric window
+(`MINTER_SIGNED_AUTH_MAX_SKEW_SECONDS`). Nonces are UUIDs consumed in a separate
+PostgreSQL transaction before business logic. Duplicates return 409; failures
+never return a previous result. Cleanup runs at most once per minute per process
+when accepting signed requests. After a lost response, query state before
+submitting a new modification.
+
+Use `dark_core_lib.request_signing.sign_request` with an Ed25519 private key,
+method, exact path/query, body bytes and authority UUID. Send the exact
+signed bytes, not a separately serialized `json=` body. The canonical UTF-8
+string is newline-separated, without a final newline:
+
+```text
+DARK2
+<METHOD>
+<RAW_PATH_WITH_QUERY>
+<AUTHORITY_ID>
+<SHA256_PUBLIC_KEY_HEX>
+<UNIX_TIMESTAMP>
+<UUID_NONCE>
+<SHA256_BODY_HEX>
+```
+
+Register `client_public_key` as base64 of the raw 32-byte Ed25519 public key in
+Admin authority creation, or replace it using
+`PUT /api/v1/admin/authority/{uuid}/client-key`. The private client key stays on
+the client and is independent of blockchain signing credentials. Authorities
+created without a client key can use only unsigned mode until a key is set.
 
 ## NOID Scheme
 
@@ -897,7 +928,7 @@ Likely causes:
 ### Requests are rejected with `401` or `403`
 
 Check:
-- `X-Authority-Id` or `X-Authority-UUID` is present in local dev mode
+- `X-DARK-Authority-Id` is present in local dev mode
 - the header identity matches the request body `authority_id`
 - the authority is authorized for the requested NAAN
 - for updates imported from chain, the authority wallet matches the on-chain owner
@@ -914,3 +945,9 @@ Remember the split responsibility:
 - [noid.md](./noid.md)
 - [minter-architecture.md](./minter-architecture.md)
 - [notebooks/README.md](./notebooks/README.md)
+
+## Ownership transfer and retirement
+
+Each authority operates in one logical Minter; different authorities can use different nodes. Admin transfers only on blockchain, without reading or changing Minter PostgreSQL. Local queues and pending replication do not restrict transfer. Admin inventories current chain owners and blocks retirement while on-chain PIDs remain; stop the authority’s activity and settle in-flight transactions before retirement. The previous request-ID resume API, database retirement gates and transfer coordination dependency were removed.
+
+Minter trusts local identity for normal queued publication and verifies owner/active status/NAAN permissions after a failure. Ownership loss marks the original job obsolete without signing it as the successor. Local-only tombstone/retry verify ownership first; reservations verify active status. A successor request can import the chain PID, archiving superseded local payload under its original authority. Migration `0004_remove_admin_coordination` preserves historical audit rows and creates local `superseded_ark_jobs`. `MINTER_ALLOWED_AUTHORITY_IDS` supplies disjoint assignments for independent Minters (empty means single-Minter unrestricted deployment). See deployer `docs/pid-ownership-transfer-design.md` for API, recovery and operational limitations.

@@ -219,7 +219,7 @@ def test_reserve_rejects_mismatched_authority_header(client):
     """Mutating requests must authenticate as the same authority they declare."""
     response = client.post(
         "/api/v1/arks",
-        headers={"X-Authority-Id": "other-uuid"},
+        headers={"X-DARK-Authority-Id": "other-uuid"},
         json={
             "authority_id": "test-uuid",
             "naan": "12345",
@@ -236,7 +236,7 @@ def test_reserve_requires_authority_header_when_mtls_disabled(client):
     """Local/dev mode must not allow anonymous mutating requests."""
     response = client.post(
         "/api/v1/arks",
-        headers={"X-Authority-Id": " "},
+        headers={"X-DARK-Authority-Id": " "},
         json={
             "authority_id": "test-uuid",
             "naan": "12345",
@@ -244,7 +244,7 @@ def test_reserve_requires_authority_header_when_mtls_disabled(client):
     )
 
     assert response.status_code == 401
-    assert "authority identity required" in response.json()["detail"].lower()
+    assert "authority header required" in response.json()["detail"].lower()
     assert response.headers["X-DARK-Error-Code"] == "AUTHORITY_IDENTITY_REQUIRED"
     assert response.headers["X-DARK-Retryable"] == "false"
 
@@ -860,7 +860,9 @@ def test_get_ark_after_metadata_payload_purge_storage_failure_is_best_effort(
 
 
 def test_tombstone_ark(client, test_db, mock_corelib):
-    """Test tombstoning an ARK."""
+    """Test tombstoning an unpublished ARK."""
+    from dark_core_lib.exceptions import ARKNotFoundError
+    mock_corelib.get_ark.side_effect = ARKNotFoundError("not published")
     mock_corelib.is_authorized_for_naan.return_value = True
     
     # Create ARK
@@ -900,11 +902,11 @@ def test_tombstone_rejects_non_owner(client, test_db):
 
     response = client.delete(
         f"/api/v1/arks/ark:12345/{name}",
-        headers={"X-Authority-Id": "other-uuid"},
+        headers={"X-DARK-Authority-Id": "other-uuid"},
     )
 
     assert response.status_code == 403
-    assert "does not match" in response.json()["detail"].lower()
+    assert response.json()["detail"] == "CHAIN_OWNER_CHANGED"
 
 
 def test_get_ark_rejects_invalid_checkdigit_when_enabled(client):

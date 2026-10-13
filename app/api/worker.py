@@ -7,16 +7,17 @@ from datetime import datetime, timezone
 from math import ceil
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import HTTPException, APIRouter, Depends, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import case, func, text
 from sqlalchemy.orm import Session
 
+from app.middleware.authority_lifecycle import require_mutation_identity, require_current_owner
 from app.config import get_settings
 from app.database.ark_locks import acquire_ark_lock
 from app.database.models import ARKMetadata, ARKRecord
 from app.dependencies import get_db
-from app.middleware.auth import require_mtls
+from app.middleware.auth import require_authority_identity
 from app.models.processing import ProcessingErrorCode, ProcessingStage, ProcessingStatus, ProcessingWaitReason, code_label
 from app.models.states import ARKState
 from app.repositories import WorkerRuntimeRepository
@@ -316,9 +317,9 @@ def get_worker_errors(
 
 
 @router.post("/retry", response_model=dict[str, Any])
-def retry_failed_arks(request: RetryRequest, cert_info: dict = Depends(require_mtls)) -> dict[str, Any]:
+def retry_failed_arks(request: RetryRequest, identity: dict = Depends(require_mutation_identity)) -> dict[str, Any]:
     """Explicitly return a permanent failure to READY in its current stage."""
-    identity, outcomes = (cert_info or {}).get("dn", "local-development"), []
+    authority_id, outcomes = identity["authority_id"], []
     for ark in dict.fromkeys(request.arks):
         with acquire_ark_lock(ark) as db:
             if db is None:
@@ -326,13 +327,24 @@ def retry_failed_arks(request: RetryRequest, cert_info: dict = Depends(require_m
             record = ARKRepository(db).get_by_ark(ark)
             if record is None:
                 outcomes.append({"ark": ark, "status": "not_found"}); continue
+            if record.authority_id != authority_id:
+                outcomes.append({"ark": ark, "status": "forbidden"}); continue
             if record.state in {ARKState.RESERVED.value, ARKState.TOMBSTONE.value}:
                 outcomes.append({"ark": ark, "status": "not_retryable_state"}); continue
             if record.processing_status != int(ProcessingStatus.FAILED):
                 outcomes.append({"ark": ark, "status": "not_failed"}); continue
+            from app.dependencies import get_corelib_client
+            from app.repositories.ark_repository import parse_ark
+            naan, name = parse_ark(ark)
+            try:
+                require_current_owner(get_corelib_client(), authority_id, naan, name,
+                                      allow_missing=record.state in {ARKState.DRAFT, ARKState.DRAFT.value})
+            except HTTPException as exc:
+                outcomes.append({'ark': ark, 'status': 'forbidden' if exc.status_code == 403 else 'verification_unavailable', 'detail': exc.detail})
+                continue
             record.processing_status, record.next_action_at = int(ProcessingStatus.READY), None
             record.processing_wait_reason, record.processing_attempt_count = int(ProcessingWaitReason.NONE), 0
             record.updated_at = _now(); db.commit()
-            logger.info("Administrative retry approved by %s for %s: %s", identity, ark, request.reason)
+            logger.info("Administrative retry approved by %s for %s: %s", authority_id, ark, request.reason)
             outcomes.append({"ark": ark, "status": "accepted"})
     return {"requested": len(request.arks), "reason": request.reason, "items": outcomes}

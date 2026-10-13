@@ -36,7 +36,7 @@ def get_engine():
             pool_pre_ping=True,
         )
         
-        logger.info(f"Created database engine for: {settings.database_url}")
+        logger.info("Created database engine for: %s", _engine.url.render_as_string(hide_password=True))
     
     return _engine
 

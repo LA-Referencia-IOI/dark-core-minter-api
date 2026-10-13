@@ -34,13 +34,8 @@ async def lifespan(app: FastAPI):
     logger.info("Starting dARK Core API...")
     settings = get_settings()
     
-    # Validate mTLS config if enabled
-    if settings.mtls_enabled:
-        settings.validate_mtls_config()
-        logger.info("mTLS is enabled")
-    else:
-        logger.warning("mTLS is disabled - for development only!")
-    
+    logger.info("Signed authentication enabled: %s", settings.minter_signed_auth_enabled)
+
     # Initialize database
     try:
         from app.database import init_db

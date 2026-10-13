@@ -17,6 +17,8 @@ from dotenv import load_dotenv
 _STUBS_DIR = Path(__file__).parent / "stubs"
 if _STUBS_DIR.exists():
     sys.path.insert(0, str(_STUBS_DIR))
+    import dark_core_lib
+    dark_core_lib.__path__.append(str(Path(__file__).resolve().parents[2] / "dark-core-lib" / "dark_core_lib"))
 
 # Load component env if it exists (prefer deployed integration config).
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -186,7 +188,7 @@ def client(mock_corelib, override_get_db):
                     with patch("app.api.worker.check_rpc_health", return_value=mock_rpc_health):
                         with patch("app.api.worker.check_metadata_storage_health", return_value=mock_storage_health):
                             with TestClient(app) as test_client:
-                                test_client.headers.update({"X-Authority-Id": "test-uuid"})
+                                test_client.headers.update({"X-DARK-Authority-Id": "test-uuid"})
                                 yield test_client
     
     # Clear overrides after test

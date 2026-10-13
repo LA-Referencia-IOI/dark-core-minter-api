@@ -200,7 +200,9 @@ def test_update_rejects_top_level_alternate_identifiers(client):
 
 
 def test_delete_tombstone(client, mock_corelib):
-    """Test delete (tombstone)."""
+    """An unpublished reservation can be cancelled by its active authority."""
+    from dark_core_lib.exceptions import ARKNotFoundError
+    mock_corelib.get_ark.side_effect = ARKNotFoundError("not published")
     reserve_response = client.post(
         "/api/v1/arks",
         json={
@@ -254,3 +256,11 @@ def test_update_metadata_xml_format(client, mock_corelib):
     assert isinstance(data.get("minimal_metadata"), dict)
     # CIDs are null initially
     assert data.get("metadata_cid") is None
+
+
+def test_unassigned_authority_cannot_reserve(client, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr('app.middleware.authority_lifecycle.get_settings', lambda: SimpleNamespace(authority_is_assigned=lambda authority: False))
+    response = client.post('/api/v1/arks', json={'authority_id': 'test-uuid', 'naan': '12345'})
+    assert response.status_code == 403
+    assert response.json()['detail'] == 'AUTHORITY_NOT_ASSIGNED_TO_MINTER'

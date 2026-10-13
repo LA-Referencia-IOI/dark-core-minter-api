@@ -617,7 +617,7 @@ The security model is intentionally split between local-dev ergonomics and produ
 
 When `MTLS_ENABLED=false`:
 
-- mutating endpoints require `X-Authority-Id` or `X-Authority-UUID`
+- mutating endpoints require `X-DARK-Authority-Id`
 - body `authority_id` must match the resolved identity
 - NAAN authorization is still checked against the blockchain layer via `dark-core-lib`
 

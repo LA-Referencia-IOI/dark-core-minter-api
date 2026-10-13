@@ -10,7 +10,6 @@ from fastapi import APIRouter, Depends, Path
 from dark_core_lib import DARKCoreClient
 
 from app.dependencies import get_corelib_client
-from app.middleware.auth import require_mtls
 from app.models.responses import (
     AuthorityResponse,
     AuthorityNAANsResponse,
@@ -30,7 +29,6 @@ router = APIRouter()
 )
 async def get_authority(
     uuid: str = Path(..., description="Authority UUID"),
-    cert_info: dict = Depends(require_mtls),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
 ) -> AuthorityResponse:
     """
@@ -56,7 +54,6 @@ async def get_authority(
 )
 async def get_authority_naans(
     uuid: str = Path(..., description="Authority UUID"),
-    cert_info: dict = Depends(require_mtls),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
 ) -> AuthorityNAANsResponse:
     """
@@ -81,7 +78,6 @@ async def get_authority_naans(
 async def check_authority_authorization(
     uuid: str = Path(..., description="Authority UUID"),
     naan: str = Path(..., description="NAAN to check"),
-    cert_info: dict = Depends(require_mtls),
     corelib_client: DARKCoreClient = Depends(get_corelib_client),
 ) -> AuthorityAuthorizedResponse:
     """

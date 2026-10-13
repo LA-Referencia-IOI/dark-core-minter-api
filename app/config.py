@@ -43,6 +43,14 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("MINTER_API_PORT", "CORE_API_PORT"),
     )
     minter_api_workers: int = 2
+    # Optional comma-separated assignment for a logical Minter. Operators must
+    # keep assignments disjoint across Minters with independent databases.
+    minter_allowed_authority_ids: str = ""
+
+    def authority_is_assigned(self, authority_id: str) -> bool:
+        allowed = {value.strip() for value in self.minter_allowed_authority_ids.split(',') if value.strip()}
+        return not allowed or authority_id in allowed
+
 
     # Logging. Containers log to stdout by default; an optional rotating file
     # handler is available only when an operator explicitly configures it.
@@ -142,6 +150,11 @@ class Settings(BaseSettings):
     minter_noid_length: int = 7
     minter_noid_checkdigit: bool = True
     
+    # Signed request authentication (HTTPS terminates at the trusted gateway).
+    minter_signed_auth_enabled: bool = False
+    minter_client_key_cache_idle_ttl_seconds: int = Field(default=60, gt=0)
+    minter_signed_auth_max_skew_seconds: int = Field(default=300, gt=0)
+
     # mTLS Configuration
     mtls_enabled: bool = False
     tls_cert_file: Optional[str] = None

@@ -13,6 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from app.config import get_settings
+
 from dark_core_lib import ARKPublishOperation, ARKPublishResult, DARKCoreClient
 from dark_core_lib.exceptions import (
     ARKNotFoundError,
@@ -377,6 +379,10 @@ class ReplicationReconciliationWorker(_Stats):
                     or not _ready_for_processing(record, _now())
                 ):
                     return {**result, "checked": 0}
+                if not get_settings().authority_is_assigned(record.authority_id):
+                    repo.mark_processing_failed(ark, 'Authority not assigned to this Minter', int(ProcessingErrorCode.AUTHORITY_NOT_FOUND), is_permanent=True)
+                    db.commit()
+                    return {**result, "failed": 1}
                 metadata = repo.get_metadata_by_ark_id(record.id)
                 if metadata is None or not metadata.level1_cid or not metadata.original_cid:
                     raise ValueError("metadata CIDs are required for reconciliation")
@@ -773,7 +779,49 @@ class ChainPublisherWorker(_Stats):
             return False
         return bool(current and current.url == target and current.cid == cid)
 
+    def _reconcile_failed_identity(self, repo: ARKRepository, ark: str) -> bool:
+        """Check identity only after failure; retain the original job authority.
+
+        A successful read proves ownership loss. RPC uncertainty never does.
+        Permanent failures remain visible and cannot silently run as a successor.
+        """
+        record = repo.get_by_ark(ark)
+        if record is None:
+            return False
+        try:
+            authority = self.corelib_client.get_authority_by_uuid(record.authority_id)
+            naan, name = parse_ark(ark)
+            try:
+                current = self.corelib_client.get_ark(naan, name)
+            except ARKNotFoundError:
+                current = None
+            changed = current is not None and current.owner.lower() != authority.wallet_address.lower()
+            if changed or not authority.active:
+                reason = 'ownership changed; original job is obsolete' if changed else 'authority inactive; original job cannot publish'
+                repo.mark_processing_failed(ark, reason, int(ProcessingErrorCode.CHAIN_STATE_CONFLICT), is_permanent=True)
+                self.stats['total_permanent_failures'] += 1
+                self._error(ark, reason)
+                return True
+            if not self.corelib_client.is_authorized_for_naan(record.authority_id, naan):
+                repo.mark_processing_failed(ark, 'NAAN permission revoked; administrative authorization required',
+                    int(ProcessingErrorCode.AUTHORIZATION_FAILED), is_permanent=True)
+                self.stats['total_permanent_failures'] += 1
+                return True
+        except AuthorityNotFoundError:
+            repo.mark_processing_failed(ark, 'Original authority no longer exists',
+                int(ProcessingErrorCode.AUTHORITY_NOT_FOUND), is_permanent=True)
+            self.stats['total_permanent_failures'] += 1
+            return True
+        except Exception:
+            repo.defer_processing_retry(ark, 'Ownership reconciliation unavailable; outcome remains unknown',
+                int(ProcessingErrorCode.CHAIN_RPC_UNAVAILABLE))
+            self.stats['total_deferred'] += 1
+            return True
+        return False
+
     def _record_failure(self, repo: ARKRepository, ark: str, exc: Exception) -> None:
+        if self._reconcile_failed_identity(repo, ark):
+            return
         message = f"blockchain publish failed: {exc}"
         if isinstance(exc, (AuthorityNotFoundError, AuthorizationError)):
             code = (
@@ -795,29 +843,28 @@ class ChainPublisherWorker(_Stats):
             self.stats["total_permanent_failures"] += 1
         self._error(ark, message)
 
+    def _pipeline_item_is_current(self, repo: ARKRepository, item: dict[str, Any]) -> bool:
+        """Apply results only to the exact payload submitted by this pipeline."""
+        current = repo.get_by_ark(item["ark"])
+        metadata = repo.get_metadata_by_ark_id(current.id) if current is not None else None
+        return bool(
+            current is not None
+            and current.authority_id == item["authority_id"]
+            and current.state == item["state"]
+            and current.target == item["target"]
+            and current.processing_stage == int(ProcessingStage.CHAIN)
+            and metadata is not None
+            and metadata.level1_cid == item["cid"]
+        )
+
     def _finalize_pipeline_confirmation(
         self, repo: ARKRepository, item: dict[str, Any]
     ) -> bool:
-        """Persist a confirmed (or reconciled) chain write if it is still current.
-
-        The pipeline runs outside the database transaction.  Re-checking the
-        internal stage and L1 CID while holding the ARK lock prevents an old
-        result from publishing a record that was changed in the meantime.
-        """
-        current = repo.get_by_ark(item["ark"])
-        metadata = (
-            repo.get_metadata_by_ark_id(current.id) if current is not None else None
-        )
-        if (
-            current is None
-            or current.processing_stage != int(ProcessingStage.CHAIN)
-            or metadata is None
-            or metadata.level1_cid != item["cid"]
-        ):
+        """Persist confirmation only while the submitted payload remains current."""
+        if not self._pipeline_item_is_current(repo, item):
             return False
-        expected_state = (
-            current.state.value if isinstance(current.state, ARKState) else current.state
-        )
+        state = item["state"]
+        expected_state = state.value if isinstance(state, ARKState) else state
         repo.update_to_published(item["ark"], expected_states=(expected_state,))
         return True
 
@@ -832,9 +879,13 @@ class ChainPublisherWorker(_Stats):
         can already be on chain.  First reconcile the exact on-chain value;
         otherwise defer it without consuming the retry budget.
         """
+        if not self._pipeline_item_is_current(repo, item):
+            return False
         if result.status == "confirmed":
             return self._finalize_pipeline_confirmation(repo, item)
 
+        if self._reconcile_failed_identity(repo, item["ark"]):
+            return False
         naan, name = parse_ark(item["ark"])
         try:
             if self._chain_matches(naan, name, item["target"], item["cid"]):
@@ -880,6 +931,10 @@ class ChainPublisherWorker(_Stats):
                     or not _ready_for_processing(record, _now())
                 ):
                     return False
+                if not get_settings().authority_is_assigned(record.authority_id):
+                    repo.mark_processing_failed(ark, 'Authority not assigned to this Minter', int(ProcessingErrorCode.AUTHORITY_NOT_FOUND), is_permanent=True)
+                    db.commit()
+                    return False
                 metadata = repo.get_metadata_by_ark_id(record.id)
                 if metadata is None or not metadata.level1_cid or not metadata.original_cid:
                     raise ValueError("both metadata CIDs are required for chain publication")
@@ -911,6 +966,10 @@ class ChainPublisherWorker(_Stats):
                             fetch_result=False,
                         )
                 except Exception as exc:
+                    # Never reconcile a stale owner job as the successor.
+                    if self._reconcile_failed_identity(repo, ark):
+                        db.commit()
+                        return False
                     # The chain operation can be accepted while its HTTP/RPC reply is lost.
                     if not self._chain_matches(naan, name, target, level1_cid):
                         raise exc
@@ -977,6 +1036,17 @@ class ChainPublisherWorker(_Stats):
             grouped[item["authority_id"]].append(item)
 
         for authority_id, group in grouped.items():
+            if not get_settings().authority_is_assigned(authority_id):
+                for item in group:
+                    with acquire_ark_lock(item['ark']) as result_db:
+                        if result_db is not None:
+                            result_repo = ARKRepository(result_db)
+                            current = result_repo.get_by_ark(item['ark'])
+                            if current and current.authority_id == authority_id:
+                                result_repo.mark_processing_failed(item['ark'], 'Authority not assigned to this Minter',
+                                    int(ProcessingErrorCode.AUTHORITY_NOT_FOUND), is_permanent=True)
+                                result_db.commit()
+                continue
             # A worker page can hold 100 ARKs, while each authority's nonce
             # pipeline is deliberately capped at 50.  For one authority that
             # produces two RPC pipelines of 50; multiple authorities retain

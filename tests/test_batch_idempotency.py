@@ -16,7 +16,7 @@ from app.repositories import ARKRepository
 def _reserve_batch(client, authority_id="test-uuid", naan="12345", *client_item_ids):
     return client.post(
         "/api/v1/arks/batch",
-        headers={"X-Authority-Id": authority_id},
+        headers={"X-DARK-Authority-Id": authority_id},
         json={
             "authority_id": authority_id,
             "naan": naan,

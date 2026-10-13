@@ -78,7 +78,7 @@ All notebooks read the same runtime variables from the first setup cell:
 
 Local auth note:
 
-- when `MTLS_ENABLED=false`, mutating calls should send `X-Authority-Id`
+- when `MTLS_ENABLED=false`, mutating calls should send `X-DARK-Authority-Id`
 - that identity must match the request body `authority_id` when applicable
 - the notebooks assume this local-dev auth model unless you adapt them for mTLS
 
