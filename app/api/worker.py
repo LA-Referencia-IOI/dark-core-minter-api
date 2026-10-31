@@ -9,6 +9,8 @@ from typing import Any
 
 from fastapi import HTTPException, APIRouter, Depends, Query
 from pydantic import BaseModel, Field
+from dark_core_lib.ark_id import parse_ark_id
+from dark_core_lib.exceptions import ARKError
 from sqlalchemy import case, func, text
 from sqlalchemy.orm import Session
 
@@ -320,7 +322,11 @@ def get_worker_errors(
 def retry_failed_arks(request: RetryRequest, identity: dict = Depends(require_mutation_identity)) -> dict[str, Any]:
     """Explicitly return a permanent failure to READY in its current stage."""
     authority_id, outcomes = identity["authority_id"], []
-    for ark in dict.fromkeys(request.arks):
+    try:
+        identifiers = dict.fromkeys(parse_ark_id(ark).compact for ark in request.arks)
+    except ARKError as exc:
+        raise HTTPException(status_code=400, detail="Invalid ARK format") from exc
+    for ark in identifiers:
         with acquire_ark_lock(ark) as db:
             if db is None:
                 outcomes.append({"ark": ark, "status": "locked"}); continue

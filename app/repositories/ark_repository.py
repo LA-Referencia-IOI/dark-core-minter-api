@@ -43,20 +43,13 @@ def parse_ark(ark: str) -> Tuple[str, str]:
     Raises:
         ValueError: If ARK format is invalid
     """
-    if not ark.startswith("ark:"):
-        raise ValueError(f"Invalid ARK format: {ark}")
-
-    # ARK URI notation commonly includes an optional slash after ``ark:``.
-    # Stored records use the compact form, but callers must be able to send
-    # either spelling without changing the parsed NAAN or checkdigit payload.
-    identifier = ark[4:]
-    if identifier.startswith("/"):
-        identifier = identifier[1:]
-    parts = identifier.split("/", 1)
-    if len(parts) != 2 or not parts[0] or not parts[1]:
-        raise ValueError(f"Invalid ARK format: {ark}")
-
-    return parts[0], parts[1]
+    from dark_core_lib.ark_id import parse_ark_id
+    from dark_core_lib.exceptions import ARKError
+    try:
+        parsed = parse_ark_id(ark)
+    except ARKError as exc:
+        raise ValueError(str(exc)) from exc
+    return parsed.naan, parsed.name
 
 
 def _ready_for_processing(record: ARKRecord, now: datetime) -> bool:

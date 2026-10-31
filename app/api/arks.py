@@ -400,6 +400,7 @@ def _get_ark_status(
 
     try:
         naan, name = parse_ark(ark)
+        ark = f"ark:{naan}/{name}"
         _validate_ark_checkdigit_if_enabled(naan, name)
     except ValueError as exc:
         raise HTTPException(
@@ -586,6 +587,7 @@ async def update_ark_metadata(
     from app.repositories.ark_repository import parse_ark
     try:
         naan, name = parse_ark(ark)
+        ark = f"ark:{naan}/{name}"
         _validate_ark_checkdigit_if_enabled(naan, name)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format")
@@ -774,6 +776,7 @@ async def delete_ark(
     from app.repositories.ark_repository import parse_ark
     try:
         naan, name = parse_ark(ark)
+        ark = f"ark:{naan}/{name}"
         _validate_ark_checkdigit_if_enabled(naan, name)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ARK format")

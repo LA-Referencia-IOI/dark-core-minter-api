@@ -54,7 +54,7 @@ class InvalidRow:
 
 
 def parse_ark(identifier: str) -> tuple[str, str]:
-    """Parse ``ark:/NAAN/name`` and the legacy ``ark:NAAN/name`` form."""
+    """Parse ``ark:/NAAN/name`` and ``ark:NAAN/name`` as equivalent inputs."""
 
     value = identifier.strip()
     match = ARK_PATTERN.fullmatch(value)
@@ -109,7 +109,7 @@ def read_csv(path: Path, limit: Optional[int] = None) -> tuple[list[ImportRow], 
                 rows.append(
                     ImportRow(
                         row_number=row_number,
-                        darkidentifier=f"ark:/{naan}/{name}",
+                        darkidentifier=f"ark:{naan}/{name}",
                         itemurl=itemurl,
                         naan=naan,
                         name=name,
@@ -135,7 +135,7 @@ def load_completed(path: Path) -> dict[str, tuple[str, str]]:
         return {}
     with path.open("r", encoding="utf-8", newline="") as handle:
         return {
-            (row.get("darkidentifier") or "").strip(): (
+            "ark:" + "/".join(parse_ark(row.get("darkidentifier") or "")): (
                 (row.get("itemurl") or "").strip(),
                 (row.get("owner") or "").strip().lower(),
             )

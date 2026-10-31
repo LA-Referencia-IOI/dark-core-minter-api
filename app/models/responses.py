@@ -6,8 +6,10 @@ Pydantic models for API responses.
 
 from datetime import datetime
 from typing import Optional, Literal
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from app.models.states import ARKState
+from dark_core_lib.ark_id import parse_ark_id
+from dark_core_lib.exceptions import ARKError
 
 
 
@@ -39,6 +41,19 @@ class ARKResponse(BaseModel):
     level2_cid: Optional[str] = Field(None, description="CID of Level 2 (original) metadata")
     client_item_id: Optional[str] = Field(None, description="Client correlation ID")
     
+    @field_validator("ark")
+    @classmethod
+    def normalize_ark(cls, value):
+        return parse_ark_id(value).compact
+
+    @field_validator("minimal_metadata")
+    @classmethod
+    def normalize_metadata_ark(cls, value):
+        if isinstance(value, dict) and value.get("ark"):
+            value = dict(value)
+            value["ark"] = parse_ark_id(value["ark"]).compact
+        return value
+
     # Timestamps could be added here if we track them in DB/corelib
     
     model_config = ConfigDict(use_enum_values=True)
@@ -65,7 +80,15 @@ class ARKStatusBatchError(BaseModel):
 class ARKStatusBatchResult(BaseModel):
     """One independently resolved ARK in a version 1 status-batch response."""
 
-    ark: str = Field(..., description="ARK value supplied by the caller")
+    ark: str = Field(..., description="Compact ARK, or original input when malformed")
+
+    @field_validator("ark")
+    @classmethod
+    def normalize_ark(cls, value):
+        try:
+            return parse_ark_id(value).compact
+        except ARKError:
+            return value
     status: Optional[ARKResponse] = Field(
         None,
         description="The same ARK representation returned by GET /api/v1/arks/{ark}",

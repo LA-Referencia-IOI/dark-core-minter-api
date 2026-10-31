@@ -78,7 +78,7 @@ def test_read_csv_reports_missing_url_and_duplicate(tmp_path):
 
     valid, invalid = read_csv(source)
 
-    assert [row.darkidentifier for row in valid] == ["ark:/41046/abc"]
+    assert [row.darkidentifier for row in valid] == ["ark:41046/abc"]
     assert len(invalid) == 2
     assert "Duplicate ARK" in invalid[0].error
     assert "absolute HTTP(S) URL" in invalid[1].error

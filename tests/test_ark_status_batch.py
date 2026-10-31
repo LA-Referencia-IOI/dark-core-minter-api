@@ -112,3 +112,12 @@ def test_status_batch_continues_after_isolated_blockchain_failure(client, test_d
     assert results[0]["error"]["code"] == "blockchain_error"
     assert results[1]["status"]["state"] == "U"
     assert results[1]["status"]["target"] == "https://pending.example"
+
+
+def test_both_spellings_return_compact_status(client, test_db, mock_corelib):
+    ark = _create(test_db, 91, ARKState.RESERVED)
+    response = client.post(ENDPOINT, json={"arks": [ark, ark.replace("ark:", "ark:/")]})
+    assert response.status_code == 200
+    rows = response.json()["results"]
+    assert [row["ark"] for row in rows] == [ark, ark]
+    assert [row["status"]["ark"] for row in rows] == [ark, ark]
