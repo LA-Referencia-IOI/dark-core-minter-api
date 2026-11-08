@@ -1,5 +1,8 @@
 # dARK Core Minter API
 
+New platform developer: follow [developer onboarding](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/developer-onboarding.md)
+for the complete local stack, signed requests and component iteration.
+
 REST API and background workers for ARK reservation, metadata staging,
 metadata persistence, IPFS replication reconciliation, and on-chain
 publication using `dark-core-lib`.
@@ -670,24 +673,24 @@ erDiagram
 
 ## Quick Start
 
-### Inside `dark-deployer`
+### Local development (including a checkout inside `dark-deployer`)
+
+From this component's root, use a separate Python 3.14 environment:
 
 ```bash
-cd /path/to/dark-deployer
-source venv/bin/activate
-pip install -r components/dark-core-minter-api/requirements.txt
-pip install -e components/dark-core-lib
-pip install -e components/dark-core-minter-api
-```
-
-### Standalone Local Development
-
-```bash
-python3 -m venv .venv
+python3.14 -m venv .venv
+.venv/bin/python -m pip install -e '.[dev]'
+.venv/bin/python -m pip install -e ../dark-core-lib
 source .venv/bin/activate
-pip install -r requirements.txt
-pip install -e ../dark-core-lib
 ```
+
+The sibling `dark-core-lib` checkout is required. Do not install several APIs
+into the controller environment: they each contain a package named `app`.
+Run the commands below from **this component directory**. Set the documented
+runtime configuration first; installing Python packages does not start the
+chain, Store or databases. The [platform onboarding guide](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/developer-onboarding.md)
+provides the complete local stack, internal Docker endpoints and a working-tree
+Resolver example. Keep component tests in this isolated environment.
 
 ### Run API and Worker Manually
 
@@ -710,6 +713,20 @@ python -m app.main_worker chain
 # Legacy chain-worker status helper
 dark-core-worker-status
 ```
+
+## Tests
+
+From this component directory, after installing the isolated dev environment:
+
+```bash
+.venv/bin/python -m pytest
+```
+
+The default test database is a temporary SQLite file. `TEST_DATABASE_URL`
+overrides it, and fixtures drop/recreate the test schema: use only a disposable
+database for that override. PostgreSQL-specific concurrency/locking behavior
+requires a separate PostgreSQL integration run. The notebooks test the complete
+published lifecycle against the deployed stack; unit tests are not that check.
 
 ## Deployment
 
