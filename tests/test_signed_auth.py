@@ -113,7 +113,8 @@ async def test_inactive_registry_rejected(setup):
     assert not signed_auth._cache
 
 
-def test_retry_cannot_change_another_authority(monkeypatch):
+@pytest.mark.parametrize('ark', ['ark:/12345/example', 'ark:12345/example'])
+def test_retry_cannot_change_another_authority(monkeypatch, ark):
     from contextlib import contextmanager
     from app.api import worker
     record=SimpleNamespace(authority_id='other-authority',processing_status=3)
@@ -122,7 +123,7 @@ def test_retry_cannot_change_another_authority(monkeypatch):
     def locked(ark):yield db
     monkeypatch.setattr(worker,'acquire_ark_lock',locked)
     monkeypatch.setattr(worker,'ARKRepository',lambda db:SimpleNamespace(get_by_ark=lambda ark:record))
-    result=worker.retry_failed_arks(SimpleNamespace(arks=['ark:/12345/example'],reason='retry'),{'authority_id':'caller'})
-    assert result['items']==[{'ark':'ark:/12345/example','status':'forbidden'}]
+    result=worker.retry_failed_arks(SimpleNamespace(arks=[ark],reason='retry'),{'authority_id':'caller'})
+    assert result['items']==[{'ark':'ark:12345/example','status':'forbidden'}]
     db.commit.assert_not_called()
     assert record.processing_status==3
