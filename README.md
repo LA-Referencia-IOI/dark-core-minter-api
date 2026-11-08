@@ -17,14 +17,13 @@ publication using `dark-core-lib`.
    - move ARKs into `DRAFT` or `UPDATE`
 2. asynchronous worker work
    - persist Level-2 and Level-1 metadata to the configured storage backend
-   - confirm one real L1/L2 pin before publication; request final durability only after the critical queue is clear
+   - confirm the configured publication threshold for both L1 and L2 before publication; request final durability only after the critical queue is clear
    - publish `create_ark` or `update_ark` on-chain through `dark-core-lib`
    - finalize the ARK as `PUBLISHED`
 
 Normal Cluster states (`queued`, `pinning`, initial visibility) are scheduled
 with explicit bounded backoff through `next_action_at`; they are not errors.
-The deployer-level operational policy is archived in the dark-deployer repo:
-`docs/old/publication-latency-control.md` (archived).
+See the [platform architecture](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/architecture.md) for the cross-service flow.
 
 This separation gives us better resilience, simpler retries, and a cleaner operational model.
 
@@ -32,14 +31,20 @@ This separation gives us better resilience, simpler retries, and a cleaner opera
 
 Use the docs in this order, depending on what you need:
 
-- [README.md](./README.md)
-  - operational overview, lifecycle, deployment, config, notebooks
-- [minter-architecture.md](./minter-architecture.md)
-  - technical implementation details, module map, concurrency model, worker internals
-- [notebooks/README.md](./notebooks/README.md)
-  - notebook index, expected environment variables, execution notes
-- [noid.md](./noid.md)
-  - detailed NOID generation rules and rationale
+- [README.md](README.md) (this file): operational overview, lifecycle, API,
+  configuration, deployment and troubleshooting.
+- [docs/architecture.md](docs/architecture.md): technical implementation details,
+  module map, concurrency model, worker internals, data model.
+- [docs/noid.md](docs/noid.md): NOID generation rules, shoulders and check
+  character.
+- [docs/security.md](docs/security.md): request authentication summary (signed
+  Ed25519 mutations); the client integration guide lives in the
+  [dark-deployer documentation](https://github.com/LA-Referencia-IOI/dark-deployer/tree/main/docs/minter-auth).
+- [notebooks/README.md](notebooks/README.md): notebook index and environment.
+- Sphinx sources: [docs/index.rst](docs/index.rst), [docs/api.rst](docs/api.rst).
+- Platform context: the dark-deployer
+  [architecture](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/architecture.md)
+  and [documentation index](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/README.md).
 
 ## Current storage and worker sequence
 
@@ -64,6 +69,12 @@ publication, the replication worker promotes existing pins to the configured
 target only when SQL shows no metadata persistence backlog and no pending
 first-pin availability work. This promotion is asynchronous; the worker then
 observes the pins and purges only after both CIDs reach the target.
+
+Store initially requests one allocation. A publication threshold above one can
+therefore leave a new record waiting if no separate mechanism supplies additional
+pins: promotion to the durability target runs only after publication. Use a
+threshold of one for this workflow until pre-publication promotion is supported
+and validated.
 
 ## Direct Import and NAAN Audit Commands
 
@@ -114,7 +125,7 @@ missing NAAN assignment.
 
 ## Runtime Architecture
 
-If you want the implementation-oriented view behind this diagram, continue with [minter-architecture.md](./minter-architecture.md).
+If you want the implementation-oriented view behind this diagram, continue with [minter-architecture.md](docs/architecture.md).
 
 ```mermaid
 flowchart LR
@@ -157,7 +168,7 @@ flowchart LR
   - retries recoverable replication failures indefinitely
   - keeps an independent DB heartbeat and singleton lock
 - Chain worker process
-  - claims `DRAFT` and `UPDATE` records whose CIDs are complete
+  - claims `DRAFT` and `UPDATE` records in the chain-ready stage after the publication threshold is observed
   - publishes create/update transactions through `dark-core-lib`
   - handles retries, backoff, and permanent failures for blockchain publication
   - keeps DB heartbeat fresh during long blockchain batches
@@ -197,13 +208,15 @@ sequenceDiagram
     MetadataWorker->>Store: store Level-1 metadata with embedded L2 reference
     MetadataWorker->>DB: persist CIDs and retain local payloads
 
-    ChainWorker->>DB: claim ARKs with complete CIDs
+    ReplicationWorker->>Store: observe both CIDs until publication threshold
+    ReplicationWorker->>DB: advance to CHAIN when confirmed
+    ChainWorker->>DB: claim CHAIN-ready ARKs
     ChainWorker->>Core: create_ark or update_ark
     Core->>Chain: signed transaction
     ChainWorker->>DB: mark ARK as PUBLISHED
 
     ReplicationWorker->>Store: query live L1/L2 replication
-    ReplicationWorker->>DB: update counts; purge only when both targets are met
+    ReplicationWorker->>DB: update counts and purge when both targets are met
 ```
 
 ## ARK Lifecycle
@@ -321,11 +334,10 @@ sequenceDiagram
     participant Chain as "Blockchain"
 
     MetadataWorker->>Repo: get_metadata_pending_persist(limit)
-    Worker->>DB: acquire advisory lock for the ARK
-    Repo->>DB: select METADATA/READY work (or due waits) and acquire one advisory lock per ARK
-    MetadataWorker->>DB: commit claim
+    Repo->>DB: select eligible METADATA work
 
-    loop each claimed ARK
+    loop each selected ARK
+        MetadataWorker->>DB: acquire advisory lock and recheck eligibility
         MetadataWorker->>Store: store Level-2 content
         Store-->>MetadataWorker: original_cid
         MetadataWorker->>Store: store Level-1 JSON with schema + media_type + original_cid
@@ -333,13 +345,14 @@ sequenceDiagram
         MetadataWorker->>Repo: persist CIDs, retain payloads, advance to AVAILABILITY/READY
     end
 
-    ReplicationWorker->>Repo: get_metadata_pending_reconciliation(limit, recheck)
+    ReplicationWorker->>Repo: get_reconciliation_candidates(limit, stage)
     loop each AVAILABILITY or REPLICATION item with both CIDs
         ReplicationWorker->>Store: POST /v1/status/batch for L1 and L2
         opt a CID has zero copies
             ReplicationWorker->>Store: restore retained payload
             ReplicationWorker->>ReplicationWorker: require regenerated CID to match
         end
+        ReplicationWorker->>DB: acquire advisory lock and recheck eligibility
         ReplicationWorker->>Repo: lock row and compare current CIDs
         alt both counts reach publish_after_replicas
             ReplicationWorker->>Repo: advance to CHAIN/READY
@@ -350,14 +363,12 @@ sequenceDiagram
 
     ChainWorker->>Repo: get_chain_pending_publish(limit)
     Repo->>DB: SELECT only CHAIN/READY rows whose availability was verified
-    Repo->>DB: select CHAIN work and acquire one advisory lock per ARK
-    ChainWorker->>DB: commit claim
-
-    ChainWorker->>ChainWorker: group claimed ARKs by authority_id
+    ChainWorker->>ChainWorker: group selected ARKs by authority_id
     loop each authority group
         ChainWorker->>Core: publish_ark_operations(..., pipeline_size)
         Core->>Chain: send signed txs with sequential pending nonces
         Core->>Chain: wait receipts and return one semantic result per ARK
+        ChainWorker->>DB: acquire per-ARK advisory lock to apply each result
         alt result confirmed
             ChainWorker->>Repo: update_to_published
         else reverted, ambiguous, send_failed, or not_sent
@@ -401,7 +412,7 @@ flowchart LR
     A["DELETE /api/v1/arks/{ark}"] --> B["validate authority identity"]
     B --> C["validate local ownership"]
     C --> D["set local state to TOMBSTONE"]
-    D --> E["return tombstoned record"]
+    D --> E["return null response"]
 ```
 
 Important points:
@@ -430,10 +441,10 @@ flowchart TD
   - original raw payload as submitted by the client
   - can be XML, JSON, or other supported text content
 - PostgreSQL stores both payloads only while they are staged for metadata persistence.
-- After metadata persistence succeeds, PostgreSQL keeps CIDs and schema/media-type fields but purges `level1_json` and `original_content`.
+- After metadata persistence succeeds, PostgreSQL retains `level1_json` and `original_content` while replication is pending. The replication worker purges these payload fields only after publication and confirmation of the target replica count for both CIDs.
 - `GET /api/v1/arks/{ark}` returns `minimal_metadata` from local DB when available; after purge it best-effort loads Level-1 from the configured storage backend using `level1_cid`.
 - If that storage lookup fails, `GET /api/v1/arks/{ark}` still returns state, target, CIDs, and schema without `minimal_metadata`.
-- `POST /api/v1/arks/status/batch` is the versioned (`version: "v1"`) mTLS-protected reconciliation read API. It accepts `{"arks": ["ark:..."]}` with 1--100 values and returns ordered `results`, each with the requested `ark` and either `status` (the GET representation) or `{ "error": { "code", "message", "retryable" } }`. Invalid, missing, and blockchain-failed values do not abort sibling results. It is distinct from `POST /api/v1/arks/batch`, which reserves identifiers.
+- `POST /api/v1/arks/status/batch` is the versioned (`version: "v1"`) reconciliation read API. The Minter router does not require authentication for this read, although a gateway may restrict it. It accepts `{"arks": ["ark:..."]}` with 1--100 values and returns ordered `results`, each with the requested `ark` and either `status` (the GET representation) or `{ "error": { "code", "message", "retryable" } }`. Invalid, missing, and blockchain-failed values do not abort sibling results. It is distinct from `POST /api/v1/arks/batch`, which reserves identifiers.
 - The storage backend stores the immutable content addressed versions.
 - The storage backend interface and Level-1 schema are shared with the resolver through `dark-core-lib`.
 
@@ -477,60 +488,25 @@ This gives us:
 reads the three worker rows in `worker_runtime_status` with one query; it does not call RPC,
 Store API, count ARKs, scan queues, or aggregate metadata:
 
-```json
-{
-  "overall": "ok",
-  "message": "Metadata worker is working; Replication worker is working; Chain worker is working.",
-  "source": "db_heartbeat",
-  "workers": {
-    "metadata": {
-      "state": "working",
-      "alive": true,
-      "last_heartbeat_seconds": 9,
-      "last_cycle": {
-        "observed": 100,
-        "advanced": 100,
-        "waiting": 0,
-        "repaired": 0,
-        "failed": 0,
-        "duration_seconds": 10.573
-      }
-    }
-  }
-}
-```
+A running worker entry includes `enabled`, `alive`, `process_state`,
+`activity`, `heartbeat_age_seconds`, `last_cycle`, `totals`, and, when
+applicable, sleep or pause details. The keys under `workers` are `metadata`,
+`replication` and `chain`; disabled or missing workers have a smaller entry.
+`overall` is `ok`, `degraded` or `down` based on heartbeat state and suspected
+stalls. The compact response does not establish application or infrastructure
+readiness.
 
-In the compact payload, `last_cycle.observed` means records inspected in the
-latest cycle. `advanced` means records moved to the next stage, `waiting` means
-records deliberately scheduled for a later observation, and `repaired` means
-payloads submitted again after a confirmed absence/error. These are cycle
-counters, not queue sizes or lifetime totals. The heartbeat stores the actual
-`wake_at`; the API does not infer sleeping from the previous cycle.
+The `last_cycle` fields `observed`, `advanced`, `waiting`, `repaired`, `failed`
+and `duration_seconds` are cycle observations, not queue sizes or lifetime
+totals. Replication can also report `transient_deferred` and bounded promotion
+metrics. A fresh heartbeat records `wake_at`; the API also has a fallback for
+runtime rows whose cycle and heartbeat timestamps coincide.
 
-Use `GET /api/v1/worker/status?detail=full` for RPC and storage probes, bounded
-workload aggregates, permanent-error aggregates and the last cycle. Full mode is
-intended for diagnosis, not frequent monitoring. It reports process state and
-workload separately: `READY` is work that can be attempted now, while `WAITING`
-is a normal scheduled observation with a concrete `next_action_at` and reason.
-The full response includes `no_progress_cycles` and `stalled_suspected` when a
-worker has attempted work repeatedly without advancing any record.
-
-- `last_cycle_duration_seconds`: how long the last cycle took.
-- `last_cycle_processed`: how many ARKs the last cycle attempted.
-- `page_size`: the nominal maximum ARKs this worker can claim in one cycle.
-- `effective_page_size_recommended`: the current core-lib recommendation for chain pacing.
-- `sleep_seconds`: how long the worker sleeps after an empty or partial page.
-- `last_cycle_full_page`: whether the last cycle processed a full page.
-- `next_action`: `continue`, `sleep`, or `pause_rpc`.
-- `sleep_seconds_next`: the next planned wait, if any.
-- `cycle_utilization_ratio`: `last_cycle_duration_seconds / sleep_seconds`.
-- `ready_pages`: how many configured pages are needed for the currently ready queue.
-- `estimated_seconds_to_drain_ready`: rough drain time for the ready queue at the current sleep and page size.
-- `pressure`: compact state such as `idle`, `working`, `backlogged`, `rpc_unavailable`, `stale`, or `unknown`.
-
-The payload also includes `chain_capacity`, a semantic snapshot returned by `dark-core-lib` with the current capacity state, reason, block number, txpool pending count when available, and recommended effective page size.
-
-For the chain worker, `last_cycle_full_page=true` means the worker will continue immediately without sleeping. If core-lib reports RPC or chain capacity unavailable, it does not claim ARKs and reports `next_action=pause_rpc` or `next_action=pause_chain`.
+Use `?detail=workload` for bounded grouped SQL, permanent-error aggregates,
+backlog age and replication configuration; `?detail=infrastructure` adds RPC
+and storage probes; `?detail=full` combines both. The workload and process
+views are separate. `no_progress_cycles` and `stalled_suspected` are reported
+from the worker heartbeat for a live worker.
 
 Worker heartbeats are emitted by a lightweight supervisor thread, so a full chain batch can take longer than `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` without incorrectly marking the worker stale.
 
@@ -541,7 +517,7 @@ Replication heartbeats also expose four bounded last-cycle aggregates:
 derived from the already-fetched Cluster batch and can reduce the durability
 budget from 100 to 50 or 20 without affecting first-pin priority.
 
-API mutations and worker attempts acquire the same PostgreSQL advisory lock per ARK before reading the record. A physical connection remains checked out until unlock, across commits and rollbacks; a lost connection cannot reconnect and write an unlocked result. Workers recheck stage, state and retry eligibility after acquiring the lock. Metadata updates, tombstones and manual rescue return `409 Conflict` when an ARK is busy. Updates require `PUBLISHED`; initial metadata submission still allows `RESERVED → DRAFT`. No revision counter or lease is stored: content cannot change during a worker attempt. PostgreSQL releases the lock when its connection terminates. Clients should retry a busy response later; pending `DRAFT`/`UPDATE` records must finish their workflow before accepting another metadata update.
+API mutations and metadata and replication attempts use the same PostgreSQL advisory lock per ARK. A physical connection remains checked out until unlock, across commits and rollbacks; PostgreSQL releases the lock when its connection terminates. The metadata and replication workers recheck eligibility under the lock and hold it through their per-ARK work. The chain pipeline selects and submits operations without holding these per-ARK locks, then acquires them to reconcile and apply individual results; the locks therefore do not exclude API activity for the duration of chain submission. Metadata updates, tombstones and manual rescue return `409 Conflict` when an ARK is busy. Updates require `PUBLISHED`; initial metadata submission still allows `RESERVED → DRAFT`. Clients should retry a busy response later; pending `DRAFT`/`UPDATE` records must finish their workflow before accepting another metadata update.
 
 The detailed `config.chain.worker_page_size` field shows the active chain transaction pipeline window because chain page size and core-lib pipeline size are intentionally the same value. Cycle counters describe only the latest observation round, not lifetime totals or queue size.
 
@@ -552,7 +528,10 @@ require an operator decision. Normal storage/RPC backoff and IPFS propagation
 are `WAITING` workflow actions and never appear as errors. Results are paginated
 and can be filtered by `stage`, `authority_id`, and `error_code`.
 
-`POST /api/v1/worker/retry` is an mTLS-protected administrative retry. It returns an explicitly approved `FAILED` ARK to `READY` in its current internal stage; the owning worker performs the retry.
+`POST /api/v1/worker/retry` requires the requesting authority's identity and,
+when signed authentication is enabled, a DARK2 signature. It returns an
+explicitly approved `FAILED` ARK owned by that authority to `READY` in its
+current internal stage; the owning worker performs the retry.
 
 ## API Surface
 
@@ -560,7 +539,7 @@ and can be filtered by `stage`, `authority_id`, and `error_code`.
 |----------|--------|---------|
 | `/api/v1/arks` | `POST` | Reserve one ARK |
 | `/api/v1/arks/batch` | `POST` | Reserve multiple ARKs |
-| `/api/v1/arks/status/batch` | `POST` | mTLS-protected batch status lookup for up to 100 ARKs; per-item results/errors |
+| `/api/v1/arks/status/batch` | `POST` | Public in the Minter router; batch status lookup for up to 100 ARKs with per-item results/errors |
 | `/api/v1/arks/{ark}` | `GET` | Read local ARK state plus metadata/CIDs, with best-effort storage fallback |
 | `/api/v1/arks/{ark}` | `PUT` | Stage metadata and move to `DRAFT` or `UPDATE` |
 | `/api/v1/arks/{ark}` | `DELETE` | Tombstone an ARK locally |
@@ -576,13 +555,17 @@ and can be filtered by `stage`, `authority_id`, and `error_code`.
 
 Set `MINTER_SIGNED_AUTH_ENABLED=true` to require Ed25519 request signatures on
 ARK mutations and administrative retries. Set it to `false` (default) to use
-`X-DARK-Authority-Id` without cryptographic verification. Both
-modes retain authority matching, ARK ownership and NAAN checks. Restart the API
-after changing the setting. Legacy mTLS settings do not select this mode.
+`X-DARK-Authority-Id` without cryptographic verification. In unsigned mode
+the header is a caller-provided identity, not proof of identity; do not expose
+this mode to untrusted clients without an independently enforced trusted
+access boundary. Both modes retain the applicable authority matching, ARK
+ownership, assignment and NAAN checks. Restart the API after changing the
+setting. Legacy mTLS settings do not select or enforce either mode.
 
-Queries are public, including `POST /api/v1/arks/status/batch`. Use HTTPS at the
-gateway; protect direct access to the upstream API. The signed-auth feature does
-not configure server TLS or trust arbitrary forwarded-protocol headers.
+Queries are public in the Minter router, including `POST /api/v1/arks/status/batch`;
+the gateway may impose additional restrictions. Use HTTPS at the gateway and
+protect direct access to the upstream API. The signed-auth feature does not
+configure server TLS or trust arbitrary forwarded-protocol headers.
 
 Enabling requires the updated Authority contract/ABI, a registered public key,
 and migration
@@ -619,23 +602,28 @@ DARK2
 ```
 
 Register `client_public_key` as base64 of the raw 32-byte Ed25519 public key in
-Admin authority creation, or replace it using
+Admin authority creation (Admin also accepts an OpenSSH Ed25519 public-key
+line), or replace it using
 `PUT /api/v1/admin/authority/{uuid}/client-key`. The private client key stays on
 the client and is independent of blockchain signing credentials. Authorities
 created without a client key can use only unsigned mode until a key is set.
+For the complete wire format, key registration, error handling and client
+examples, see [docs/security.md](docs/security.md) and the
+[client integration guide](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/minter-auth/minter-client-authentication-guide.md).
 
 ## NOID Scheme
 
 Current policy:
 - alphabet: `0-9bcdfghjkmnpqrstvwxz` (base29)
-- generated-part length: `7`
+- generated-part minimum length: `7` by default
 - checkdigit: enabled by default
 - namespace key: `"{NAAN}:{SHOULDER}"`
 
-Capacity per namespace:
-- `29^7 = 17,249,876,309` generated identifiers
+Seven base-29 digits represent `29^7 = 17,249,876,309` values. The
+encoder grows beyond the configured minimum length for larger counters; this
+is not an enforced namespace limit.
 
-Detailed algorithm notes: [noid.md](./noid.md)
+Detailed algorithm notes: [noid.md](docs/noid.md)
 
 ## Data Model Summary
 
@@ -685,7 +673,7 @@ erDiagram
 ### Inside `dark-deployer`
 
 ```bash
-cd /Users/lmatas/source/dark-deployer
+cd /path/to/dark-deployer
 source venv/bin/activate
 pip install -r components/dark-core-minter-api/requirements.txt
 pip install -e components/dark-core-lib
@@ -725,7 +713,7 @@ dark-core-worker-status
 
 ## Deployment
 
-dark-core-minter-api is deployed by the [dark-deployer](../../README.md) using the deployment v3 pipeline: an operator inventory (see [examples/operator-inventory/](../../examples/operator-inventory/)) is resolved, planned, and rendered into per-machine Docker Compose bundles, then applied with `./deploy.sh install` (locally) or `prepare`/`push`/`apply` (remote hosts). The runtime image version and the component checkout branch are pinned in `deployment_v3/catalog_data/dark-platform-baseline-v1.0.json`. There is no standalone docker-compose file in this component.
+dark-core-minter-api is deployed by the [dark-deployer](https://github.com/LA-Referencia-IOI/dark-deployer) from an operator inventory (format `dark-operator-inventory` v3; see the [inventory reference](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/examples/operator-inventory/README.md)). The deployer resolves the inventory, renders one Docker Compose project per machine and applies it through guided operations (`./deploy.sh operation plan`, `apply`, `resume`; see the [deployer documentation](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/deployer.md)). The image is built from this repository at the branch declared in the inventory (`overrides.components`; default `main`). Runtime environment variables are generated from the inventory, not edited by hand. There is no standalone docker-compose file in this component.
 
 ## Metadata Backends
 
@@ -754,7 +742,7 @@ In that mode:
 - the returned CIDs are persisted locally; the replication worker purges local
   payloads only after both CIDs meet the storage replication target, while the
   chain worker can publish `level1_cid` independently
-- the resolver must point at the same `dark-store-api` instance to resolve `?info` and `?metadata`
+- the resolver must use a Store reader that can retrieve the metadata CIDs; it may be a separate Store instance
 - `L1.original_metadata` carries the Level-2 `schema`, `media_type`, and internal `cid`
 
 ## Configuration
@@ -774,7 +762,7 @@ The app prefers `.env.integration` over `.env`.
 | `METADATA_WORKER_CONCURRENCY` | Concurrent ARKs; each keeps L2 before L1 | `4` |
 | `METADATA_WORKER_SLEEP_SECONDS` | Metadata sleep after an empty or partial page | `2` |
 | `METADATA_WORKER_STORAGE_RETRY_SECONDS` | Sleep while metadata worker is paused for unavailable storage | `10` |
-| `METADATA_WORKER_MAX_RETRIES` | Metadata retry attempts before permanent failure | `5` |
+| `METADATA_WORKER_MAX_RETRIES` | Legacy parameter passed to the selector; current selector does not enforce a retry limit | `5` |
 | `METADATA_WORKER_RUNTIME_NAME` | Metadata worker identity | `metadata-publisher` |
 | `REPLICATION_WORKER_ENABLED` | Enable IPFS replication reconciliation worker | `true` |
 | `REPLICATION_WORKER_PAGE_SIZE` | Retained metadata records checked per cycle | `100` |
@@ -795,7 +783,7 @@ The app prefers `.env.integration` over `.env`.
 | `CHAIN_WORKER_ADAPTIVE_PAGE_ENABLED` | Enable core-lib chain-capacity based effective page size | `true` |
 | `CHAIN_WORKER_MIN_PAGE_SIZE` | Minimum effective chain page size during adaptive throttling | `1` |
 | `CHAIN_WORKER_HEALTHY_CYCLES_BEFORE_GROWING` | Healthy capacity cycles before increasing effective page size | `3` |
-| `CHAIN_WORKER_MAX_RETRIES` | Chain retry attempts before permanent failure | `5` |
+| `CHAIN_WORKER_MAX_RETRIES` | Legacy parameter passed to the selector; current selector does not enforce a retry limit | `5` |
 | `CHAIN_WORKER_RUNTIME_NAME` | Chain worker identity | `chain-publisher` |
 | `WORKER_HEARTBEAT_INTERVAL_SECONDS` | DB heartbeat interval for all workers | `10` |
 | `WORKER_HEARTBEAT_STALE_AFTER_SECONDS` | Stale heartbeat threshold | `180` |
@@ -863,19 +851,24 @@ keeps access logs.
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `MINTER_SHOULDER` | DARK 2 prefix in format `2xx`; `xx` is lowercase alphanumeric and uniquely identifies the minter per NAAN | `200` |
-| `MINTER_NOID_LENGTH` | Generated-part length | `7` |
+| `MINTER_NOID_LENGTH` | Minimum generated-part length | `7` |
 | `MINTER_NOID_CHECKDIGIT` | Append and validate checkdigit | `true` |
 | `AUTH_CACHE_TTL` | NAAN authorization cache TTL | `60` |
 | `AUTH_CACHE_MAXSIZE` | Authorization cache max entries | `1000` |
 
-### TLS and mTLS
+### Request authentication
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `MTLS_ENABLED` | Enable mTLS gate | `false` |
-| `TLS_CERT_FILE` | Server certificate path | - |
-| `TLS_KEY_FILE` | Server private key path | - |
-| `TLS_CA_FILE` | CA certificate path | - |
+| `MINTER_SIGNED_AUTH_ENABLED` | Require DARK2 signatures for mutations and retry | `false` |
+| `MINTER_CLIENT_KEY_CACHE_IDLE_TTL_SECONDS` | Per-process signing-key cache inactivity TTL | `60` |
+| `MINTER_SIGNED_AUTH_MAX_SKEW_SECONDS` | Symmetric timestamp tolerance for signed requests | `300` |
+| `MINTER_ALLOWED_AUTHORITY_IDS` | Comma-separated authorities assigned to this logical Minter; empty means unrestricted | empty |
+
+`MTLS_ENABLED`, `TLS_CERT_FILE`, `TLS_KEY_FILE` and `TLS_CA_FILE` remain in
+the settings for legacy helpers. They do not turn on a certificate gate for
+the current API routes or configure TLS in the standard server entrypoint.
+An independently configured gateway may enforce additional transport rules.
 
 ## Useful URLs
 
@@ -889,21 +882,21 @@ Once the service is running:
 
 The notebooks directory contains both focused notebooks and a simpler consolidated integration notebook.
 
-- [notebooks/minter_api_test.ipynb](./notebooks/minter_api_test.ipynb)
+- [notebooks/minter_api_test.ipynb](notebooks/minter_api_test.ipynb)
   - recommended single entry notebook for end-to-end testing
-- [notebooks/minter_01_smoke_authority.ipynb](./notebooks/minter_01_smoke_authority.ipynb)
-- [notebooks/minter_02_reserve_validation.ipynb](./notebooks/minter_02_reserve_validation.ipynb)
-- [notebooks/minter_03_update_metadata_formats.ipynb](./notebooks/minter_03_update_metadata_formats.ipynb)
-- [notebooks/minter_04_tombstone_missing.ipynb](./notebooks/minter_04_tombstone_missing.ipynb)
-- [notebooks/minter_05_batch_concurrency.ipynb](./notebooks/minter_05_batch_concurrency.ipynb)
-- [notebooks/minter_06_worker_publish_update.ipynb](./notebooks/minter_06_worker_publish_update.ipynb)
-- [notebooks/minter_07_chain_import_optional.ipynb](./notebooks/minter_07_chain_import_optional.ipynb)
-- [notebooks/minter_08_resolver_end_to_end.ipynb](./notebooks/minter_08_resolver_end_to_end.ipynb)
+- [notebooks/minter_01_smoke_authority.ipynb](notebooks/minter_01_smoke_authority.ipynb)
+- [notebooks/minter_02_reserve_validation.ipynb](notebooks/minter_02_reserve_validation.ipynb)
+- [notebooks/minter_03_update_metadata_formats.ipynb](notebooks/minter_03_update_metadata_formats.ipynb)
+- [notebooks/minter_04_tombstone_missing.ipynb](notebooks/minter_04_tombstone_missing.ipynb)
+- [notebooks/minter_05_batch_concurrency.ipynb](notebooks/minter_05_batch_concurrency.ipynb)
+- [notebooks/minter_06_worker_publish_update.ipynb](notebooks/minter_06_worker_publish_update.ipynb)
+- [notebooks/minter_07_chain_import_optional.ipynb](notebooks/minter_07_chain_import_optional.ipynb)
+- [notebooks/minter_08_resolver_end_to_end.ipynb](notebooks/minter_08_resolver_end_to_end.ipynb)
   - simple direct-HTTP flow from authority creation to resolver lookup
 - `notebooks/dark_e2e_authority_to_resolver.ipynb` at the dark-deployer repo root
   - repo-level end-to-end notebook from authority creation to resolver lookup
 
-See [notebooks/README.md](./notebooks/README.md) for execution notes and environment variables.
+See [notebooks/README.md](notebooks/README.md) for execution notes and environment variables.
 
 ## Troubleshooting
 
@@ -928,10 +921,16 @@ Likely causes:
 ### Requests are rejected with `401` or `403`
 
 Check:
-- `X-DARK-Authority-Id` is present in local dev mode
+- `X-DARK-Authority-Id` is present in both modes and the authority is assigned
+  to this Minter, if an assignment list is configured
+- when signed authentication is enabled, all six DARK2 headers, the registered
+  key, exact path/query and body bytes, timestamp and nonce are correct
 - the header identity matches the request body `authority_id`
-- the authority is authorized for the requested NAAN
-- for updates imported from chain, the authority wallet matches the on-chain owner
+- the authority is active and authorized for the requested NAAN where required
+- the authority owns the ARK where ownership is required
+
+For signed requests, inspect `X-DARK-Error-Code` and consult the
+[client troubleshooting guide](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/docs/minter-auth/minter-client-authentication-guide.md#18-authentication-errors-codes-and-actions).
 
 ### Metadata is not visible where expected
 
@@ -942,9 +941,10 @@ Remember the split responsibility:
 
 ## Related Docs
 
-- [noid.md](./noid.md)
-- [minter-architecture.md](./minter-architecture.md)
-- [notebooks/README.md](./notebooks/README.md)
+- [docs/noid.md](docs/noid.md)
+- [docs/architecture.md](docs/architecture.md)
+- [docs/security.md](docs/security.md)
+- [notebooks/README.md](notebooks/README.md)
 
 ## Ownership transfer and retirement
 

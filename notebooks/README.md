@@ -54,8 +54,7 @@ Contract note:
 - `minter_08_resolver_end_to_end.ipynb`
   - Straight-line notebook with direct HTTP calls.
   - Covers authority creation, later NAAN assignment, reserve, metadata staging, metadata persistence, chain publication, resolver redirect, `?info`, and `?metadata`.
-- `/Users/lmatas/source/dark-developer/notebooks/dark_e2e_authority_to_resolver.ipynb`
-  - root-level copy of the same notebook for monorepo-wide access.
+- The deployer repository also has an [end-to-end notebook](https://github.com/LA-Referencia-IOI/dark-deployer/blob/main/notebooks/dark_e2e_authority_to_resolver.ipynb) for a platform-wide flow.
 
 Use `minter_api_test.ipynb` first when you want a single understandable walkthrough.
 Use the numbered notebooks when you need to isolate one behavior or debug a narrower flow.
@@ -78,9 +77,15 @@ All notebooks read the same runtime variables from the first setup cell:
 
 Local auth note:
 
-- when `MTLS_ENABLED=false`, mutating calls should send `X-DARK-Authority-Id`
+- when `MINTER_SIGNED_AUTH_ENABLED=false`, mutating calls send
+  `X-DARK-Authority-Id` without a cryptographic proof
 - that identity must match the request body `authority_id` when applicable
-- the notebooks assume this local-dev auth model unless you adapt them for mTLS
+- the notebooks assume this unsigned model; for signed mode, adapt each
+  mutation to sign the exact path, query and body bytes as described in
+  [the authentication guide](../docs/security.md)
+- unsigned mode requires a trusted access boundary and must not be exposed to
+  untrusted clients based only on the authority header; `MTLS_ENABLED` does
+  not select the Minter's request authentication mode
 
 ## Execution Notes
 
