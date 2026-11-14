@@ -968,3 +968,21 @@ Remember the split responsibility:
 Each authority operates in one logical Minter; different authorities can use different nodes. Admin transfers only on blockchain, without reading or changing Minter PostgreSQL. Local queues and pending replication do not restrict transfer. Admin inventories current chain owners and blocks retirement while on-chain PIDs remain; stop the authority’s activity and settle in-flight transactions before retirement. The previous request-ID resume API, database retirement gates and transfer coordination dependency were removed.
 
 Minter trusts local identity for normal queued publication and verifies owner/active status/NAAN permissions after a failure. Ownership loss marks the original job obsolete without signing it as the successor. Local-only tombstone/retry verify ownership first; reservations verify active status. A successor request can import the chain PID, archiving superseded local payload under its original authority. Migration `0004_remove_admin_coordination` preserves historical audit rows and creates local `superseded_ark_jobs`. `MINTER_ALLOWED_AUTHORITY_IDS` supplies disjoint assignments for independent Minters (empty means single-Minter unrestricted deployment). See deployer `docs/pid-ownership-transfer-design.md` for API, recovery and operational limitations.
+
+### Documentation through a gateway
+
+Swagger (`/docs`) and ReDoc (`/redoc`) use a relative `./openapi.json` schema URL.
+The deployer can therefore expose `/api/docs` and `/api/openapi.json` while keeping
+business routes at `/api/v1/`. No ASGI `root_path=/api` is needed for this exact
+route mapping; adding it would incorrectly prefix the existing API paths.
+The same pages work directly on the Minter listener. Changes to these pages take
+effect after building and deploying the updated Minter image.
+
+Focused offline regression (from this component repository):
+
+```sh
+../../venv/bin/python -m pytest -q tests/test_documentation_mount.py
+```
+
+These tests follow the schema URL through a simulated gateway and verify direct,
+`/api` and nested documentation mounts without starting database or RPC clients.

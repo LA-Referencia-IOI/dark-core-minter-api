@@ -9,6 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Depends
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
@@ -91,9 +92,20 @@ def create_app() -> FastAPI:
         ),
         version="0.1.0",
         lifespan=lifespan,
-        docs_url="/docs",
-        redoc_url="/redoc",
+        docs_url=None,
+        redoc_url=None,
     )
+
+    # The gateway mounts documentation at /api/docs while API paths already
+    # include /api/v1. Relative schema URLs work there and at the direct /docs
+    # endpoint without adding a second /api prefix to API requests.
+    @app.get("/docs", include_in_schema=False)
+    async def swagger_docs():
+        return get_swagger_ui_html(openapi_url="./openapi.json", title=f"{app.title} - Swagger UI")
+
+    @app.get("/redoc", include_in_schema=False)
+    async def redoc_docs():
+        return get_redoc_html(openapi_url="./openapi.json", title=f"{app.title} - ReDoc")
     
     # CORS middleware (configurable for production)
     app.add_middleware(
