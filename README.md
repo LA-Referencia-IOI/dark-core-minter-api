@@ -184,6 +184,14 @@ flowchart LR
 - Blockchain
   - final public state for ARK registration and updates
 
+## Global pin placement
+
+Enable `REPLICATION_PIN_EVERYWHERE` on Minter and Store together. Store creates
+global pins. Minter waits for its configured publication threshold for each of
+L1 and L2 before making an ARK eligible for the Chain Worker. It continues to
+observe both CIDs after publication and releases the staged payloads when
+both reach the durability threshold.
+
 ## End-to-End Flow
 
 ```mermaid
@@ -791,6 +799,7 @@ The app prefers `.env.integration` over `.env`.
 | `REPLICATION_WORKER_RUNTIME_NAME` | Reconciler heartbeat, PID and advisory-lock identity | `replication-reconciler` |
 | `REPLICATION_PUBLISH_AFTER_REPLICAS` | Minimum real pins required before the record is publishable | `1` |
 | `REPLICATION_TARGET_REPLICAS` | Desired global pin count before local payload purge | `2` |
+| `REPLICATION_PIN_EVERYWHERE` | Let Cluster place the pins and skip finite replica promotions | `false` |
 | `CHAIN_WORKER_ENABLED` | Enable blockchain publication worker | `true` |
 | `CHAIN_WORKER_PAGE_SIZE` | ARKs per chain cycle and max in-flight core-lib transaction window | `100` |
 | `CHAIN_WORKER_SLEEP_SECONDS` | Chain sleep after an empty or partial page | `5` |
