@@ -264,6 +264,7 @@ class ReplicationReconciliationWorker(_Stats):
         repair_cooldown_seconds: int = 900,
         publish_after_replicas: int = 1,
         target_replicas: int = 2,
+        pin_everywhere: bool = False,
         status_batch_size: int = 200,
         promotion_batch_size: int = 100,
         promotion_pressure_high_percent: int = 80,
@@ -293,6 +294,7 @@ class ReplicationReconciliationWorker(_Stats):
         self.repair_grace_seconds = max(int(repair_grace_seconds), 0)
         self.repair_cooldown_seconds = max(int(repair_cooldown_seconds), 0)
         self.publish_after = max(int(publish_after_replicas), 1)
+        self.pin_everywhere = pin_everywhere
         self.target_replicas = max(int(target_replicas), self.publish_after)
         self.status_batch_size = min(max(int(status_batch_size), 1), 200)
         self.promotion_batch_size = min(max(int(promotion_batch_size), 1), 200)
@@ -327,6 +329,8 @@ class ReplicationReconciliationWorker(_Stats):
 
     def _promotion_candidates(self, cids: list[str], observed: dict[str, Any]) -> list[str]:
         """Return only CIDs whose observed Cluster allocation is below target."""
+        if self.pin_everywhere:
+            return []
         return [
             cid for cid in cids
             if (status := observed.get(cid)) is not None
@@ -510,10 +514,8 @@ class ReplicationReconciliationWorker(_Stats):
                     # The content is available, but the target replica count
                     # has not been reached yet.  Keep it in the normal
                     # replication queue and re-observe it later.
-                    # A payload repaired from an unpinned/error state was
-                    # re-added with the initial 1/1 policy.  Put it back in
-                    # READY so the next maintenance cycle requests its final
-                    # target allocation exactly once again.
+                    # Observe a repaired payload again promptly. With finite
+                    # replication the next cycle can also promote its pin.
                     if result["repaired"]:
                         current.processing_status = int(ProcessingStatus.READY)
                         current.next_action_at = None

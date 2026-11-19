@@ -647,6 +647,7 @@ def run_worker(worker_kind: str = "chain") -> None:
                     repair_cooldown_seconds=runtime["repair_cooldown_seconds"],
                     publish_after_replicas=settings.replication_publish_after_replicas,
                     target_replicas=settings.replication_target_replicas,
+                    pin_everywhere=settings.replication_pin_everywhere,
                     status_batch_size=runtime["status_batch_size"],
                     promotion_batch_size=runtime["promotion_batch_size"],
                     maintenance_cycle_seconds=runtime["maintenance_cycle_seconds"],
