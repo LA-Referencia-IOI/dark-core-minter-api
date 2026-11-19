@@ -183,3 +183,57 @@ def test_unavailable_chain_never_proves_ownership_loss():
     assert worker._reconcile_failed_identity(repo, "ark:12345/test")
     repo.defer_processing_retry.assert_called_once()
     repo.mark_processing_failed.assert_not_called()
+
+
+def test_pin_everywhere_observes_one_for_publication_and_two_for_durability(test_db_engine, monkeypatch):
+    from sqlalchemy.orm import Session
+    from app.database.models import ARKMetadata, ARKRecord
+    from app.models.processing import ProcessingStatus
+    from app.workers import publisher
+
+    ark = "ark:12345/everywhere"
+    monkeypatch.setattr(publisher, "acquire_ark_lock", lambda _: Session(test_db_engine))
+    with Session(test_db_engine) as db:
+        record = ARKRecord(
+            naan="12345", name="everywhere", state="D", authority_id="authority",
+            processing_stage=int(ProcessingStage.AVAILABILITY),
+            processing_status=int(ProcessingStatus.READY),
+        )
+        db.add(record)
+        db.flush()
+        record_id = record.id
+        db.add(ARKMetadata(
+            ark_record_id=record_id, level1_cid="level1", original_cid="level2",
+            original_schema="dc", original_content="payload",
+        ))
+        db.commit()
+
+    worker = ReplicationReconciliationWorker(Mock(), pin_everywhere=True)
+    one = dict.fromkeys(
+        ("level1", "level2"), SimpleNamespace(total_replicas=1, assigned_replicas=1, status="pinned")
+    )
+    assert worker._promotion_candidates(list(one), one) == []
+    assert worker._reconcile(ark, one)["advanced"] == 1
+    with Session(test_db_engine) as db:
+        record = db.get(ARKRecord, record_id)
+        assert record.processing_stage == int(ProcessingStage.CHAIN)
+        # Simulate the result of successful publication by the chain worker.
+        record.state = "P"
+        record.processing_stage = int(ProcessingStage.REPLICATION)
+        db.commit()
+
+    assert worker._reconcile(ark, one)["waiting"] == 1
+    with Session(test_db_engine) as db:
+        record = db.get(ARKRecord, record_id)
+        assert db.query(ARKMetadata).filter_by(ark_record_id=record_id).one().original_content == "payload"
+        record.next_action_at = None
+        record.processing_status = int(ProcessingStatus.READY)
+        db.commit()
+
+    two = dict.fromkeys(
+        ("level1", "level2"), SimpleNamespace(total_replicas=2, assigned_replicas=2, status="pinned")
+    )
+    assert worker._reconcile(ark, two)["purged"] == 1
+    with Session(test_db_engine) as db:
+        assert db.get(ARKRecord, record_id).processing_stage == int(ProcessingStage.COMPLETE)
+    worker.storage.ensure_replication.assert_not_called()

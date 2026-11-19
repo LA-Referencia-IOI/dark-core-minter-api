@@ -119,6 +119,7 @@ class Settings(BaseSettings):
     replication_worker_runtime_name: str = "replication-reconciler"
     replication_publish_after_replicas: int = 1
     replication_target_replicas: int = 2
+    replication_pin_everywhere: bool = False
     worker_max_idle_sleep_seconds: int = 10
 
     chain_worker_enabled: bool = True
