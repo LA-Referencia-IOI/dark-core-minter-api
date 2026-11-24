@@ -294,6 +294,14 @@ Important points:
 - The name format is `{shoulder}{generated_part}{checkdigit}`.
 - A uniqueness collision is retried with a new counter value.
 
+For a batch reservation, Minter checks the live authority before allocating any identifiers.
+A transient RPC failure permits one more authority lookup. Each RPC request uses a two-second
+transport timeout, and the second lookup starts only within three seconds of the first.
+An exhausted transient check returns HTTP 503 with `X-DARK-Error-Code: AUTHORITY_STATUS_UNAVAILABLE`,
+`X-DARK-Retryable: true` and a diagnostic `X-Request-ID`. The client may sign the same batch
+again with a fresh nonce. An inactive authority receives HTTP 403. If a response is lost after
+commit, use the original authority, NAAN and client item IDs to recover the active reservations.
+
 ### 2. Update Metadata
 
 `PUT /api/v1/arks/{ark}` does not publish immediately. It stores metadata locally and prepares the record for the asynchronous workers.

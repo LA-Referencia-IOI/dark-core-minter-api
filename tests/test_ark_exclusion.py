@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 from app.api import arks, worker as worker_api
 from app.database import ark_locks
 from app.database.models import Base, ARKRecord, ARKMetadata
+from app.middleware.authority_lifecycle import get_authority_reader
 from app.dependencies import get_corelib_client, get_metadata_storage, get_db
 from app.middleware.auth import require_authority_identity
 from app.models.processing import ProcessingStage, ProcessingStatus, ProcessingErrorCode, ProcessingWaitReason
@@ -70,6 +71,7 @@ def client(engine, monkeypatch):
     core = Mock()
     core.config.default_gas_limit = 100000
     app.dependency_overrides[get_corelib_client] = lambda: core
+    app.dependency_overrides[get_authority_reader] = lambda: core.get_authority_by_uuid
     app.dependency_overrides[get_metadata_storage] = lambda: Mock()
     def database():
         with Session(engine) as db:

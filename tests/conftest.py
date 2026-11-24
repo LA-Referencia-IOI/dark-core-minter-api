@@ -56,6 +56,7 @@ from dark_core_lib.models import ChainCapacityInfo
 
 from app.main import app
 import app.dependencies as dependencies_module
+from app.middleware.authority_lifecycle import get_authority_reader
 from app.dependencies import get_corelib_client, init_corelib_client, get_db
 from app.api.arks import get_locked_ark_db
 from app.database.models import Base
@@ -154,6 +155,7 @@ def client(mock_corelib, override_get_db):
 
     # Override dependencies
     app.dependency_overrides[get_corelib_client] = lambda: mock_corelib
+    app.dependency_overrides[get_authority_reader] = lambda: mock_corelib.get_authority_by_uuid
     app.dependency_overrides[get_db] = override_get_db
     # Endpoint unit tests use a single SQLite session. PostgreSQL exclusion is
     # exercised separately, without this override, in test_ark_exclusion.py.
